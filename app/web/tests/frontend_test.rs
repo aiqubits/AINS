@@ -365,14 +365,14 @@ fn i18n_context_t_returns_correct_language_translations() {
 
         // 初始 En
         let t = ctx.t();
-        if t.dashboard_title == "Welcome to AINS Rust Fullend System 🚀" {
+        if t.dashboard_title == "Welcome to AINS AI Native System 🚀" {
             EN_CORRECT.store(true, Ordering::SeqCst);
         }
 
         // 切换到 Zh
         ctx.set_lang(Language::Zh);
         let t = ctx.t();
-        if t.dashboard_title == "欢迎来到 AINS AI Native System 🚀" {
+        if t.dashboard_title == "欢迎来到 AINS AI 原生系统 🚀" {
             ZH_CORRECT.store(true, Ordering::SeqCst);
         }
 
