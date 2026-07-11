@@ -1,0 +1,18 @@
+[package]
+name = "ains-salvo"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ains-runtime = { workspace = true }
+salvo = { workspace = true }
+anyhow.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "signal"] }
+bytes.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+cookie.workspace = true
+serde_urlencoded.workspace = true
+async-trait.workspace = true

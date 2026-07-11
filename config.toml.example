@@ -1,0 +1,211 @@
+# ==============================================
+# AINS Shared Configuration File
+# ==============================================
+# Copy this file to config.toml and update values for your environment
+# This configuration is shared between server and frontend (app)
+
+# Database connection URL (PostgreSQL)
+# Replace CHANGE_ME_POSTGRES_PASSWORD with a strong password
+# Format: postgres://user:password@host:port/database
+# Can be overridden by environment variable: AINS_DATABASE_URL
+database_url = "postgres://postgres:CHANGE_ME_POSTGRES_PASSWORD@127.0.0.1:5432/ains"
+
+# Redis connection URL (for caching, distributed locking, and rate limiting)
+# NOTE: When using Docker Compose, this is overridden by AINS_REDIS_URL
+#       which includes the Redis password. Make sure to include the password
+#       if your Redis instance has requirepass enabled.
+# ⚠️  Use percent-encoding for special characters in the password
+#     (e.g., p%40ss for p@ss, p%2Fss for p/ss).
+#     To avoid this, generate passwords with: openssl rand -hex 32
+# Format: redis://[:password]@host:port
+# Can be overridden by environment variable: AINS_REDIS_URL
+redis_url = "redis://:CHANGE_ME_REDIS_PASSWORD@127.0.0.1:6379"
+
+# Redis cache connection pool size (default: 10)
+# Maximum number of concurrent connections for the bb8 Redis cache pool.
+# Increase this if the application handles many concurrent cache operations.
+# Can be overridden by environment variable: AINS_CACHE_MAX_CONNECTIONS
+cache_max_connections = 10
+
+# Read replica database URLs (empty = disabled, backward compatible)
+# When configured, SELECT queries are automatically routed to read replicas
+# while INSERT/UPDATE/DELETE always go to the write database.
+# Can be overridden by environment variable: AINS_DATABASE_READ_URLS
+#   Environment variable format: comma-separated list
+#   Example: export AINS_DATABASE_READ_URLS="postgres://user:pass@replica1:5432/ains,postgres://user:pass@replica2:5432/ains"
+database_read_urls = []
+
+# ⚠️  SECURITY WARNING: MUST change this in production!
+# Generate a strong secret with: openssl rand -base64 64
+# The server will refuse to start with this placeholder in non-development mode.
+# Can be overridden by environment variable: AINS_JWT_SECRET
+jwt_secret = "REPLACE_ME_WITH_A_STRONG_SECRET"
+
+# JWT token expiration time in seconds (default: 1 hour)
+# Can be overridden by environment variable: AINS_JWT_EXPIRY_SECONDS
+jwt_expiry_seconds = 3600
+
+# JWT expiration when "remember me" is enabled (default: 30 days)
+# Can be overridden by environment variable: AINS_JWT_REMEMBER_EXPIRY_SECONDS
+jwt_remember_expiry_seconds = 2592000
+
+# Refresh token expiration time in seconds (default: 90 days)
+# Refresh tokens are used for silent JWT renewal when the JWT expires.
+# Can be overridden by environment variable: AINS_REFRESH_TOKEN_EXPIRY_SECONDS
+refresh_token_expiry_seconds = 7776000
+
+# Whether to set the Secure flag on auth cookies (default: true)
+# Set to false for local development over plain HTTP.
+# MUST be true in production (requires HTTPS).
+# Can be overridden by environment variable: AINS_COOKIE_SECURE
+cookie_secure = true
+
+# System admin account (auto-seeded on first boot, only one can exist)
+# The system admin has super-admin privileges (bypasses all admin-only restrictions)
+# ⚠️  SECURITY: MUST override these in staging/production environments!
+#     The server will refuse to start with default values in non-development mode.
+# Can be overridden by environment variables: AINS_SYSTEM_ADMIN_EMAIL / AINS_SYSTEM_ADMIN_PASSWORD
+system_admin_email = "admin@ains.local"
+system_admin_password = "change-me-admin-password"
+
+# Server configuration
+[server]
+# Server bind address
+# Can be overridden by environment variable: AINS_SERVER__HOST
+host = "0.0.0.0"
+# Server port
+# Can be overridden by environment variable: AINS_SERVER__PORT
+port = 3000
+# Allowed CORS origins (REQUIRED for staging/production environments)
+# In non-development mode, the server will log an error and block all
+# cross-origin requests if this list is empty.
+# Can be overridden by environment variable: AINS_SERVER__ALLOWED_ORIGINS
+#   Environment variable format: comma-separated list
+#   Example: export AINS_SERVER__ALLOWED_ORIGINS="https://example.com,https://app.example.com"
+# allowed_origins = ["https://example.com", "https://app.example.com"]
+
+# Database connection pool configuration
+[database]
+# Maximum number of connections in the pool
+# Can be overridden by environment variable: AINS_DATABASE__MAX_CONNECTIONS
+max_connections = 10
+# Minimum number of idle connections to maintain
+# Can be overridden by environment variable: AINS_DATABASE__MIN_CONNECTIONS
+min_connections = 1
+# Connection timeout in seconds
+# Can be overridden by environment variable: AINS_DATABASE__CONNECT_TIMEOUT_SECS
+connect_timeout_secs = 8
+# Idle timeout in seconds
+# Can be overridden by environment variable: AINS_DATABASE__IDLE_TIMEOUT_SECS
+idle_timeout_secs = 600
+# Acquire timeout in seconds
+# Can be overridden by environment variable: AINS_DATABASE__ACQUIRE_TIMEOUT_SECS
+acquire_timeout_secs = 30
+
+# Read-write routing configuration (optional, has defaults)
+[database_routing]
+# Read replica selection strategy: round_robin | random | weighted
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__STRATEGY
+strategy = "round_robin"
+# Weights for each read replica (only applies to weighted strategy).
+# MUST align with database_read_urls by index position.
+#   e.g., database_read_urls = [url_a, url_b] and read_weights = [3, 1]
+#         means url_a gets weight 3, url_b gets weight 1.
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__READ_WEIGHTS
+read_weights = []
+# Extra retry attempts after all read replicas have been tried once.
+# Each extra attempt tries any non-circuit-broken replica (including those
+# that previously failed but whose circuit breaker has expired).
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__RETRY_ATTEMPTS
+retry_attempts = 2
+# Circuit breaker duration in milliseconds for a failed read replica
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__CIRCUIT_BREAK_MS
+circuit_break_ms = 30000
+# Fall back to the write database when no healthy read replicas are available
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__FALLBACK_TO_WRITE
+fallback_to_write = true
+# Background health check interval in seconds (0 = disabled)
+# Can be overridden by environment variable: AINS_DATABASE_ROUTING__HEALTH_CHECK_INTERVAL_SECS
+health_check_interval_secs = 15
+
+# Read replica connection pool configuration (optional, independent from write pool)
+[database_read]
+# Maximum number of connections in the pool (default: 20)
+# Can be overridden by environment variable: AINS_DATABASE_READ__MAX_CONNECTIONS
+max_connections = 20
+# Minimum number of idle connections to maintain (default: 2)
+# Can be overridden by environment variable: AINS_DATABASE_READ__MIN_CONNECTIONS
+min_connections = 2
+# Connection timeout in seconds (default: 5, independent from write pool)
+# Can be overridden by environment variable: AINS_DATABASE_READ__CONNECT_TIMEOUT_SECS
+connect_timeout_secs = 5
+# Idle timeout in seconds (default: 600)
+# Can be overridden by environment variable: AINS_DATABASE_READ__IDLE_TIMEOUT_SECS
+idle_timeout_secs = 600
+# Acquire timeout in seconds (default: 10, independent from write pool)
+# Can be overridden by environment variable: AINS_DATABASE_READ__ACQUIRE_TIMEOUT_SECS
+acquire_timeout_secs = 10
+
+# Email (SMTP) configuration
+# When left empty / default, the email service is disabled and registration
+# auto-verifies users (useful for development). Configure all fields below to
+# enable sending verification and welcome emails.
+[email]
+# SMTP server hostname
+smtp_host = ""
+# SMTP port (587 for STARTTLS, 465 for implicit TLS, 25 for plain)
+smtp_port = 587
+# SMTP authentication username
+smtp_username = ""
+# SMTP authentication password
+smtp_password = ""
+# From address for outgoing emails
+from_address = ""
+# Optional display name for the from address
+from_name = "AINS"
+# Whether to use TLS (STARTTLS or implicit TLS depending on port)
+use_tls = true
+# Connection timeout in seconds (0 = no timeout)
+timeout_secs = 30
+
+# WeChat Official Account configuration for captcha login
+# When enabled, users can log in by sending a keyword (e.g. "验证码") to the
+# WeChat Official Account, receiving a captcha code, and entering it on the
+# login page.
+# All fields below must be properly configured for the feature to work.
+[wechat]
+# Whether to enable WeChat captcha-login (default: false)
+# enabled = true
+
+# Your WeChat Official Account AppID
+# app_id = "wx..."
+
+# Your WeChat Official Account AppSecret
+# app_secret = "..."
+
+# The Token configured in the WeChat MP backend for signature verification
+# token = "..."
+
+# Optional: logical account identifier for multi-account setups
+# account_id = "default"
+
+# Optional: encoding AES key for safe mode (43 chars)
+# encoding_aes_key = "..."
+
+# Optional: message encryption mode: plain, compatible, safe (default: plain)
+# message_mode = "plain"
+
+# Captcha validity in seconds (default: 300)
+# captcha_ttl_secs = 300
+
+# Cooldown between captcha requests in seconds (default: 60)
+# resend_cooldown_secs = 60
+
+# Max failed attempts before captcha is invalidated (default: 5)
+# max_failed_attempts = 5
+
+# Captcha code length (default: 5)
+# captcha_len = 5
+
+# Keywords that trigger captcha generation (comma-separated)
+# trigger_keywords = ["验证码", "登录码", "login"]

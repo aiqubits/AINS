@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ains
+  namespace: ains
+  labels:
+    app: ains
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: ains
+  template:
+    metadata:
+      labels:
+        app: ains
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      containers:
+      - name: ains
+        image: ains-server:latest
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+        - name: AINS_ENV
+          value: "production"
+        - name: RUST_LOG
+          value: "info"
+        - name: AINS_DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: database_url
+        # Read replica URLs (comma-separated, optional)
+        # When using CloudNativePG, set database_read_urls in ains-secrets.
+        # The .ro service load-balances across all healthy replicas:
+        #   postgres://postgres:password@ains-db-ro.ains.svc.cluster.local:5432/ains
+        #
+        # In single-database mode (no CNP), database_read_urls in the secret
+        # should be empty — AutoRouter runs in single-database mode.
+        - name: AINS_DATABASE_READ_URLS
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: database_read_urls
+        - name: AINS_REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: redis_url
+        - name: AINS_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: jwt_secret
+        - name: AINS_SYSTEM_ADMIN_EMAIL
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: system_admin_email
+        - name: AINS_SYSTEM_ADMIN_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: system_admin_password
+        volumeMounts:
+        - name: config-volume
+          mountPath: /app/config.toml
+          subPath: config.toml
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 5
+          failureThreshold: 3
+      volumes:
+      - name: config-volume
+        configMap:
+          name: ains-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ains-service
+  namespace: ains
+spec:
+  selector:
+    app: ains
+  ports:
+  - protocol: TCP
+    port: 3000
+    targetPort: 3000
+    name: http
+  type: ClusterIP

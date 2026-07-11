@@ -1,0 +1,116 @@
+# ==========================================
+# ⚠️  DEVELOPMENT ONLY: Single-instance PostgreSQL (no CNP operator)
+# ==========================================
+# This file is for development/testing where CloudNativePG is NOT installed.
+#
+# FOR PRODUCTION with read-write splitting:
+#   Use k8s/postgres-cluster.yml instead. It deploys 1 primary + 2
+#   replicas managed by the CloudNativePG operator, with automatic
+#   failover and the -ro/-rw Services needed by AutoRouter.
+#
+# WARNING: Do NOT apply both manifests simultaneously in the same namespace.
+# ==========================================
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ains
+  labels:
+    app: postgres
+    ains.io/db-mode: standalone
+spec:
+  serviceName: postgres-service
+  replicas: 1
+  podManagementPolicy: Parallel
+  # OnDelete is intentional for a single-replica database StatefulSet:
+  # it prevents automatic Pod restarts on spec changes (e.g., resource
+  # limits adjustments), giving operators full control over when the
+  # database restarts. For multi-replica setups, use RollingUpdate.
+  updateStrategy:
+    type: OnDelete
+  # NOTE: Uses a manually-managed PVC instead of volumeClaimTemplates.
+  # For a single-replica database, manual PVC management is simpler and
+  # sufficient. If you scale beyond 1 replica, switch to volumeClaimTemplates.
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # postgres:16-alpine uses UID 70 (not 999 like Debian-based)
+        runAsUser: 70
+        fsGroup: 70
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+        env:
+        - name: POSTGRES_USER
+          value: postgres
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: postgres_password
+        - name: POSTGRES_DB
+          value: ains
+        volumeMounts:
+        - name: postgres-storage
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - postgres
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - postgres
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+      - name: postgres-storage
+        persistentVolumeClaim:
+          claimName: postgres-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-service
+  namespace: ains
+spec:
+  selector:
+    app: postgres
+  ports:
+  - protocol: TCP
+    port: 5432
+    targetPort: 5432
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-pvc
+  namespace: ains
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

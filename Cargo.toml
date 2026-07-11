@@ -1,0 +1,86 @@
+[workspace]
+members = ["server", "app/ui", "app/web", "app/desktop", "app/mobile", "app/client-api", "crates/emailserver", "crates/distributed-ratelimit", "crates/ains-runtime", "crates/ains-axum", "crates/ains-salvo", "crates/i18n", "crates/wechat-api"]
+# resolver = "3" is required for Rust edition 2024
+# Minimum Rust version: 1.92+
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+authors = [
+    "aiqubits <aiqubits@hotmail.com>",
+]
+license = "MIT"
+repository = "https://github.com/aiqubits/ains"
+homepage = "https://www.openpick.org/"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Frontend
+dioxus = { version = "0.7.7" }
+dioxus-icons = "0.1"
+
+# Frontend workspace
+ui = { path = "app/ui" }
+client-api = { path = "app/client-api" }
+
+# Shared crates
+emailserver = { path = "crates/emailserver" }
+distributed-ratelimit = { path = "crates/distributed-ratelimit" }
+
+# Web framework crates
+ains-runtime = { path = "crates/ains-runtime" }
+ains-axum = { path = "crates/ains-axum" }
+ains-salvo = { path = "crates/ains-salvo" }
+axum = { version = "0.8.9" }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors", "compression-br", "compression-gzip", "limit"] }
+http = "1"
+http-body-util = "0.1"
+tokio = { version = "1", features = ["full"] }
+salvo = { version = "0.93", features = ["server", "server-handle", "affix-state", "cors", "compression", "catch-panic", "size-limiter", "logging"] }
+
+# i18n
+i18n = { path = "crates/i18n" }
+
+# WeChat Official Account SDK
+wechat-api = { path = "crates/wechat-api" }
+
+# Phase 0: 新增 workspace 依赖
+bytes = "1"
+cookie = "0.18"
+serde_urlencoded = "0.7"
+percent-encoding = "2"
+async-trait = "0.1"
+jsonwebtoken = "9"
+
+# ── Release 优化 ──────────────────────────────────────
+[profile.release]
+opt-level = "z"       # 最小体积优化
+lto = true             # 跨 crate 链接时优化，消除死代码
+codegen-units = 1      # 最大优化机会（牺牲编译速度）
+strip = true           # 移除调试符号
+# panic = "abort" 会禁用服务器端的 panic unwind 机制，
+# 导致 panic_middleware 无法通过 tokio::spawn 捕获 panic 并返回 500。
+
+# ── WASM 前端专用 Release profile ──────────────────────
+# 使用方式: cargo build --profile release-wasm -p web --target wasm32-unknown-unknown
+[profile.release-wasm]
+inherits = "release"
+panic = "abort"        # WASM 前端：减少 panic 展开代码

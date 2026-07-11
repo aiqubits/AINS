@@ -1,0 +1,14 @@
+[application]
+name = "web"
+default_platform = "web"
+
+[web.app]
+title = "AINS"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src"]
+
+# 开发服务器
+[[web.proxy]]
+backend = "http://127.0.0.1:3000/api/"

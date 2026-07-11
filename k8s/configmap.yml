@@ -1,0 +1,77 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ains-config
+  namespace: ains
+data:
+  config.toml: |
+    # AINS Configuration File
+    
+    # Database connection URL (PostgreSQL)
+    # NOTE: database_url is stored in K8s Secret (ains-secrets), not ConfigMap
+    # It is injected via secretKeyRef in the Deployment env
+    
+    # Redis connection URL (for distributed locking only)
+    # NOTE: redis_url is stored in K8s Secret (ains-secrets), not ConfigMap
+    # It is injected via secretKeyRef in the Deployment env
+    
+    # JWT secret key for token signing
+    # NOTE: jwt_secret is stored in K8s Secret (ains-secrets), not ConfigMap
+    # It is injected via secretKeyRef in the Deployment env
+    
+    # JWT token expiration time in seconds (default: 1 hour)
+    jwt_expiry_seconds = 3600
+    
+    # Server configuration
+    [server]
+    host = "0.0.0.0"
+    port = 3000
+    # Allowed CORS origins
+    # NOTE: In K8s, the nginx sidecar handles reverse proxy, so same-origin
+    # requests may not need this. Set only if direct browser-to-API access is needed.
+    # allowed_origins = ["https://example.com"]
+    
+    # Database connection pool configuration
+    [database]
+    max_connections = 10
+    min_connections = 1
+    connect_timeout_secs = 8
+    idle_timeout_secs = 600
+    acquire_timeout_secs = 30
+
+    # Read replica database URLs (empty = disabled)
+    # When using CloudNativePG, set via env var AINS_DATABASE_READ_URLS
+    # (the env var overrides this config). The .ro service URL:
+    #   postgres://postgres:password@ains-db-ro.ains.svc.cluster.local:5432/ains
+    #
+    # NOTE: CNP's .ro service load-balances across ALL healthy replicas,
+    # so only ONE URL entry is needed (not per-replica URLs).
+    # Can be overridden by env var: AINS_DATABASE_READ_URLS
+    database_read_urls = []
+
+    # Read-write routing configuration
+    [database_routing]
+    strategy = "round_robin"
+    # Read weights; must align with database_read_urls by index position
+    read_weights = []
+    # Extra retry attempts after all read replicas have been tried once.
+    # Each extra attempt tries non-circuit-broken replicas (e.g., those
+    # that failed previously but whose circuit breaker has expired).
+    retry_attempts = 2
+    circuit_break_ms = 30000
+    fallback_to_write = true
+    health_check_interval_secs = 15
+
+    # Read replica connection pool configuration
+    [database_read]
+    max_connections = 20
+    min_connections = 2
+    connect_timeout_secs = 5
+    idle_timeout_secs = 600
+    acquire_timeout_secs = 10
+
+  # ------------------------------------------
+  # Individual keys for env var injection
+  # (used by Deployment envFrom / configMapKeyRef)
+  # NOTE: database_url and redis_url are in Secret, not here
+  # ------------------------------------------

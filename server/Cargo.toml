@@ -1,0 +1,77 @@
+[package]
+name = "ains-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+categories = ["asynchronous", "network-programming", "web-programming"]
+keywords = ["web", "server", "backend", "fullstack", "scaffold"]
+description = "The best way to develop your web service with one click."
+license.workspace = true
+readme = "../README.md"
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+# Web framework abstraction (不直接依赖 axum/tower/tower-http/http/http-body-util)
+ains-runtime = { workspace = true }
+ains-axum = { workspace = true, optional = true }  # 默认后端
+ains-salvo = { workspace = true, optional = true }  # salvo 可选后端
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sea-orm = { version = "1.1.20", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+async-trait = "0.1"
+parking_lot = "0.12"
+futures = "0.3"
+
+# Redis for distributed locking, caching, and rate limiting
+redis = { version = "1.2.3", features = ["tokio-comp", "connection-manager"] }
+bb8 = "0.9.1"
+bb8-redis = "0.26.0"
+distributed-ratelimit.workspace = true
+
+# Configuration
+config = "0.15"
+clap = { version = "4", features = ["derive"] }
+
+# Authentication
+jsonwebtoken = "9"
+argon2 = "0.5"
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+cookie = "0.18"
+
+# Email
+emailserver.workspace = true
+
+# WeChat Official Account captcha-login
+wechat-api.workspace = true
+
+# Validation
+validator = { version = "0.19", features = ["derive"] }
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_urlencoded = "0.7"
+anyhow.workspace = true
+thiserror.workspace = true
+http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+# tower 仅用于内联测试和集成测试中的 ServiceExt::oneshot()
+tower = { version = "0.5", features = ["util"] }
+# reqwest 用于 Salvo 模式的集成测试（通过 HTTP 客户端发送请求）
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+# salvo 用于 Salvo 模式的集成测试（Server、TcpListener 等类型）
+salvo = { workspace = true }
+
+[features]
+default = ["ains-axum"]
+ains-axum = ["dep:ains-axum"]
+ains-salvo = ["dep:ains-salvo"]

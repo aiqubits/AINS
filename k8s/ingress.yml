@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: ains-ingress
+  namespace: ains
+  annotations:
+    # Set to "true" after deploying TLS certificates (see tls section below)
+    nginx.ingress.kubernetes.io/ssl-redirect: "false"
+spec:
+  ingressClassName: nginx
+  # ==========================================
+  # TLS configuration (uncomment to enable HTTPS)
+  #
+  # Prerequisites:
+  # 1. Create a TLS secret:
+  #      kubectl create secret tls ains-tls \
+  #        --cert=/path/to/cert.pem \
+  #        --key=/path/to/key.pem \
+  #        -n ains
+  # 2. Or use cert-manager to auto-provision Let's Encrypt certificates.
+  # ==========================================
+  # tls:
+  # - hosts:
+  #   - ains.local
+  #   secretName: ains-tls
+  rules:
+  - host: ains.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: ains-web-service
+            port:
+              number: 80
