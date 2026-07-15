@@ -598,6 +598,16 @@ async fn reset_password_inner(
         .reset_password(&email, &payload.code, &payload.new_password)
         .await?;
 
+    // Invalidate token_version cache so auth middleware reads fresh value.
+    let token_cache_key = format!("user:token_version:{}", outcome.user_id);
+    if let Err(e) = state.cache.invalidate(&token_cache_key).await {
+        tracing::warn!(
+            "Failed to invalidate token_version cache for user {}: {:?}",
+            outcome.user_id,
+            e
+        );
+    }
+
     let new_token = crate::middlewares::generate_token(
         &outcome.user_id.to_string(),
         &outcome.role,
@@ -605,6 +615,7 @@ async fn reset_password_inner(
         state.config.jwt_expiry_seconds,
         false,
         outcome.token_version,
+        &outcome.tenant_id,
     )
     .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?;
 
@@ -656,6 +667,7 @@ pub struct RefreshResponse {
     pub expires_in: u64,
     pub user_id: String,
     pub role: String,
+    pub tenant_id: String,
     #[serde(skip_serializing)]
     pub refresh_token: String,
     pub refresh_expires_in: u64,
@@ -709,7 +721,7 @@ async fn refresh_inner(
     // consumed — all three cases are treated as unauthorised. The refresh token
     // is the sole authority for granting a new JWT; we do NOT fall back to the
     // JWT cookie, because doing so would bypass expiry/revocation enforcement.
-    let (user_id, role, token_version) = service
+    let (user_id, role, token_version, tenant_id) = service
         .rotate_refresh_token(&token_hash, &new_hash, refresh_expires_at)
         .await
         .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?
@@ -724,6 +736,7 @@ async fn refresh_inner(
         state.config.jwt_remember_expiry_seconds,
         true,
         token_version,
+        &tenant_id,
     )
     .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?;
 
@@ -760,6 +773,7 @@ async fn refresh_inner(
             expires_in: jwt_max_age,
             user_id: user_id.to_string(),
             role,
+            tenant_id,
             refresh_token: raw_refresh,
             refresh_expires_in: refresh_max_age,
         },

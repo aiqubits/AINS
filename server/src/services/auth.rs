@@ -48,6 +48,7 @@ pub struct LoginResponse {
     pub expires_in: u64,
     pub user_id: String,
     pub role: String,
+    pub tenant_id: String,
     #[serde(skip_serializing)]
     pub refresh_token: String,
     pub refresh_expires_in: u64,
@@ -128,6 +129,32 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         }
 
+        // Reject login for disabled tenants — users of disabled tenants
+        // must not be able to obtain JWTs or use the system.
+        match crate::services::tenant::TenantService::new(self.db.clone())
+            .is_active(&user.tenant_id)
+            .await
+        {
+            Ok(true) => { /* tenant is active — continue */ }
+            Ok(false) => {
+                tracing::info!(
+                    "Login rejected for {}: tenant {} is not active",
+                    user.email,
+                    user.tenant_id
+                );
+                return Err(AuthError::InvalidCredentials);
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    user_email = %user.email,
+                    tenant_id = %user.tenant_id,
+                    "Failed to check tenant active status — rejecting login (fail-closed)"
+                );
+                return Err(AuthError::InvalidCredentials);
+            }
+        }
+
         let jwt_expiry = if request.remember {
             self.jwt_remember_expiry_seconds
         } else {
@@ -141,6 +168,7 @@ impl AuthService {
             jwt_expiry,
             request.remember,
             user.token_version,
+            &user.tenant_id,
         )
         .map_err(|e| {
             tracing::error!("Failed to generate JWT for user {}: {:?}", user.id, e);
@@ -207,6 +235,7 @@ impl AuthService {
             expires_in: jwt_expiry,
             user_id: user.id.to_string(),
             role: user.role,
+            tenant_id: user.tenant_id,
             refresh_token: raw_refresh_token,
             refresh_expires_in,
         })
@@ -352,7 +381,7 @@ impl AuthService {
         old_token_hash: &str,
         new_token_hash: &str,
         new_expires_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<Option<(i64, String, i32)>, AuthError> {
+    ) -> Result<Option<(i64, String, i32, String)>, AuthError> {
         use crate::repositories::refresh_token::{
             ActiveModel, Column, Entity as RefreshTokenEntity, Model,
         };
@@ -391,6 +420,25 @@ impl AuthService {
             None => return Ok(None),
         };
 
+        // Reject refresh token rotation for disabled tenants — same security
+        // boundary as the login endpoint (services/auth.rs login()).
+        // Uses the transaction connection so the check is consistent with
+        // the subsequent mutation. Auto-rollback on Drop if we return None.
+        if !crate::repositories::tenant::Entity::find_by_id(&user.tenant_id)
+            .one(&txn)
+            .await
+            .context("Failed to query tenant")?
+            .map(|t| t.status == "active")
+            .unwrap_or(false)
+        {
+            tracing::info!(
+                user_id = %user.id,
+                tenant_id = %user.tenant_id,
+                "Refresh token rotation rejected: tenant is not active"
+            );
+            return Ok(None);
+        }
+
         RefreshTokenEntity::delete_many()
             .filter(Column::TokenHash.eq(old_token_hash))
             .exec(&txn)
@@ -412,7 +460,12 @@ impl AuthService {
 
         txn.commit().await.context("Failed to commit transaction")?;
 
-        Ok(Some((user.id, user.role, user.token_version)))
+        Ok(Some((
+            user.id,
+            user.role,
+            user.token_version,
+            user.tenant_id,
+        )))
     }
 }
 
@@ -462,6 +515,7 @@ mod tests {
             expires_in: 3600,
             user_id: "123e4567-e89b-12d3-a456-426614174000".to_string(),
             role: "user".to_string(),
+            tenant_id: "default".to_string(),
             refresh_token: "refresh.token.here".to_string(),
             refresh_expires_in: 7776000,
         };

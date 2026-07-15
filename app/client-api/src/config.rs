@@ -30,6 +30,14 @@ pub struct ClientConfig {
     /// 即总共最多发起 4 次请求（1 次初始 + 3 次重试）。
     /// 设置为 0 表示禁用重试。
     pub max_retries: u32,
+    /// 是否禁用系统 HTTP 代理。
+    ///
+    /// - `true`：调用 `.no_proxy()` 绕过系统代理（适用于测试/容器环境）
+    /// - `false`（默认）：使用系统 HTTP_PROXY / HTTPS_PROXY 环境变量
+    ///
+    /// 此外，环境变量 `AINS_SYS_NO_PROXY=true` 也会令此标志生效，
+    /// 方便在不修改代码的情况下全局禁用代理。
+    pub no_proxy: bool,
 }
 
 impl ClientConfig {
@@ -39,6 +47,7 @@ impl ClientConfig {
             base_url: base_url.into(),
             timeout_secs: 30,
             max_retries: 3,
+            no_proxy: false,
         }
     }
 
@@ -51,6 +60,12 @@ impl ClientConfig {
     /// 设置最大重试次数（0 表示禁用重试）
     pub fn with_max_retries(mut self, retries: u32) -> Self {
         self.max_retries = retries;
+        self
+    }
+
+    /// 设置是否禁用系统 HTTP 代理
+    pub fn with_no_proxy(mut self, no_proxy: bool) -> Self {
+        self.no_proxy = no_proxy;
         self
     }
 
@@ -129,6 +144,7 @@ impl Default for ClientConfig {
             base_url: "http://127.0.0.1:8080".to_string(),
             timeout_secs: 30,
             max_retries: 3,
+            no_proxy: false,
         }
     }
 }

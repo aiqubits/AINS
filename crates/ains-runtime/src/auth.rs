@@ -13,6 +13,9 @@ pub struct JwtClaims {
     /// Whether the original login had "remember me" enabled
     #[serde(default)]
     pub remember: bool,
+    /// Tenant ID for multi-tenant isolation
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 /// Authenticated user information extracted from JWT.
@@ -31,6 +34,8 @@ pub struct AuthUser {
     pub token_version: i32,
     /// Whether the original login had "remember me" enabled
     pub remember: bool,
+    /// Tenant ID for multi-tenant isolation
+    pub tenant_id: String,
 }
 
 impl From<JwtClaims> for AuthUser {
@@ -42,6 +47,7 @@ impl From<JwtClaims> for AuthUser {
             iat: claims.iat,
             token_version: claims.token_version,
             remember: claims.remember,
+            tenant_id: claims.tenant_id,
         }
     }
 }
@@ -84,6 +90,7 @@ mod tests {
             role: "admin".to_string(),
             token_version: 1,
             remember: false,
+            tenant_id: "default".to_string(),
         }
     }
 

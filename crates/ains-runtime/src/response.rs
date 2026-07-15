@@ -4,6 +4,7 @@ use http::HeaderName;
 use http::StatusCode;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::HttpError;
 
@@ -20,6 +21,9 @@ pub enum ResponseBody {
     Empty,
     Json(JsonValue),
     Bytes(Bytes),
+    /// Server-Sent Events streaming response.
+    /// Each item is a complete SSE event string (as raw bytes).
+    Sse(UnboundedReceiver<Result<Bytes, String>>),
 }
 
 impl Response {
@@ -68,6 +72,32 @@ impl Response {
         self.content_type = Some(content_type);
     }
 
+    /// Create a new SSE streaming response.
+    pub fn sse(rx: UnboundedReceiver<Result<Bytes, String>>) -> Self {
+        let mut res = Self::new();
+        res.body = ResponseBody::Sse(rx);
+        res.content_type = Some("text/event-stream");
+        res
+    }
+
+    /// Returns `true` if this is an SSE streaming response.
+    pub fn is_sse(&self) -> bool {
+        matches!(self.body, ResponseBody::Sse(_))
+    }
+
+    /// Take ownership of the SSE receiver.
+    /// Returns `None` if this is not an SSE response.
+    pub fn take_sse_receiver(&mut self) -> Option<UnboundedReceiver<Result<Bytes, String>>> {
+        let old = std::mem::replace(&mut self.body, ResponseBody::Empty);
+        match old {
+            ResponseBody::Sse(rx) => Some(rx),
+            other => {
+                self.body = other;
+                None
+            }
+        }
+    }
+
     /// Check if explicit Content-Type is set.
     pub fn content_type(&self) -> Option<&'static str> {
         self.content_type
@@ -102,6 +132,9 @@ impl Response {
                 .map(Bytes::from)
                 .map_err(|e| e.to_string()),
             ResponseBody::Bytes(bytes) => Ok(bytes.clone()),
+            ResponseBody::Sse(_) => {
+                Err("Cannot read bytes from SSE streaming response".to_string())
+            }
         }
     }
 
@@ -195,5 +228,33 @@ mod tests {
         let err = HttpError::bad_request("test");
         let resp: Response = err.into();
         assert!(resp.content_type().is_none());
+    }
+
+    #[test]
+    fn sse_constructor_sets_content_type() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let resp = Response::sse(rx);
+        assert!(resp.is_sse());
+        assert_eq!(resp.content_type(), Some("text/event-stream"));
+    }
+
+    #[test]
+    fn take_sse_receiver_returns_receiver() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut resp = Response::sse(rx);
+        assert!(resp.is_sse());
+        let taken = resp.take_sse_receiver();
+        assert!(taken.is_some(), "should return the receiver");
+        assert!(!resp.is_sse(), "should no longer be SSE after taking");
+        // The channel is still usable (tx is still alive)
+        let _ = tx.send(Ok(Bytes::from("data: hello\n\n")));
+    }
+
+    #[test]
+    fn non_sse_take_receiver_returns_none() {
+        let mut resp = Response::new();
+        assert!(resp.take_sse_receiver().is_none());
+        let mut resp = Response::with_status(StatusCode::OK);
+        assert!(resp.take_sse_receiver().is_none());
     }
 }

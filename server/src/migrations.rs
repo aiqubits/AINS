@@ -126,5 +126,12 @@ mod tests {
         assert_eq!(migrations.len(), 1);
         assert!(migrations[0].1.contains("CREATE TABLE IF NOT EXISTS users"));
         assert!(migrations[0].1.contains("token_version"));
+        assert!(
+            migrations[0]
+                .1
+                .contains("CREATE TABLE IF NOT EXISTS tenants")
+        );
+        assert!(migrations[0].1.contains("ai_gateway_channels"));
+        assert!(migrations[0].1.contains("token_usage"));
     }
 }

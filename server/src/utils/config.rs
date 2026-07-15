@@ -1,6 +1,36 @@
 use anyhow::{Context, Result};
 use config::{Config, Environment, File};
 use serde::Deserialize;
+use std::path::Path;
+
+/// Resolve a config file path relative to the workspace root.
+///
+/// When the given `path` does not exist as-is (e.g. tests run from the `server/`
+/// crate directory while `config.toml` lives at the workspace root), this function
+/// falls back to the canonical path derived from `CARGO_MANIFEST_DIR`.
+///
+/// # Compile-time path caveat
+///
+/// `env!("CARGO_MANIFEST_DIR")` is baked into the binary at compile time.
+/// If the binary is relocated to a machine with a different directory layout
+/// and the config path does not exist at the original compile-time path,
+/// only the first branch (`Path::new(path).exists()`) can succeed.
+/// In production Docker deployments this is never an issue because the
+/// binary and config live at fixed paths (see Dockerfile.server).
+fn resolve_config_path(path: &str) -> String {
+    if Path::new(path).exists() {
+        return path.to_string();
+    }
+    // Try resolving relative to the workspace root (parent of the crate directory)
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    if let Some(workspace_root) = manifest.parent() {
+        let alt = workspace_root.join(path);
+        if alt.exists() {
+            return alt.to_string_lossy().to_string();
+        }
+    }
+    path.to_string()
+}
 
 /// Application configuration structure
 #[derive(Debug, Deserialize, Clone)]
@@ -50,6 +80,12 @@ pub struct AppConfig {
     #[serde(default = "default_cookie_secure")]
     pub cookie_secure: bool,
 
+    /// Encryption key for AI Gateway channel API keys (AES-256-GCM).
+    /// Must be at least 32 bytes when encoded. If not set, falls back to
+    /// `jwt_secret` for backward compatibility during migration.
+    #[serde(default = "default_gateway_encryption_key")]
+    pub gateway_encryption_key: String,
+
     /// System admin account email (auto-seeded on first boot)
     #[serde(default = "default_system_admin_email")]
     pub system_admin_email: String,
@@ -73,6 +109,17 @@ pub struct AppConfig {
     /// WeChat Official Account configuration (optional)
     #[serde(default)]
     pub wechat: WechatAccountConfig,
+
+    /// AI Gateway quota and circuit-breaker configuration
+    #[serde(default)]
+    pub quota: QuotaConfig,
+
+    /// Whether to disable HTTP proxy for all outbound reqwest clients.
+    /// When `true`, `.no_proxy()` is applied to all HTTP clients.
+    /// When `false` (default), the system's HTTP proxy settings are used.
+    /// Can be overridden by environment variable: `AINS_SYS_NO_PROXY`
+    #[serde(default)]
+    pub sys_no_proxy: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -241,6 +288,12 @@ fn default_jwt_secret() -> String {
     "REPLACE_ME_WITH_A_STRONG_SECRET".to_string()
 }
 
+/// Default gateway encryption key — falls back to jwt_secret if not set.
+/// In production, set AINS_GATEWAY_ENCRYPTION_KEY to a separate 32+ byte secret.
+fn default_gateway_encryption_key() -> String {
+    String::new()
+}
+
 fn default_system_admin_email() -> String {
     "admin@ains.local".to_string()
 }
@@ -402,6 +455,66 @@ impl Default for WechatAccountConfig {
     }
 }
 
+/// AI Gateway quota and circuit-breaker configuration.
+#[derive(Debug, Deserialize, Clone)]
+pub struct QuotaConfig {
+    /// Channel-level max requests per minute (default: 60).
+    #[serde(default = "default_channel_max_rpm")]
+    pub channel_max_rpm: u64,
+
+    /// Channel-level max tokens per minute (default: 100000).
+    #[serde(default = "default_channel_max_tpm")]
+    pub channel_max_tpm: u64,
+
+    /// Tenant-level max requests per minute per capability (default: 600).
+    #[serde(default = "default_tenant_max_rpm")]
+    pub tenant_max_rpm: u64,
+
+    /// Consecutive upstream failures before circuit breaker trips (default: 5).
+    #[serde(default = "default_cb_failure_threshold")]
+    pub cb_failure_threshold: u32,
+
+    /// Seconds to wait before retrying a tripped circuit (default: 60).
+    #[serde(default = "default_cb_retry_after_secs")]
+    pub cb_retry_after_secs: u64,
+
+    /// Whether quota checks fail-open when Redis is unavailable (default: true).
+    #[serde(default = "default_quota_fail_open")]
+    pub fail_open: bool,
+}
+
+impl Default for QuotaConfig {
+    fn default() -> Self {
+        Self {
+            channel_max_rpm: default_channel_max_rpm(),
+            channel_max_tpm: default_channel_max_tpm(),
+            tenant_max_rpm: default_tenant_max_rpm(),
+            cb_failure_threshold: default_cb_failure_threshold(),
+            cb_retry_after_secs: default_cb_retry_after_secs(),
+            fail_open: default_quota_fail_open(),
+        }
+    }
+}
+
+fn default_channel_max_rpm() -> u64 {
+    60
+}
+fn default_channel_max_tpm() -> u64 {
+    100_000
+}
+fn default_tenant_max_rpm() -> u64 {
+    600
+}
+fn default_cb_failure_threshold() -> u32 {
+    5
+}
+fn default_cb_retry_after_secs() -> u64 {
+    60
+}
+fn default_quota_fail_open() -> bool {
+    true
+}
+
 fn default_captcha_ttl() -> u64 {
     300
 }
@@ -429,11 +542,13 @@ fn default_trigger_keywords() -> Vec<String> {
 /// 2. Environment-specific config file (config.{env}.toml)
 /// 3. Environment variables with AINS_ prefix
 pub fn load_config(config_path: &str, env: &str) -> Result<AppConfig> {
+    let resolved_path = resolve_config_path(config_path);
+    let resolved_env_path = resolve_config_path(&format!("config.{}", env));
     let settings = Config::builder()
         // Load base configuration file
-        .add_source(File::with_name(config_path).required(false))
+        .add_source(File::with_name(&resolved_path).required(false))
         // Load environment-specific configuration
-        .add_source(File::with_name(&format!("config.{}", env)).required(false))
+        .add_source(File::with_name(&resolved_env_path).required(false))
         // Load environment variables with AINS_ prefix
         .add_source(
             Environment::with_prefix("AINS")
@@ -509,6 +624,7 @@ mod tests {
             redis_url: "redis://127.0.0.1".to_string(),
             cache_max_connections: 10,
             jwt_secret: "secret".to_string(),
+            gateway_encryption_key: String::new(),
             jwt_expiry_seconds: 7200,
             jwt_remember_expiry_seconds: 2592000,
             refresh_token_expiry_seconds: 7776000,
@@ -522,6 +638,8 @@ mod tests {
             database_read: DatabaseReadConfig::default(),
             email: emailserver::EmailConfig::default(),
             wechat: WechatAccountConfig::default(),
+            quota: QuotaConfig::default(),
+            sys_no_proxy: false,
         };
         let cloned = config.clone();
         assert_eq!(config.database_url, cloned.database_url);
@@ -590,6 +708,42 @@ mod tests {
         assert_eq!(
             config.server.allowed_origins[0],
             "https://single.example.com"
+        );
+    }
+
+    #[test]
+    fn resolve_config_path_exists_returns_as_is() {
+        let result = resolve_config_path("Cargo.toml");
+        assert!(
+            result.ends_with("Cargo.toml"),
+            "should end with Cargo.toml, got: {}",
+            result
+        );
+        assert!(
+            std::path::Path::new(&result).exists(),
+            "resolved path should exist"
+        );
+    }
+
+    #[test]
+    fn resolve_config_path_nonexistent_returns_original() {
+        let result = resolve_config_path("nonexistent_file_xyz.toml");
+        assert_eq!(result, "nonexistent_file_xyz.toml");
+    }
+
+    #[test]
+    fn resolve_config_path_workspace_root_fallback() {
+        let result = resolve_config_path("config.toml");
+        assert!(
+            result.ends_with("config.toml"),
+            "should resolve to config.toml, got: {}",
+            result
+        );
+        let p = std::path::Path::new(&result);
+        assert!(p.exists(), "resolved config.toml should exist");
+        assert!(
+            p.is_absolute(),
+            "resolved config.toml path should be absolute"
         );
     }
 }

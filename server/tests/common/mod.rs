@@ -14,6 +14,12 @@ pub mod axum;
 #[cfg(feature = "ains-salvo")]
 pub mod salvo;
 
+/// Default test password used for all integration test user registrations.
+///
+/// Defined once here to ensure consistency across all test helpers
+/// (axum::register_and_login, salvo::register_and_login, etc.).
+pub const DEFAULT_TEST_PASSWORD: &str = "Password123!";
+
 /// Generate a unique test email using a nanosecond timestamp.
 pub fn unique_email(label: &str) -> String {
     let ts = std::time::SystemTime::now()

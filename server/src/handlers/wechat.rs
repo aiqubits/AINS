@@ -32,6 +32,7 @@ pub struct WxLoginResponse {
     pub expires_in: u64,
     pub user_id: String,
     pub role: String,
+    pub tenant_id: String,
 }
 
 /// POST /api/public/auth/wx-login
@@ -96,7 +97,33 @@ async fn wx_login_inner(
     };
 
     // 3. Look up the user's role and token_version.
-    let (role, token_version) = lookup_user_role_and_version(state, user_id).await?;
+    let (role, token_version, tenant_id) = lookup_user_role_and_version(state, user_id).await?;
+
+    // 3.5. Reject login for disabled tenants — same security boundary
+    // as the email login endpoint (services/auth.rs login()).
+    match crate::services::tenant::TenantService::with_cache(state.db.clone(), state.cache.clone())
+        .is_active(&tenant_id)
+        .await
+    {
+        Ok(true) => { /* tenant is active — continue */ }
+        Ok(false) => {
+            tracing::info!(
+                user_id = %user_id,
+                tenant_id = %tenant_id,
+                "WeChat login rejected: tenant is not active"
+            );
+            return Err(ApiError::BadRequest("WeChat login failed".to_string()));
+        }
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                user_id = %user_id,
+                tenant_id = %tenant_id,
+                "Failed to check tenant status — rejecting WeChat login (fail-closed)"
+            );
+            return Err(ApiError::BadRequest("WeChat login failed".to_string()));
+        }
+    }
 
     // 4. Issue JWT.
     let jwt_expiry = state.config.jwt_expiry_seconds;
@@ -107,6 +134,7 @@ async fn wx_login_inner(
         jwt_expiry,
         false,
         token_version,
+        &tenant_id,
     )
     .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?;
 
@@ -131,16 +159,17 @@ async fn wx_login_inner(
             expires_in: jwt_expiry,
             user_id: user_id.to_string(),
             role,
+            tenant_id,
         },
         cookies,
     ))
 }
 
-/// Look up a user's role and token_version by id.
+/// Look up a user's role, token_version, and tenant_id by id.
 async fn lookup_user_role_and_version(
     state: &AppState,
     user_id: i64,
-) -> Result<(String, i32), ApiError> {
+) -> Result<(String, i32, String), ApiError> {
     use crate::repositories::user::Entity as UserEntity;
     use sea_orm::EntityTrait;
 
@@ -153,7 +182,7 @@ async fn lookup_user_role_and_version(
         })?
         .ok_or_else(|| ApiError::Internal("An unexpected error occurred".to_string()))?;
 
-    Ok((user.role, user.token_version))
+    Ok((user.role, user.token_version, user.tenant_id))
 }
 
 // ── WeChat configuration status endpoint ───────────────────────────────────

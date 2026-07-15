@@ -8,7 +8,7 @@
 # Replace CHANGE_ME_POSTGRES_PASSWORD with a strong password
 # Format: postgres://user:password@host:port/database
 # Can be overridden by environment variable: AINS_DATABASE_URL
-database_url = "postgres://postgres:CHANGE_ME_POSTGRES_PASSWORD@127.0.0.1:5432/ains"
+database_url = "postgres://ains:CHANGE_ME_POSTGRES_PASSWORD@127.0.0.1:5432/ains"
 
 # Redis connection URL (for caching, distributed locking, and rate limiting)
 # NOTE: When using Docker Compose, this is overridden by AINS_REDIS_URL
@@ -40,6 +40,21 @@ database_read_urls = []
 # The server will refuse to start with this placeholder in non-development mode.
 # Can be overridden by environment variable: AINS_JWT_SECRET
 jwt_secret = "REPLACE_ME_WITH_A_STRONG_SECRET"
+
+# Encryption key for AI Gateway channel API keys (AES-256-GCM).
+# If not set, falls back to jwt_secret (not recommended for production).
+# Generate with: openssl rand -base64 32
+# Can be overridden by environment variable: AINS_GATEWAY_ENCRYPTION_KEY
+gateway_encryption_key = ""
+
+# Whether to disable system HTTP proxy for all outbound reqwest clients.
+# When true, the server bypasses HTTP_PROXY / HTTPS_PROXY environment
+# variables and connects directly. Useful in container/development
+# environments where system proxy is not configured or interferes with
+# local connections (e.g. wiremock mock servers in tests).
+# Default: false (use system proxy if configured).
+# Can be overridden by environment variable: AINS_SYS_NO_PROXY
+# sys_no_proxy = false
 
 # JWT token expiration time in seconds (default: 1 hour)
 # Can be overridden by environment variable: AINS_JWT_EXPIRY_SECONDS
@@ -209,3 +224,24 @@ timeout_secs = 30
 
 # Keywords that trigger captcha generation (comma-separated)
 # trigger_keywords = ["验证码", "登录码", "login"]
+
+# AI Gateway quota and circuit-breaker configuration
+# All fields have sensible defaults — only uncomment if you need to override.
+[quota]
+# Channel-level max requests per minute (default: 60)
+# channel_max_rpm = 60
+
+# Channel-level max tokens per minute (default: 100000)
+# channel_max_tpm = 100000
+
+# Tenant-level max requests per minute per capability (default: 600)
+# tenant_max_rpm = 600
+
+# Consecutive upstream failures before circuit breaker trips (default: 5)
+# cb_failure_threshold = 5
+
+# Seconds to wait before retrying a tripped circuit (default: 60)
+# cb_retry_after_secs = 60
+
+# Whether to fail-open (allow requests) when Redis is unavailable (default: true)
+# fail_open = true

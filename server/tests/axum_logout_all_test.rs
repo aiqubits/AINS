@@ -52,12 +52,23 @@ async fn create_test_app() -> Router {
 
     let cache = CacheService::new(&config.redis_url, config.cache_max_connections).await;
 
+    let gateway_secret = if !config.gateway_encryption_key.is_empty() {
+        &config.gateway_encryption_key
+    } else {
+        &config.jwt_secret
+    };
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        gateway_secret,
+    ));
+
     let state = AppState {
         db,
         cache,
         config: Arc::new(config),
         email: emailserver::EmailService::new(emailserver::EmailConfig::default()),
         wechat: None,
+        gateway,
     };
 
     let cors = CorsLayer::new()
@@ -491,4 +502,56 @@ async fn test_logout_all_current_session_succeeds() {
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["message"], "Logged out from all devices");
+}
+
+/// (6) Token version cache is invalidated after logout-all.
+///
+/// Regression test for the scenario where `revoke_all_sessions` increments
+/// `token_version` but does NOT invalidate the `user:token_version:{id}`
+/// Redis cache.  The bug: if the cache was populated *before* logout-all
+/// (e.g. by a prior auth-middleware check), a subsequent request with the
+/// old JWT would find a cached `token_version` matching the JWT claim and
+/// incorrectly accept the request for up to 30 seconds (the cache TTL).
+///
+/// Test flow:
+/// 1. Register + login + call a protected endpoint to populate the cache.
+/// 2. Call logout-all (increments token_version in DB).
+/// 3. Call the protected endpoint again with the old JWT.
+/// 4. Assert 401 — proving the cache was invalidated.
+#[tokio::test]
+async fn test_logout_all_invalidates_token_version_cache() {
+    let app = create_test_app().await;
+    let email = unique_email("token_cache_inval");
+
+    // 1. Register + login to get a JWT
+    let old_token = register_and_login(&app, &email).await;
+
+    // 2. Call a protected endpoint to populate the user:token_version:{id} cache
+    let status = check_token_valid(&app, &old_token).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "JWT should be valid before logout-all"
+    );
+
+    // 3. Call logout-all — token_version is incremented in DB
+    let status = call_logout_all(&app, &old_token).await;
+    assert_eq!(status, StatusCode::OK, "logout-all should succeed");
+
+    // 4. Old JWT should be rejected immediately.
+    //    If the token_version cache is NOT invalidated, this check might
+    //    incorrectly pass because the cached value still matches the JWT.
+    assert_eq!(
+        check_token_valid(&app, &old_token).await,
+        StatusCode::UNAUTHORIZED,
+        "Old JWT must be rejected after logout-all even when cache was pre-populated"
+    );
+
+    // 5. Re-login and verify the new JWT works
+    let new_token = login(&app, &email, "Password123!", false).await;
+    assert_eq!(
+        check_token_valid(&app, &new_token).await,
+        StatusCode::OK,
+        "New JWT obtained after logout-all should be valid"
+    );
 }

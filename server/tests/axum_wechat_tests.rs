@@ -87,12 +87,18 @@ async fn create_wechat_state_with_len(
         db.clone(),
     );
 
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        &app_config.jwt_secret,
+    ));
+
     ains_server::AppState {
         db,
         cache,
         config: Arc::new(app_config),
         email: emailserver::EmailService::new(emailserver::EmailConfig::default()),
         wechat,
+        gateway,
     }
 }
 
@@ -167,12 +173,18 @@ async fn build_router_without_wechat() -> Router {
     let db = create_test_db().await;
     let cache = create_cache().await;
 
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        &config.jwt_secret,
+    ));
+
     let state = ains_server::AppState {
         db,
         cache,
         config: Arc::new(config),
         email: emailserver::EmailService::new(emailserver::EmailConfig::default()),
         wechat: None,
+        gateway,
     };
 
     let cors = CorsLayer::new()

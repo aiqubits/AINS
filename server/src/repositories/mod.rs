@@ -1,5 +1,8 @@
+pub mod channel;
 pub mod refresh_token;
 pub mod snowflake_worker;
+pub mod tenant;
+pub mod token_usage;
 pub mod user;
 
 pub use refresh_token::{

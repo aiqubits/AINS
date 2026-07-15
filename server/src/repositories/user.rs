@@ -70,6 +70,9 @@ pub struct Model {
 
     /// WeChat Official Account openid (bound on first wx-login)
     pub wx_openid: Option<String>,
+
+    /// Owning server-side tenant. Clients never select this value themselves.
+    pub tenant_id: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -116,6 +119,7 @@ pub struct UserResponse {
     pub email: String,
     pub name: String,
     pub role: String,
+    pub tenant_id: String,
     pub email_verified: bool,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
@@ -140,6 +144,7 @@ impl From<Model> for UserResponse {
             email: model.email,
             name: model.name,
             role: model.role,
+            tenant_id: model.tenant_id,
             email_verified: model.email_verified,
             created_at: model.created_at,
             updated_at: model.updated_at,
@@ -180,6 +185,7 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
 
         let response = UserResponse::from(model.clone());
@@ -188,6 +194,7 @@ mod tests {
         assert_eq!(response.email, "test@example.com");
         assert_eq!(response.name, "Test User");
         assert_eq!(response.role, "user");
+        assert_eq!(response.tenant_id, "default");
         assert_eq!(response.created_at, now);
         assert_eq!(response.updated_at, now);
         assert_eq!(response.token_version, 1);
@@ -248,6 +255,7 @@ mod tests {
             token_version: 1,
             balance: 500,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
 
         let json = serde_json::to_string(&response).unwrap();

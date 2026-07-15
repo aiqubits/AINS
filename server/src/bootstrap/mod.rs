@@ -15,6 +15,8 @@ use crate::{
     AppConfig, AppState, AutoRouter, migrations,
     repositories::user::{Column, Entity as UserEntity},
     routes::helpers::create_rate_limiter,
+    services::gateway::GatewayService,
+    services::{MeteringService, QuotaService},
     utils::{db_router::connect_db, init_logger, load_config},
 };
 use crate::{AppRouter, AppRuntime, Runtime};
@@ -151,12 +153,32 @@ pub fn create_app_state(
     let email_service = emailserver::EmailService::new(config.email.clone());
     let wechat =
         crate::services::wechat::init_wechat_components(&config.wechat, &cache, db.clone());
+    let secret = if !config.gateway_encryption_key.is_empty() {
+        &config.gateway_encryption_key
+    } else {
+        &config.jwt_secret
+    };
+    let rate_limiter = create_rate_limiter(&cache);
+    let quota = QuotaService::new(
+        (rate_limiter.is_available()).then_some(rate_limiter),
+        cache.clone(),
+        Arc::new(config.quota.clone()),
+    );
+    let metering = MeteringService::new(db.clone());
+    let gateway = Arc::new(GatewayService::with_quota(
+        db.clone(),
+        secret,
+        quota,
+        Some(metering),
+        config.sys_no_proxy,
+    ));
     AppState {
         db,
         cache,
         config: Arc::new(config),
         email: email_service,
         wechat,
+        gateway,
     }
 }
 
@@ -191,6 +213,13 @@ pub async fn bootstrap(cli_args: CliArgs) -> Result<BootstrapResult> {
                  Set AINS_SYSTEM_ADMIN_EMAIL and AINS_SYSTEM_ADMIN_PASSWORD environment variables \
                  or update config.toml.",
                 cli_args.env
+            );
+        }
+        if app_config.gateway_encryption_key.is_empty() {
+            tracing::warn!(
+                "gateway_encryption_key is not set — AI Gateway channel API keys will be \
+                 encrypted using jwt_secret. Set AINS_GATEWAY_ENCRYPTION_KEY to a separate \
+                 32+ byte secret in production. Generate: openssl rand -base64 32"
             );
         }
     }
@@ -254,6 +283,7 @@ pub async fn bootstrap(cli_args: CliArgs) -> Result<BootstrapResult> {
 
 /// Seed system admin account on first boot.
 async fn seed_system_admin(db: &sea_orm::DatabaseConnection, config: &AppConfig) -> Result<()> {
+    use crate::repositories::tenant::DEFAULT_TENANT_ID;
     use crate::repositories::user::ActiveModel;
     use crate::utils::password::hash_password;
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -311,6 +341,7 @@ async fn seed_system_admin(db: &sea_orm::DatabaseConnection, config: &AppConfig)
         password_reset_failed_attempts: Set(0),
         balance: Set(10000),
         wx_openid: Set(None),
+        tenant_id: Set(DEFAULT_TENANT_ID.to_string()),
     };
 
     match user.insert(db).await {

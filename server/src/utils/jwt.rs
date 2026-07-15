@@ -10,6 +10,7 @@ pub fn generate_token(
     expiry_seconds: u64,
     remember: bool,
     token_version: i32,
+    tenant_id: &str,
 ) -> anyhow::Result<String> {
     use anyhow::Context;
     use jsonwebtoken::{EncodingKey, Header, encode};
@@ -27,6 +28,7 @@ pub fn generate_token(
         role: role.to_string(),
         token_version,
         remember,
+        tenant_id: tenant_id.to_string(),
     };
 
     encode(
@@ -43,7 +45,7 @@ mod tests {
 
     #[test]
     fn generate_token_roundtrip() {
-        let token = generate_token("42", "admin", "secret-key", 3600, false, 1).unwrap();
+        let token = generate_token("42", "admin", "secret-key", 3600, false, 1, "default").unwrap();
         let claims = ains_runtime::validate_jwt(&token, "secret-key").unwrap();
         assert_eq!(claims.sub, "42");
         assert_eq!(claims.role, "admin");
@@ -55,7 +57,7 @@ mod tests {
 
     #[test]
     fn generate_token_with_remember() {
-        let token = generate_token("1", "user", "secret", 7200, true, 5).unwrap();
+        let token = generate_token("1", "user", "secret", 7200, true, 5, "default").unwrap();
         let claims = ains_runtime::validate_jwt(&token, "secret").unwrap();
         assert_eq!(claims.sub, "1");
         assert_eq!(claims.token_version, 5);
@@ -64,7 +66,8 @@ mod tests {
 
     #[test]
     fn generate_token_wrong_secret_fails_validation() {
-        let token = generate_token("1", "user", "correct_secret", 3600, false, 1).unwrap();
+        let token =
+            generate_token("1", "user", "correct_secret", 3600, false, 1, "default").unwrap();
         let result = ains_runtime::validate_jwt(&token, "wrong_secret");
         assert!(result.is_err());
     }

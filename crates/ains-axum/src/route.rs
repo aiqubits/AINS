@@ -1,8 +1,14 @@
 use ains_runtime::{HttpError, Response, ResponseBody};
 use axum::body::Body;
 use axum::response::{IntoResponse, Response as AxumResponse};
+use bytes::Bytes;
 use http::StatusCode;
 use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio_stream::Stream;
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 /// 统一 Response 的 axum 包装器，实现 IntoResponse
 pub struct UnifiedResponse(pub Response);
@@ -31,6 +37,11 @@ impl From<HttpError> for UnifiedError {
 
 /// 将统一 Response 转换为 axum Response
 pub fn response_to_axum(mut resp: Response) -> AxumResponse {
+    // SSE streaming response — return early as a streaming response
+    if resp.is_sse() {
+        return response_to_axum_sse(resp);
+    }
+
     let status = resp.status();
 
     // Determine Content-Type: explicit override takes priority, then auto-detect
@@ -64,6 +75,93 @@ pub fn response_to_axum(mut resp: Response) -> AxumResponse {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// A stream wrapper that terminates on the first `Err` item.
+///
+/// Unlike `filter_map` (which skips `Err` items but continues the stream),
+/// this stream returns `Poll::Ready(None)` (stream end) when an `Err` is
+/// received. This ensures that no data after an upstream error reaches the
+/// SSE client.
+struct SseByteStream {
+    inner: UnboundedReceiverStream<Result<Bytes, String>>,
+    terminated: bool,
+}
+
+impl SseByteStream {
+    fn new(rx: UnboundedReceiver<Result<Bytes, String>>) -> Self {
+        Self {
+            inner: UnboundedReceiverStream::new(rx),
+            terminated: false,
+        }
+    }
+}
+
+impl Stream for SseByteStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.terminated {
+            return Poll::Ready(None);
+        }
+        match Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => Poll::Ready(Some(Ok(bytes))),
+            Poll::Ready(Some(Err(e))) => {
+                tracing::error!("SSE stream error: {}", e);
+                this.terminated = true;
+                Poll::Ready(None)
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Convert an SSE response to an axum streaming SSE response.
+///
+/// The SSE events are already pre-formatted (with `event:` and `data:` lines)
+/// by the handler layer. We use `Body::from_stream` to send raw bytes directly
+/// with the `text/event-stream` content type, avoiding axum's `Sse`/`Event`
+/// wrapper which would cause double encoding.
+fn response_to_axum_sse(mut resp: Response) -> AxumResponse {
+    let rx = match resp.take_sse_receiver() {
+        Some(rx) => rx,
+        None => {
+            tracing::error!(
+                "response_to_axum_sse called on non-SSE response — falling back to empty response"
+            );
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    // Stream raw bytes directly — SSE events are pre-formatted
+    let byte_stream = SseByteStream::new(rx);
+
+    let mut builder = http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive");
+
+    // Propagate custom headers (cookies, etc.)
+    // NOTE: content-type, content-length, and connection are set
+    // explicitly above — skip them to prevent handler-level overrides
+    // from breaking the SSE protocol semantics.
+    for (name, value) in resp.take_headers() {
+        if !name.as_str().eq_ignore_ascii_case("content-type")
+            && !name.as_str().eq_ignore_ascii_case("content-length")
+            && !name.as_str().eq_ignore_ascii_case("connection")
+            && let Ok(hv) = http::HeaderValue::from_str(&value)
+        {
+            builder = builder.header(name.as_str(), hv);
+        }
+    }
+
+    let body = Body::from_stream(byte_stream);
+    builder
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 /// 创建 GET 方法路由（接受统一 async handler）
@@ -298,5 +396,112 @@ mod tests {
         let value = cookie_header.to_str().unwrap();
         assert!(value.contains("old_session="), "Should clear old_session");
         assert!(value.contains("Max-Age=0"), "Should set Max-Age=0");
+    }
+
+    #[tokio::test]
+    async fn sse_response_has_correct_content_type() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(Bytes::from("data: hello\n\n")));
+        drop(tx);
+        let resp = Response::sse(rx);
+        let axum_resp = response_to_axum(resp);
+        assert_eq!(axum_resp.status(), StatusCode::OK);
+        let ct = axum_resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert_eq!(ct, "text/event-stream");
+    }
+
+    #[tokio::test]
+    async fn sse_response_preserves_custom_headers() {
+        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut resp = Response::sse(rx);
+        resp.insert_header("x-custom", "test-value");
+        let axum_resp = response_to_axum(resp);
+        assert_eq!(
+            axum_resp
+                .headers()
+                .get("x-custom")
+                .and_then(|v| v.to_str().ok()),
+            Some("test-value")
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_response_streams_data_correctly() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(Bytes::from(
+            "event: test\ndata: {\"key\":\"value\"}\n\n",
+        )));
+        drop(tx); // Close the channel so the stream terminates
+        let resp = Response::sse(rx);
+        let axum_resp = response_to_axum(resp);
+        let bytes = axum_resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(body_str.contains("event: test"));
+        assert!(body_str.contains("data: {"));
+        assert!(body_str.contains("\"key\""));
+    }
+
+    #[tokio::test]
+    async fn sse_response_non_sse_fallback() {
+        // Calling the SSE converter directly with a non-SSE response should error
+        let resp = Response::new();
+        let axum_resp = super::response_to_axum_sse(resp);
+        assert_eq!(axum_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn sse_response_terminates_on_stream_error() {
+        // When an Err is sent through the SSE channel, the filter_map drops
+        // the error (returning None), terminating the stream. Any data sent
+        // AFTER the error should NOT appear in the response body.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Err("connection lost".to_string()));
+        let _ = tx.send(Ok(Bytes::from("data: this should not appear\n\n")));
+        drop(tx);
+
+        let resp = Response::sse(rx);
+        let axum_resp = response_to_axum(resp);
+        let bytes = axum_resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
+
+        // The error terminates the stream — data after the error is lost
+        assert!(
+            !body_str.contains("this should not appear"),
+            "Data sent after Err must NOT reach the client"
+        );
+        assert!(
+            body_str.is_empty(),
+            "Body should be empty since the error was the first event, got: {:?}",
+            body_str
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_response_data_before_error_is_delivered() {
+        // Valid data sent BEFORE an error should still reach the client.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let _ = tx.send(Ok(Bytes::from("data: valid data\n\n")));
+        let _ = tx.send(Err("connection lost".to_string()));
+        let _ = tx.send(Ok(Bytes::from("data: after error\n\n")));
+        drop(tx);
+
+        let resp = Response::sse(rx);
+        let axum_resp = response_to_axum(resp);
+        let bytes = axum_resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
+
+        // Valid data before the error is delivered; data after error is not
+        assert!(
+            body_str.contains("valid data"),
+            "Data sent before Err must be delivered"
+        );
+        assert!(
+            !body_str.contains("after error"),
+            "Data sent after Err must NOT reach the client"
+        );
     }
 }

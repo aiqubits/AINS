@@ -16,6 +16,7 @@ pub use utils::AppConfig;
 pub use utils::db_router::AutoRouter;
 
 use crate::services::CacheService;
+use crate::services::gateway::GatewayService;
 use sea_orm::EntityTrait;
 
 use ains_runtime::MiddlewareState;
@@ -44,6 +45,9 @@ pub struct AppState {
     pub email: emailserver::EmailService,
     /// WeChat captcha-login components (None when disabled).
     pub wechat: Option<crate::services::wechat::WechatComponents>,
+    /// AI Gateway service for channel management and LLM proxy.
+    /// Pre-created with HKDF-derived AES key and shared reqwest::Client.
+    pub gateway: Arc<GatewayService>,
 }
 
 #[async_trait]

@@ -5,6 +5,11 @@ use crate::handlers::api::{
     adjust_balance, change_my_password, create_user, delete_user, get_me, get_user, health_check,
     list_users, logout_all, set_balance, update_user,
 };
+use crate::handlers::gateway::{create_channel, disable_channel, list_channels, update_channel};
+use crate::handlers::responses::responses_chat;
+use crate::handlers::tenant::{
+    create_tenant, delete_tenant, list_tenants, move_user_tenant, update_tenant,
+};
 
 pub fn api_routes() -> AppRouter {
     // Admin-only routes: require admin role
@@ -16,7 +21,16 @@ pub fn api_routes() -> AppRouter {
             .route("/users/{id}", put(update_user))
             .route("/users/{id}", delete(delete_user))
             .route("/users/{id}/balance", put(set_balance))
-            .route("/users/{id}/balance/adjust", post(adjust_balance)),
+            .route("/users/{id}/balance/adjust", post(adjust_balance))
+            .route("/users/{id}/tenant", put(move_user_tenant))
+            .route("/tenants", get(list_tenants))
+            .route("/tenants", post(create_tenant))
+            .route("/tenants/{id}", put(update_tenant))
+            .route("/tenants/{id}", delete(delete_tenant))
+            .route("/channels", get(list_channels))
+            .route("/channels", post(create_channel))
+            .route("/channels/{id}", put(update_channel))
+            .route("/channels/{id}", delete(disable_channel)),
     );
 
     // Self-service routes for any authenticated user (no admin role required).
@@ -28,6 +42,7 @@ pub fn api_routes() -> AppRouter {
 
     AppRouter::new()
         .route("/health", get(health_check))
+        .route("/ai/chat", post(responses_chat))
         .merge(self_routes)
         .merge(admin_routes)
 }

@@ -20,6 +20,8 @@ use ains_axum::{BodyExt, from_fn, from_fn_with_state};
 use ains_server::middlewares::auth_middleware;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::OnceLock;
+use tokio::sync::Mutex as AsyncMutex;
 use tower::ServiceExt;
 
 // Helper function to create test app
@@ -61,12 +63,23 @@ async fn create_test_app_and_state() -> (Router, ains_server::AppState) {
     // Create Redis client (optional)
     let cache = CacheService::new(&config.redis_url, config.cache_max_connections).await;
 
+    let gateway_secret = if !config.gateway_encryption_key.is_empty() {
+        &config.gateway_encryption_key
+    } else {
+        &config.jwt_secret
+    };
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        gateway_secret,
+    ));
+
     let state = AppState {
         db,
         cache,
         config: Arc::new(config),
         email: emailserver::EmailService::new(emailserver::EmailConfig::default()),
         wechat: None,
+        gateway,
     };
 
     // Configure CORS
@@ -2632,6 +2645,121 @@ async fn test_reset_password_expired_code() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
+/// Reset-password for a user whose tenant is disabled must return 400.
+///
+/// The password_reset service rejects reset for disabled tenants (same
+/// security boundary as the login endpoint).  The user's tenant is checked
+/// before verifying the reset code, so even a valid code is rejected.
+#[tokio::test]
+async fn test_reset_password_disabled_tenant_rejected() {
+    use ains_server::utils::load_config;
+    use argon2::{Argon2, PasswordHasher, password_hash::SaltString};
+    use jsonwebtoken::{DecodingKey, Validation, decode};
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    let app = create_test_app().await;
+
+    let email = unique_email("rst_dsb_tnt");
+    let token = register_and_login(&app, &email).await;
+
+    // Decode JWT to get user_id
+    let config = load_config("config.toml", "development").expect("Failed to load config");
+    let mut validation = Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.set_issuer(&["ains-server"]);
+    validation.set_audience(&["ains"]);
+    let token_data = decode::<ains_runtime::JwtClaims>(
+        &token,
+        &DecodingKey::from_secret(config.jwt_secret.as_bytes()),
+        &validation,
+    )
+    .expect("Failed to decode token");
+    let user_id: i64 = token_data.claims.sub.parse().expect("Invalid user ID");
+
+    let db = Database::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    // Create a new tenant
+    let tenant_id = uuid::Uuid::new_v4().to_string();
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "INSERT INTO tenants (id, name, status, created_at) VALUES ($1, $2, 'active', NOW())",
+        [tenant_id.clone().into(), "Reset Tenant".into()],
+    ))
+    .await
+    .expect("Failed to create test tenant");
+
+    // Move user to the new tenant
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE users SET tenant_id = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2",
+        [tenant_id.clone().into(), user_id.into()],
+    ))
+    .await
+    .expect("Failed to move user tenant");
+
+    // Disable the tenant
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE tenants SET status = 'disabled' WHERE id = $1",
+        [tenant_id.clone().into()],
+    ))
+    .await
+    .expect("Failed to disable tenant");
+
+    // Seed a valid reset code
+    use rand::Rng;
+    let code_int = rand::thread_rng().gen_range(0..1_000_000);
+    let code = format!("{:06}", code_int);
+    let argon2 = Argon2::default();
+    let salt = SaltString::generate(&mut rand::thread_rng());
+    let code_hash = argon2
+        .hash_password(code.as_bytes(), &salt)
+        .expect("Failed to hash reset code")
+        .to_string();
+
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::minutes(60);
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE users SET password_reset_token_hash = $1, password_reset_expires_at = $2, \
+         password_reset_sent_at = $3, password_reset_failed_attempts = 0, updated_at = NOW() \
+         WHERE id = $4",
+        [
+            code_hash.into(),
+            expires_at.into(),
+            now.into(),
+            user_id.into(),
+        ],
+    ))
+    .await
+    .expect("Failed to seed reset code");
+
+    // Attempt to reset password with the valid code — must fail because
+    // the tenant is disabled (returns InvalidOrExpired for anti-enumeration).
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/public/auth/reset-password")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_string(&json!({
+                        "email": &email,
+                        "code": code,
+                        "new_password": "NewPassword456!"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
 // ── Cache Invalidation Integration Tests ─────────────────────────────────
 //
 // These tests verify that UserService write operations properly invalidate
@@ -2697,6 +2825,7 @@ async fn test_cache_invalidation_after_user_update() {
                 role: None,
             },
             "system",
+            "default",
         )
         .await
         .expect("update_user failed");
@@ -2814,7 +2943,7 @@ async fn test_cache_invalidation_after_delete() {
     assert!(cached.is_some(), "user should be cached before delete");
 
     // Delete the user — should invalidate cache
-    svc.delete_user(user.id.as_i64(), "system", 0)
+    svc.delete_user(user.id.as_i64(), "system", 0, "default")
         .await
         .expect("delete_user failed");
 
@@ -2872,7 +3001,7 @@ async fn test_cache_invalidation_after_balance_change() {
 
     // Set balance — should invalidate cache
     let updated = svc
-        .set_balance(user.id.as_i64(), 500, "system")
+        .set_balance(user.id.as_i64(), 500, "system", "default")
         .await
         .expect("set_balance failed");
     assert_eq!(updated.balance, 500);
@@ -2893,8 +3022,18 @@ async fn test_cache_invalidation_after_balance_change() {
 
 // ── Pagination Count Cache Integration Tests ────────────────────────────
 
+/// Serialise execution of tests that directly check the count-cache key in
+/// Redis.  Without this serialisation, parallel tests that also create/delete
+/// users (and therefore invalidate the count cache) can make the count key
+/// temporarily empty during the assertion window.
+fn count_cache_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
+
 #[tokio::test]
 async fn test_count_cache_populated_on_list_users() {
+    let _guard = count_cache_lock().lock().await;
     use ains_server::repositories::user::CreateUserInput;
     use ains_server::services::UserService;
     use ains_server::services::user::PaginationParams;
@@ -2902,7 +3041,7 @@ async fn test_count_cache_populated_on_list_users() {
     let (_app, state) = create_test_app_and_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
     let role = "admin";
-    let count_key = format!("user:count:{}", role);
+    let count_key = format!("user:count:{}:default", role);
 
     // 清除可能残留的旧缓存，确保第一个 list_users 走缓存未命中路径
     let _ = state.cache.invalidate(&count_key).await;
@@ -2924,7 +3063,7 @@ async fn test_count_cache_populated_on_list_users() {
 
     // First list_users: count cache miss → should populate
     let page1 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert!(page1.total > 0, "should have at least one user");
@@ -2932,7 +3071,7 @@ async fn test_count_cache_populated_on_list_users() {
     // Verify caching: second call should return at least same value (cache hit);
     // parallel tests may have added users between calls, making the count higher.
     let page2 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert!(
@@ -2948,6 +3087,7 @@ async fn test_count_cache_populated_on_list_users() {
 
 #[tokio::test]
 async fn test_count_cache_invalidated_after_create_and_delete() {
+    let _guard = count_cache_lock().lock().await;
     use ains_server::repositories::user::CreateUserInput;
     use ains_server::services::UserService;
     use ains_server::services::user::PaginationParams;
@@ -2957,7 +3097,7 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
     let role = "admin";
 
     // 清除可能残留的旧缓存
-    let count_key = format!("user:count:{}", role);
+    let count_key = format!("user:count:{}:default", role);
     let _ = state.cache.invalidate(&count_key).await;
 
     // Create an initial user so list_users works
@@ -2978,7 +3118,7 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
     // Populate count cache via list_users (with retry for resilience)
     for attempt in 1..=3 {
         let _page = svc
-            .list_users(PaginationParams::default(), role)
+            .list_users(PaginationParams::default(), role, "default")
             .await
             .expect("list_users failed");
         if state.cache.get::<u64>(&count_key).await.unwrap().is_some() {
@@ -3017,12 +3157,12 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
 
     // Re-populate count cache
     let _page = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
 
     // Now delete user1 — should invalidate count cache again
-    svc.delete_user(user1.id.as_i64(), "system", 0)
+    svc.delete_user(user1.id.as_i64(), "system", 0, "default")
         .await
         .expect("delete_user failed");
 
@@ -3063,11 +3203,12 @@ async fn test_count_cache_invalidated_after_create_system_role() {
     // Populate system count cache via list_users with system role.
     // Use a retry loop to handle potential cache invalidation from parallel
     // tests (other test's create_user invalidates all count cache keys).
+    // system role uses key "user:count:system" (no tenant suffix)
     let count_key = format!("user:count:{}", role);
     let mut before_create: Option<u64> = None;
     for attempt in 1..=3 {
         let _page = svc
-            .list_users(PaginationParams::default(), role)
+            .list_users(PaginationParams::default(), role, "default")
             .await
             .expect("list_users failed");
         if let Some(cached) = state.cache.get::<u64>(&count_key).await.unwrap() {
@@ -3108,4 +3249,193 @@ async fn test_count_cache_invalidated_after_create_system_role() {
     );
 
     let _ = state.cache.invalidate(&count_key).await;
+}
+
+/// Multi-tenant list isolation: admin from tenant A must NOT see users from
+/// tenant B. This verifies the tenant-scoped RBAC in UserService::list_users.
+#[tokio::test]
+async fn test_list_users_multi_tenant_isolation() {
+    use ains_server::utils::load_config;
+    use sea_orm::Database;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let (app, state) = create_test_app_and_state().await;
+
+    // ── Setup: Create two tenants via raw SQL ─────────────────────────
+    let config = load_config("config.toml", "development").expect("Failed to load config");
+    let db = Database::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    let tenant_a = "mt_list_tenant_a";
+    let tenant_b = "mt_list_tenant_b";
+
+    for (tid, name) in &[(tenant_a, "Tenant A"), (tenant_b, "Tenant B")] {
+        db.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "INSERT INTO tenants (id, name, status) VALUES ($1, $2, 'active') ON CONFLICT (id) DO NOTHING",
+            [(*tid).into(), (*name).into()],
+        ))
+        .await
+        .expect("Failed to create test tenant");
+    }
+
+    // ── Register three users: admin_a, user_a (in tenant_a), user_b (in tenant_b) ─
+    let email_admin_a = unique_email("mt_admin_a");
+    let email_user_a = unique_email("mt_user_a");
+    let email_user_b = unique_email("mt_user_b");
+
+    let _token_admin_a = register_and_login(&app, &email_admin_a).await;
+    let _token_user_a = register_and_login(&app, &email_user_a).await;
+    let _token_user_b = register_and_login(&app, &email_user_b).await;
+
+    // Move admin_a → tenant_a and promote to admin
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE users
+           SET tenant_id = $1, role = 'admin', token_version = token_version + 1, updated_at = NOW()
+           WHERE email = $2"#,
+        [tenant_a.into(), email_admin_a.to_lowercase().into()],
+    ))
+    .await
+    .expect("Failed to move admin_a to tenant_a and promote");
+
+    // Move user_a → tenant_a (regular user role)
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE users
+           SET tenant_id = $1, token_version = token_version + 1, updated_at = NOW()
+           WHERE email = $2"#,
+        [tenant_a.into(), email_user_a.to_lowercase().into()],
+    ))
+    .await
+    .expect("Failed to move user_a to tenant_a");
+
+    // Move user_b → tenant_b (regular user role)
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE users
+           SET tenant_id = $1, token_version = token_version + 1, updated_at = NOW()
+           WHERE email = $2"#,
+        [tenant_b.into(), email_user_b.to_lowercase().into()],
+    ))
+    .await
+    .expect("Failed to move user_b to tenant_b");
+
+    // ── Login as admin_a and list users ────────────────────────────
+    // Admin from tenant_a: should only see users in tenant_a (role=user)
+    let token_a = login(&app, &email_admin_a).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/users?page=1&per_page=50")
+                .header("authorization", format!("Bearer {}", token_a))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = body_to_json(response.into_body()).await;
+    let items_a = body["items"].as_array().unwrap();
+    let emails_a: Vec<&str> = items_a.iter().filter_map(|u| u["email"].as_str()).collect();
+    assert!(
+        emails_a.contains(&&email_user_a.to_lowercase().as_str()),
+        "tenant_a admin should see user in their tenant"
+    );
+    assert!(
+        !emails_a.contains(&&email_user_b.to_lowercase().as_str()),
+        "tenant_a admin must NOT see tenant_b user"
+    );
+
+    // ── System admin: should see both users across tenants ────────────
+    // Promote admin_a to system role and login
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        r#"UPDATE users
+           SET role = 'system', token_version = token_version + 1, updated_at = NOW()
+           WHERE email = $1"#,
+        [email_admin_a.to_lowercase().into()],
+    ))
+    .await
+    .expect("Failed to promote user to system");
+
+    // Invalidate auth middleware's token_version cache (stale after SQL update)
+    let user_id: i64 = {
+        let secret = config.jwt_secret.clone();
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.validate_exp = true;
+        validation.set_issuer(&["ains-server"]);
+        validation.set_audience(&["ains"]);
+        let token_data = jsonwebtoken::decode::<ains_runtime::JwtClaims>(
+            &token_a,
+            &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .expect("Failed to decode token");
+        token_data
+            .claims
+            .sub
+            .parse::<i64>()
+            .expect("Invalid user ID")
+    };
+    let _ = state
+        .cache
+        .invalidate(&format!("user:token_version:{}", user_id))
+        .await;
+
+    let token_sys = login(&app, &email_admin_a).await;
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/users?page=1&per_page=50")
+                .header("authorization", format!("Bearer {}", token_sys))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = body_to_json(response.into_body()).await;
+    let items_sys = body["items"].as_array().unwrap();
+    let emails_sys: Vec<&str> = items_sys
+        .iter()
+        .filter_map(|u| u["email"].as_str())
+        .collect();
+    assert!(
+        emails_sys.contains(&&email_user_a.to_lowercase().as_str()),
+        "system should see user from tenant_a"
+    );
+    assert!(
+        emails_sys.contains(&&email_user_b.to_lowercase().as_str()),
+        "system should see user from tenant_b"
+    );
+}
+
+/// Helper to log in and return a JWT.
+async fn login(app: &Router, email: &str) -> String {
+    let login_payload = json!({
+        "email": email,
+        "password": "Password123!",
+        "remember": false,
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/public/auth/login")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&login_payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = body_to_json(response.into_body()).await;
+    body["token"].as_str().unwrap().to_string()
 }

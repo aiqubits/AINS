@@ -82,6 +82,65 @@ impl RedisRateLimiter {
     ///
     /// See https://redis.io/docs/latest/develop/interact/programmability/eval-intro/
     /// for the scripting semantics used here.
+    /// Check **and** increment by `n` the rate limit counter for `key`.
+    ///
+    /// Same as [`check`](Self::check) but atomically adds `n` to the counter
+    /// in a single Redis call.  This avoids the partial-budget-consumption
+    /// problem that would arise from looping `n` times over `check()`.
+    ///
+    /// - `n` – how much to increment (e.g. token units).  Must be > 0.
+    pub async fn check_n(
+        &self,
+        key: &str,
+        max_requests: u64,
+        window_seconds: u64,
+        n: u64,
+    ) -> Result<bool, RateLimitError> {
+        debug_assert!(n > 0, "check_n: n must be positive");
+        let mut conn = self.conn().await?;
+        let full_key = self.build_key(key);
+
+        // Lua script: atomically INCRBY, set TTL on first creation,
+        // return the new count.
+        //
+        // KEYS[1] – the counter key
+        // ARGV[1] – TTL in seconds
+        // ARGV[2] – increment amount (n)
+        const INCRBY_AND_EXPIRE: &str = r#"
+            local count = redis.call('INCRBY', KEYS[1], ARGV[2])
+            if count == tonumber(ARGV[2]) then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return count
+        "#;
+
+        let count: u64 = Script::new(INCRBY_AND_EXPIRE)
+            .key(&full_key)
+            .arg(window_seconds)
+            .arg(n)
+            .invoke_async(&mut conn)
+            .await?;
+
+        Ok(count <= max_requests)
+    }
+
+    /// Check **and** increment the rate limit counter for `key`.
+    ///
+    /// - `key` – the bare key (e.g. `"login:ip:1.2.3.4"`). The configured
+    ///   `key_prefix` is prepended automatically.
+    /// - `max_requests` – how many requests are allowed within the window.
+    /// - `window_seconds` – the length of the fixed window in seconds.
+    ///
+    /// Returns:
+    /// - `Ok(true)` – request is allowed (counter ≤ `max_requests`).
+    /// - `Ok(false)` – rate limit exceeded.
+    /// - `Err(RateLimitError)` – Redis unavailable or command failed.
+    ///
+    ///   Atomic rate‑limit check: increment counter and set expiry in one
+    ///   Redis call via a Lua script, eliminating the INCR / EXPIRE race.
+    ///
+    /// See https://redis.io/docs/latest/develop/interact/programmability/eval-intro/
+    /// for the scripting semantics used here.
     pub async fn check(
         &self,
         key: &str,
@@ -247,5 +306,82 @@ mod tests {
         // (NotAvailable) rather than rate-limiting.
         let result = limiter.check("another:key", 0, 60).await;
         assert!(result.is_err(), "disabled limiter must not contact Redis");
+    }
+
+    // ── check_n tests ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_check_n_disabled_returns_not_available() {
+        let limiter = RedisRateLimiter::disabled(RateLimitConfig::default());
+        let result = limiter.check_n("test:key", 10, 60, 3).await;
+        assert!(
+            matches!(result, Err(RateLimitError::NotAvailable)),
+            "disabled limiter should return NotAvailable for check_n, got {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn test_check_n_disabled_regardless_of_limit() {
+        let limiter = RedisRateLimiter::disabled(RateLimitConfig::default());
+        // Even with max_requests=0, n=0, disabled limiter must fail with
+        // NotAvailable rather than contacting Redis or returning a pass.
+        let result = limiter.check_n("another:key", 0, 60, 1).await;
+        assert!(result.is_err(), "disabled limiter must not contact Redis");
+    }
+
+    // NOTE: Full Redis integration tests for check_n (INCRBY atomicity,
+    // TTL behaviour, multi-increment rejection) require a running Redis
+    // instance.  They are covered at the integration-test level in:
+    //   - server/tests/axum_ratelimit_test.rs  (per-IP rate limiting)
+    //   - server/tests/axum_quota_test.rs       (channel/tenant quota checks)
+    // which use check_n internally through the quota service.
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_check_n_zero_n_is_noop() {
+        // check_n with n = 0 must not crash or panic, and it should return
+        // Ok(true) when the count is within the limit (since INCRBY 0 does
+        // not change the counter).
+        // Requires a running Redis instance at 127.0.0.1:6379.
+        let client = redis::Client::open("redis://127.0.0.1:6379").unwrap();
+        let limiter = RedisRateLimiter::new(client, RateLimitConfig::default());
+        let key = "test:check_n_zero";
+        let full_key = limiter.build_key(key);
+        let mut conn = limiter.conn().await.unwrap();
+
+        // Ensure clean state
+        let _: () = redis::cmd("DEL")
+            .arg(&full_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+
+        // n = 0 should pass when under limit
+        let result = limiter.check_n(key, 10, 60, 0).await;
+        assert!(
+            matches!(result, Ok(true)),
+            "check_n with n=0 should return Ok(true) when under limit, got {:?}",
+            result
+        );
+
+        // The counter should still be 0 after n=0 INCRBY
+        let val: Option<u64> = redis::cmd("GET")
+            .arg(&full_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            val.unwrap_or(0) == 0,
+            "counter should still be 0 after n=0 check_n, got {:?}",
+            val
+        );
+
+        // Clean up
+        let _: () = redis::cmd("DEL")
+            .arg(&full_key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
     }
 }

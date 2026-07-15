@@ -47,6 +47,7 @@ pub struct PasswordResetOutcome {
     pub user_id: i64,
     pub role: String,
     pub token_version: i32,
+    pub tenant_id: String,
 }
 
 fn generate_code() -> String {
@@ -221,6 +222,21 @@ impl PasswordResetService {
             }
         };
 
+        // Reject password reset for disabled tenants — same security
+        // boundary as the login endpoint (services/auth.rs login()).
+        // Anti-enumeration: return InvalidOrExpired for both inactive
+        // tenant and DB query failure (fail-closed).
+        match crate::services::tenant::TenantService::new(self.db.clone())
+            .is_active(&user.tenant_id)
+            .await
+        {
+            Ok(true) => { /* tenant is active — continue */ }
+            _ => {
+                let _ = verify_code(code, dummy_code_hash());
+                return Err(PasswordResetError::InvalidOrExpired);
+            }
+        }
+
         let expires_at = match user.password_reset_expires_at {
             Some(t) => t,
             None => {
@@ -320,6 +336,7 @@ impl PasswordResetService {
             user_id: updated.id,
             role: updated.role,
             token_version: updated.token_version,
+            tenant_id: updated.tenant_id,
         })
     }
 
@@ -405,5 +422,19 @@ mod tests {
         assert!(e.to_string().contains("Too soon"));
         let e = PasswordResetError::EmailNotConfigured;
         assert!(e.to_string().contains("not configured"));
+    }
+
+    #[test]
+    fn test_password_reset_outcome_includes_tenant_id() {
+        let outcome = PasswordResetOutcome {
+            user_id: 42,
+            role: "user".to_string(),
+            token_version: 3,
+            tenant_id: "default".to_string(),
+        };
+        assert_eq!(outcome.user_id, 42);
+        assert_eq!(outcome.role, "user");
+        assert_eq!(outcome.token_version, 3);
+        assert_eq!(outcome.tenant_id, "default");
     }
 }

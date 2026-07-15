@@ -1271,6 +1271,7 @@ async fn test_cache_invalidation_after_user_update() {
                 role: None,
             },
             "system",
+            "default",
         )
         .await
         .expect("update_user failed");
@@ -1381,7 +1382,7 @@ async fn test_cache_invalidation_after_delete() {
     assert!(cached.is_some(), "user should be cached before delete");
 
     // Delete user → cache invalidated
-    svc.delete_user(user.id.as_i64(), "system", 0)
+    svc.delete_user(user.id.as_i64(), "system", 0, "default")
         .await
         .expect("delete_user failed");
 
@@ -1438,7 +1439,7 @@ async fn test_cache_invalidation_after_balance_change() {
 
     // Set balance → cache invalidated
     let updated = svc
-        .set_balance(user.id.as_i64(), 500, "system")
+        .set_balance(user.id.as_i64(), 500, "system", "default")
         .await
         .expect("set_balance failed");
     assert_eq!(updated.balance, 500);
@@ -1478,7 +1479,7 @@ async fn test_count_cache_populated_on_list_users() {
     let state = salvo::create_test_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
     let role = "admin";
-    let count_key = format!("user:count:{}", role);
+    let count_key = format!("user:count:{}:default", role);
 
     // 清除可能来自其他测试的残留缓存
     let _ = state.cache.invalidate(&count_key).await;
@@ -1499,14 +1500,14 @@ async fn test_count_cache_populated_on_list_users() {
 
     // First list_users: count cache miss → populate
     let page1 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert!(page1.total > 0, "should have at least one user");
 
     // Second list_users: should hit cache (same count expected)
     let page2 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert_eq!(
@@ -1515,7 +1516,7 @@ async fn test_count_cache_populated_on_list_users() {
     );
 
     // Clean up
-    let count_key = format!("user:count:{}", role);
+    let count_key = format!("user:count:{}:default", role);
     let _ = state.cache.invalidate(&count_key).await;
 }
 
@@ -1529,7 +1530,7 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
     let state = salvo::create_test_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
     let role = "admin";
-    let count_key = format!("user:count:{}", role);
+    let count_key = format!("user:count:{}:default", role);
 
     // 清除可能来自其他测试的残留缓存
     let _ = state.cache.invalidate(&count_key).await;
@@ -1550,18 +1551,18 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
         .expect("create_user failed");
 
     // Populate count cache via list_users
-    svc.list_users(PaginationParams::default(), role)
+    svc.list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     // Verify cache is populated by calling list_users again (should return same total)
     // This is more robust than checking Redis directly due to cross-test cache interference.
     let page1 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert!(page1.total > 0, "should have at least one user");
     let page2 = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
     assert_eq!(
@@ -1592,12 +1593,12 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
 
     // Re-populate
     let _page = svc
-        .list_users(PaginationParams::default(), role)
+        .list_users(PaginationParams::default(), role, "default")
         .await
         .expect("list_users failed");
 
     // Delete user1 → count cache invalidated again
-    svc.delete_user(user1.id.as_i64(), "system", 0)
+    svc.delete_user(user1.id.as_i64(), "system", 0, "default")
         .await
         .expect("delete_user failed");
 
@@ -1620,6 +1621,7 @@ async fn test_count_cache_invalidated_after_create_system_role() {
     let state = salvo::create_test_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
     let role = "system";
+    // system role uses key "user:count:system" (no tenant suffix)
     let count_key = format!("user:count:{}", role);
 
     // 清除可能来自其他测试的残留缓存
@@ -1643,7 +1645,7 @@ async fn test_count_cache_invalidated_after_create_system_role() {
     let mut before_create: Option<u64> = None;
     for attempt in 1..=3 {
         let _page = svc
-            .list_users(PaginationParams::default(), role)
+            .list_users(PaginationParams::default(), role, "default")
             .await
             .expect("list_users failed");
         if let Some(cached) = state.cache.get::<u64>(&count_key).await.unwrap() {

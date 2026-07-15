@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::repositories::tenant::DEFAULT_TENANT_ID;
 use crate::repositories::user::{
     ActiveModel, Column, CreateUserInput, Entity as UserEntity, Model as UserModel,
     UpdateUserInput, UserResponse,
@@ -40,12 +41,34 @@ pub enum UserError {
 }
 
 /// Check RBAC rules for balance modification operations on a loaded user.
-fn check_balance_rbac(target: &UserModel, actor_role: &str) -> Result<(), UserError> {
-    // Protect system accounts
+fn check_balance_rbac(
+    target: &UserModel,
+    actor_role: &str,
+    actor_tenant_id: &str,
+) -> Result<(), UserError> {
+    // Protect system accounts — no one can modify a system user's balance
     if target.role == "system" {
         tracing::warn!(
             target_user_id = %target.id,
             "Attempt to modify system account balance — returning NotFound"
+        );
+        return Err(UserError::NotFound);
+    }
+
+    // System super-admin can modify any non-system user's balance
+    // (including cross-tenant and across all roles).
+    if actor_role == "system" {
+        return Ok(());
+    }
+
+    // Admin scope: can only modify users within their own tenant
+    if actor_role == "admin" && target.tenant_id != actor_tenant_id {
+        tracing::warn!(
+            target_user_id = %target.id,
+            actor_role = %actor_role,
+            target_tenant = %target.tenant_id,
+            actor_tenant = %actor_tenant_id,
+            "Admin attempted to modify cross-tenant user balance — returning NotFound"
         );
         return Err(UserError::NotFound);
     }
@@ -75,7 +98,6 @@ fn check_balance_rbac(target: &UserModel, actor_role: &str) -> Result<(), UserEr
             "Role '{actor_role}' is not allowed to modify balance"
         )));
     }
-
     Ok(())
 }
 
@@ -121,6 +143,19 @@ impl UserService {
         &self,
         input: CreateUserInput,
         actor_role: &str,
+    ) -> Result<UserResponse, UserError> {
+        self.create_user_for_tenant(input, actor_role, DEFAULT_TENANT_ID)
+            .await
+    }
+
+    /// Create a user in an explicitly selected tenant.  The public legacy
+    /// method above deliberately keeps default-tenant behaviour for callers
+    /// that predate multi-tenancy.
+    pub async fn create_user_for_tenant(
+        &self,
+        input: CreateUserInput,
+        actor_role: &str,
+        tenant_id: &str,
     ) -> Result<UserResponse, UserError> {
         tracing::trace!("Creating user with email: {}", input.email);
 
@@ -174,6 +209,7 @@ impl UserService {
             password_reset_failed_attempts: Set(0),
             balance: Set(0),
             wx_openid: Set(None),
+            tenant_id: Set(tenant_id.to_string()),
         };
 
         tracing::debug!("Inserting user into database");
@@ -197,15 +233,15 @@ impl UserService {
         // (no role filter), so the "system" key must also be invalidated.
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("admin"))
+            .invalidate(&Self::user_count_cache_key("admin", Some(tenant_id)))
             .await;
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("user"))
+            .invalidate(&Self::user_count_cache_key("user", Some(tenant_id)))
             .await;
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("system"))
+            .invalidate(&Self::user_count_cache_key("system", None))
             .await;
 
         Ok(UserResponse::from(result))
@@ -281,14 +317,15 @@ impl UserService {
     /// Get user by ID with RBAC scope enforcement.
     ///
     /// When `actor_role` is `"admin"`, the query filters to only return users with
-    /// `role = "user"`. This ensures that non-existent users and scoped-out users
-    /// both return `None`, eliminating the timing side-channel that would otherwise
-    /// allow an admin to distinguish "user does not exist" from "user exists but is
-    /// not a regular user".
+    /// `role = "user"` within the same tenant. This ensures that non-existent users
+    /// and scoped-out users both return `None`, eliminating the timing side-channel
+    /// that would otherwise allow an admin to distinguish "user does not exist" from
+    /// "user exists but is scoped out".
     pub async fn get_user_scoped(
         &self,
         id: i64,
         actor_role: &str,
+        actor_tenant_id: &str,
     ) -> Result<Option<UserResponse>, UserError> {
         // Delegate to get_user() which uses the cache layer.
         // RBAC filtering is applied in-memory rather than in SQL so that
@@ -298,8 +335,8 @@ impl UserService {
             None => return Ok(None),
         };
 
-        // Admin scope: admin can only view user accounts
-        if actor_role == "admin" && user.role != "user" {
+        // Admin scope: admin can only view user accounts within their own tenant
+        if actor_role == "admin" && (user.role != "user" || user.tenant_id != actor_tenant_id) {
             return Ok(None);
         }
 
@@ -312,6 +349,7 @@ impl UserService {
         id: i64,
         input: UpdateUserInput,
         actor_role: &str,
+        actor_tenant_id: &str,
     ) -> Result<UserResponse, UserError> {
         // READ FROM WRITE: guarantees read-your-writes consistency — a user
         // that exists on the write database must not appear as NotFound due to
@@ -330,6 +368,19 @@ impl UserService {
             tracing::warn!(
                 target_user_id = %id,
                 "Attempt to modify system account — returning NotFound"
+            );
+            return Err(UserError::NotFound);
+        }
+
+        // Admin scope: can only modify users within their own tenant
+        // NOTE: returns NotFound (not NotAllowed) to prevent user enumeration.
+        if actor_role == "admin" && user.tenant_id != actor_tenant_id {
+            tracing::warn!(
+                target_user_id = %id,
+                actor_role = %actor_role,
+                target_tenant = %user.tenant_id,
+                actor_tenant = %actor_tenant_id,
+                "Admin attempted to modify cross-tenant user — returning NotFound"
             );
             return Err(UserError::NotFound);
         }
@@ -602,6 +653,7 @@ impl UserService {
         id: i64,
         actor_role: &str,
         actor_id: i64,
+        actor_tenant_id: &str,
     ) -> Result<(), UserError> {
         // Fetch target from the write database so that a recently-created
         // user is not falsely reported as NotFound due to read replica lag.
@@ -628,6 +680,19 @@ impl UserService {
             return Err(UserError::NotFound);
         }
 
+        // Admin scope: can only delete users within their own tenant
+        // NOTE: returns NotFound (not NotAllowed) to prevent user enumeration.
+        if actor_role == "admin" && target.tenant_id != actor_tenant_id {
+            tracing::warn!(
+                target_user_id = %id,
+                actor_role = %actor_role,
+                target_tenant = %target.tenant_id,
+                actor_tenant = %actor_tenant_id,
+                "Admin attempted to delete cross-tenant user — returning NotFound"
+            );
+            return Err(UserError::NotFound);
+        }
+
         // Admin scope: can only delete user accounts
         // NOTE: returns NotFound (not NotAllowed) to prevent user enumeration.
         if actor_role == "admin" && target.role != "user" {
@@ -647,6 +712,26 @@ impl UserService {
         let mut delete_stmt = UserEntity::delete_many().filter(Column::Id.eq(id));
         if actor_role == "admin" {
             delete_stmt = delete_stmt.filter(Column::Role.eq("user"));
+        }
+
+        // Cascade delete refresh tokens to prevent orphaned records.
+        // Best-effort: failure to clean up refresh tokens is non-critical
+        // (orphaned tokens are functionally inert) and must not prevent
+        // the user deletion from succeeding.
+        if let Err(e) = self
+            .db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM refresh_tokens WHERE user_id = $1",
+                [id.into()],
+            ))
+            .await
+        {
+            tracing::warn!(
+                "Failed to cascade-delete refresh tokens for user {}: {:?}",
+                id,
+                e
+            );
         }
 
         let result = delete_stmt
@@ -680,17 +765,18 @@ impl UserService {
         // Invalidate count cache so pagination reflects deletion immediately.
         // NOTE: When the system role lists users, the count is all users (no role filter),
         // so the "system" key must also be invalidated.
+        // NOTE: admin cache keys are tenant-scoped to prevent cross-tenant pollution.
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("admin"))
+            .invalidate(&Self::user_count_cache_key("admin", Some(actor_tenant_id)))
             .await;
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("user"))
+            .invalidate(&Self::user_count_cache_key("user", Some(actor_tenant_id)))
             .await;
         let _ = self
             .cache
-            .invalidate(&Self::user_count_cache_key("system"))
+            .invalidate(&Self::user_count_cache_key("system", None))
             .await;
 
         Ok(())
@@ -698,8 +784,31 @@ impl UserService {
 
     const USER_COUNT_TTL_SECS: u64 = 30; // 30 seconds for count cache
 
-    fn user_count_cache_key(actor_role: &str) -> String {
-        format!("user:count:{}", actor_role)
+    /// Build a Redis cache key for the paginated user-count.
+    ///
+    /// - For the `"system"` role: the key is `user:count:system` (no tenant suffix)
+    ///   because system sees ALL users across all tenants.
+    /// - For all other roles (`"admin"`, `"user"`): the key is
+    ///   `user:count:{role}:{tenant_id}` so count caches are tenant-scoped.
+    ///
+    /// The caller MUST pass `None` for `actor_tenant_id` when `actor_role` is
+    /// `"system"` (the tenant is ignored anyway, but `None` communicates intent).
+    fn user_count_cache_key(actor_role: &str, actor_tenant_id: Option<&str>) -> String {
+        if actor_role == "system" {
+            // system sees ALL users (no tenant filter)
+            format!("user:count:{}", actor_role)
+        } else {
+            // admin only sees users within their own tenant
+            debug_assert!(
+                actor_tenant_id.is_some(),
+                "non-system roles must provide a tenant_id for count cache key"
+            );
+            format!(
+                "user:count:{}:{}",
+                actor_role,
+                actor_tenant_id.unwrap_or("")
+            )
+        }
     }
 
     /// List users with pagination
@@ -707,6 +816,7 @@ impl UserService {
         &self,
         params: PaginationParams,
         actor_role: &str,
+        actor_tenant_id: &str,
     ) -> Result<PaginatedResponse<UserResponse>, UserError> {
         // Sanitize pagination inputs: clamp zero to 1 and cap large values
         // to reasonable bounds to prevent overflow or excessive offsets.
@@ -715,9 +825,11 @@ impl UserService {
 
         let mut query = UserEntity::find().order_by_desc(Column::CreatedAt);
 
-        // Admin scope: only see user role users
+        // Admin scope: only see user role users within the same tenant
         if actor_role == "admin" {
-            query = query.filter(Column::Role.eq("user"));
+            query = query
+                .filter(Column::Role.eq("user"))
+                .filter(Column::TenantId.eq(actor_tenant_id));
         }
 
         let paginator = query.paginate(&*self.db, per_page);
@@ -727,7 +839,13 @@ impl UserService {
         // COUNT(*) queries are the most expensive part of pagination, especially
         // under active role-scoped filtering, so caching just the count provides
         // ~80% of the pagination caching benefit with zero cache-fragmentation risk.
-        let count_cache_key = Self::user_count_cache_key(actor_role);
+        // System role sees ALL users (no tenant filter), so pass None.
+        // Admin/pass-through roles are tenant-scoped, pass Some(tenant_id).
+        let count_cache_key = if actor_role == "system" {
+            Self::user_count_cache_key(actor_role, None)
+        } else {
+            Self::user_count_cache_key(actor_role, Some(actor_tenant_id))
+        };
         let count_ttl = std::time::Duration::from_secs(Self::USER_COUNT_TTL_SECS);
 
         let total = match self.cache.get::<u64>(&count_cache_key).await {
@@ -772,6 +890,7 @@ impl UserService {
         target_id: i64,
         balance: i64,
         actor_role: &str,
+        actor_tenant_id: &str,
     ) -> Result<UserResponse, UserError> {
         let txn = self
             .db
@@ -788,7 +907,7 @@ impl UserService {
             .ok_or(UserError::NotFound)?;
 
         // RBAC checks
-        check_balance_rbac(&target, actor_role)?;
+        check_balance_rbac(&target, actor_role, actor_tenant_id)?;
 
         // Reject negative balance
         if balance < 0 {
@@ -844,6 +963,7 @@ impl UserService {
         target_id: i64,
         amount: i64,
         actor_role: &str,
+        actor_tenant_id: &str,
     ) -> Result<UserResponse, UserError> {
         let txn = self
             .db
@@ -860,7 +980,7 @@ impl UserService {
             .ok_or(UserError::NotFound)?;
 
         // RBAC checks
-        check_balance_rbac(&target, actor_role)?;
+        check_balance_rbac(&target, actor_role, actor_tenant_id)?;
 
         // Atomic balance adjustment with overflow protection
         let new_balance = target
@@ -990,6 +1110,7 @@ mod tests {
             token_version: 1,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
 
         let response = PaginatedResponse {
@@ -1097,8 +1218,9 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
-        let result = check_balance_rbac(&target, "admin");
+        let result = check_balance_rbac(&target, "admin", "default");
         assert!(matches!(result, Err(UserError::NotFound)));
     }
 
@@ -1124,8 +1246,9 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
-        let result = check_balance_rbac(&target, "admin");
+        let result = check_balance_rbac(&target, "admin", "default");
         assert!(matches!(result, Err(UserError::NotFound)));
     }
 
@@ -1151,8 +1274,9 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
-        let result = check_balance_rbac(&target, "user");
+        let result = check_balance_rbac(&target, "user", "default");
         assert!(matches!(result, Err(UserError::NotAllowed(_))));
     }
 
@@ -1178,8 +1302,9 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
-        let result = check_balance_rbac(&target, "system");
+        let result = check_balance_rbac(&target, "system", "default");
         assert!(result.is_ok());
     }
 
@@ -1205,8 +1330,109 @@ mod tests {
             password_reset_failed_attempts: 0,
             balance: 0,
             wx_openid: None,
+            tenant_id: "default".to_string(),
         };
-        let result = check_balance_rbac(&target, "admin");
+        let result = check_balance_rbac(&target, "admin", "default");
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_balance_rbac_admin_cross_tenant_rejected() {
+        // Admin from "tenant_a" attempts to modify a user in "tenant_b"
+        // — must be rejected with NotFound (tenant isolation).
+        let target = UserModel {
+            id: 100,
+            email: "cross_tenant_user@test.com".to_string(),
+            password_hash: String::new(),
+            name: "Cross Tenant User".to_string(),
+            role: "user".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            token_version: 1,
+            email_verified: false,
+            verification_code_hash: None,
+            verification_code_expires_at: None,
+            verification_code_sent_at: None,
+            verification_failed_attempts: 0,
+            password_reset_token_hash: None,
+            password_reset_expires_at: None,
+            password_reset_sent_at: None,
+            password_reset_failed_attempts: 0,
+            balance: 0,
+            wx_openid: None,
+            tenant_id: "tenant_b".to_string(),
+        };
+        // Actor is admin in tenant_a, target is a user in tenant_b → NotFound
+        let result = check_balance_rbac(&target, "admin", "tenant_a");
+        assert!(matches!(result, Err(UserError::NotFound)));
+    }
+
+    #[test]
+    fn test_check_balance_rbac_system_cross_tenant_allowed() {
+        // System role can modify any user regardless of tenant.
+        let target = UserModel {
+            id: 101,
+            email: "other_tenant_user@test.com".to_string(),
+            password_hash: String::new(),
+            name: "Other Tenant User".to_string(),
+            role: "user".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            token_version: 1,
+            email_verified: false,
+            verification_code_hash: None,
+            verification_code_expires_at: None,
+            verification_code_sent_at: None,
+            verification_failed_attempts: 0,
+            password_reset_token_hash: None,
+            password_reset_expires_at: None,
+            password_reset_sent_at: None,
+            password_reset_failed_attempts: 0,
+            balance: 0,
+            wx_openid: None,
+            tenant_id: "remote_tenant".to_string(),
+        };
+        let result = check_balance_rbac(&target, "system", "some_other_tenant");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_check_balance_rbac_unknown_role_catch_all() {
+        // Unrecognized roles (e.g., "editor", "viewer") must be rejected
+        // by the defensive catch-all. This tests the final branch in
+        // check_balance_rbac that no unrecognized role slips through.
+        let target = UserModel {
+            id: 200,
+            email: "editor_user@test.com".to_string(),
+            password_hash: String::new(),
+            name: "Editor User".to_string(),
+            role: "user".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            token_version: 1,
+            email_verified: false,
+            verification_code_hash: None,
+            verification_code_expires_at: None,
+            verification_code_sent_at: None,
+            verification_failed_attempts: 0,
+            password_reset_token_hash: None,
+            password_reset_expires_at: None,
+            password_reset_sent_at: None,
+            password_reset_failed_attempts: 0,
+            balance: 0,
+            wx_openid: None,
+            tenant_id: "default".to_string(),
+        };
+        let result = check_balance_rbac(&target, "editor", "default");
+        assert!(matches!(
+            result,
+            Err(UserError::NotAllowed(ref m)) if m.contains("editor")
+        ));
+
+        let result = check_balance_rbac(&target, "manager", "default");
+        assert!(matches!(
+            result,
+            Err(UserError::NotAllowed(ref m)) if m.contains("manager")
+        ));
     }
 }

@@ -52,20 +52,31 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         config.validate()?;
 
+        // 检查是否应禁用系统 HTTP 代理：
+        // 1. 配置中显式设置 no_proxy = true
+        // 2. 环境变量 AINS_SYS_NO_PROXY = true（全局覆盖）
+        let no_proxy = config.no_proxy
+            || std::env::var("AINS_SYS_NO_PROXY")
+                .ok()
+                .map(|v| v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+
         let client = {
             #[cfg(not(target_arch = "wasm32"))]
             {
-                reqwest::Client::builder()
+                let mut builder = reqwest::Client::builder()
                     .timeout(Duration::from_secs(config.timeout_secs))
-                    .cookie_store(true)
-                    .build()
-                    .map_err(|e| {
-                        ClientError::Config(format!("Failed to create HTTP client: {}", e))
-                    })?
+                    .cookie_store(true);
+                if no_proxy {
+                    builder = builder.no_proxy();
+                }
+                builder.build().map_err(|e| {
+                    ClientError::Config(format!("Failed to create HTTP client: {}", e))
+                })?
             }
             #[cfg(target_arch = "wasm32")]
             {
-                // WASM 下 reqwest 不支持设置超时（浏览器 fetch API 控制）
+                // WASM 下 reqwest 不支持设置超时和代理（浏览器 fetch API 控制）
                 let _ = config.timeout_secs;
                 reqwest::Client::builder().build().map_err(|e| {
                     ClientError::Config(format!("Failed to create HTTP client: {}", e))

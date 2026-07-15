@@ -10,6 +10,7 @@ use std::net::TcpListener;
 use std::sync::Arc;
 
 use crate::common;
+use crate::common::DEFAULT_TEST_PASSWORD;
 
 /// A test server that runs on a random port and sends responses via reqwest.
 pub struct TestServer {
@@ -46,12 +47,18 @@ pub async fn create_test_server() -> TestServer {
     let cache = common::create_cache_service().await;
     let config = Arc::new(common::load_test_config());
 
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        &config.jwt_secret,
+    ));
+
     let state = AppState {
         db,
         cache,
         config,
         email: common::default_email_service(),
         wechat: None,
+        gateway,
     };
 
     // 使用生产级的 build_app_router，注入禁用的 rate limiter 以避免测试中
@@ -68,9 +75,10 @@ pub async fn create_test_server() -> TestServer {
             .expect("Salvo test server failed");
     });
 
-    // Build the reqwest client
+    // Build the reqwest client with no_proxy for test isolation
     let client = reqwest::Client::builder()
         .cookie_store(true)
+        .no_proxy()
         .build()
         .expect("Failed to build reqwest client");
 
@@ -202,8 +210,8 @@ pub async fn delete(
 pub async fn register_and_login(server: &TestServer, email: &str) -> String {
     let register_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!",
-        "password_confirm": "Password123!",
+        "password": DEFAULT_TEST_PASSWORD,
+        "password_confirm": DEFAULT_TEST_PASSWORD,
         "name": "Test User"
     });
 
@@ -212,7 +220,7 @@ pub async fn register_and_login(server: &TestServer, email: &str) -> String {
 
     let login_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!"
+        "password": DEFAULT_TEST_PASSWORD
     });
 
     let (status, body) = post_json(server, "/api/public/auth/login", &login_payload).await;
@@ -225,12 +233,17 @@ pub async fn create_test_state() -> ains_server::AppState {
     let db = crate::common::create_test_db_and_run_migrations().await;
     let cache = crate::common::create_cache_service().await;
     let config = std::sync::Arc::new(crate::common::load_test_config());
+    let gateway = std::sync::Arc::new(ains_server::services::gateway::GatewayService::new(
+        db.clone(),
+        &config.jwt_secret,
+    ));
     ains_server::AppState {
         db,
         cache,
         config,
         email: crate::common::default_email_service(),
         wechat: None,
+        gateway,
     }
 }
 
@@ -238,8 +251,8 @@ pub async fn create_test_state() -> ains_server::AppState {
 pub async fn register_and_login_with_refresh(server: &TestServer, email: &str) -> (String, String) {
     let register_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!",
-        "password_confirm": "Password123!",
+        "password": DEFAULT_TEST_PASSWORD,
+        "password_confirm": DEFAULT_TEST_PASSWORD,
         "name": "Test User"
     });
     let (status, _) = post_json(server, "/api/public/auth/register", &register_payload).await;
@@ -252,7 +265,7 @@ pub async fn register_and_login_with_refresh(server: &TestServer, email: &str) -
         .header("content-type", "application/json")
         .json(&serde_json::json!({
             "email": email,
-            "password": "Password123!",
+            "password": DEFAULT_TEST_PASSWORD,
             "remember": true,
         }))
         .send()

@@ -19,7 +19,7 @@ repos:
       - id: test-server
         name: "test (server)"
         description: 运行 server 单元测试
-        entry: cargo test --package ains-server --lib --no-fail-fast
+        entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package ains-server --lib --no-fail-fast"
         language: system
         types: [rust]
         pass_filenames: false
@@ -29,7 +29,7 @@ repos:
       - id: test-web
         name: "test (web)"
         description: 运行 web crate 测试
-        entry: cargo test --package web --no-fail-fast
+        entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package web --no-fail-fast"
         language: system
         types: [rust]
         pass_filenames: false
@@ -39,7 +39,7 @@ repos:
       - id: test-client-api
         name: "test (client-api)"
         description: 运行 client-api 测试（含 wiremock 集成测试）
-        entry: cargo test --package client-api --no-fail-fast
+        entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package client-api --no-fail-fast"
         language: system
         types: [rust]
         pass_filenames: false

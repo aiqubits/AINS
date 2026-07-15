@@ -1,6 +1,9 @@
 pub mod api;
 pub mod auth;
+pub mod gateway;
 pub mod helpers;
+pub mod responses;
+pub mod tenant;
 pub mod wechat;
 
 pub use api::{

@@ -5,6 +5,7 @@ use crate::AppState;
 use crate::handlers::auth::{expiry_cookie, token_cookie, unix_timestamp_from_now};
 use crate::handlers::helpers::extract_handler_context;
 use crate::middlewares::{AuthUser, JWT_COOKIE, REFRESH_COOKIE};
+use crate::repositories::tenant::DEFAULT_TENANT_ID;
 use crate::repositories::user::{CreateUserInput, UpdateUserInput, UserResponse};
 use crate::services::auth::AuthService;
 use crate::services::user::{BALANCE_SCALE, PaginatedResponse, PaginationParams, UserService};
@@ -87,6 +88,7 @@ pub async fn list_users(req: crate::ServerRequest) -> Result<Response, HttpError
                 per_page: query.per_page,
             },
             &auth_user.role,
+            &auth_user.tenant_id,
         )
         .await
         .map_err(to_http)?;
@@ -113,6 +115,8 @@ pub struct CreateUserRequest {
     /// Role override (only effective when actor is system)
     #[validate(custom(function = "validate_role"))]
     role: Option<String>,
+    /// System may select any active tenant; tenant admins are scoped to their own.
+    tenant_id: Option<String>,
 }
 
 /// Create a new user (admin-only).
@@ -149,8 +153,26 @@ pub async fn create_user(mut req: crate::ServerRequest) -> Result<Response, Http
     };
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
+    let tenant_id = if auth_user.role == "system" {
+        payload
+            .tenant_id
+            .as_deref()
+            .unwrap_or(DEFAULT_TENANT_ID)
+            .to_string()
+    } else {
+        auth_user.tenant_id.clone()
+    };
+    if !crate::services::tenant::TenantService::with_cache(state.db.clone(), state.cache.clone())
+        .is_active(&tenant_id)
+        .await
+        .map_err(|_| HttpError::internal("Failed to verify tenant"))?
+    {
+        return Err(HttpError::bad_request(
+            "Tenant does not exist or is disabled",
+        ));
+    }
     let mut result = service
-        .create_user(
+        .create_user_for_tenant(
             CreateUserInput {
                 email: email.clone(),
                 password: payload.password,
@@ -158,6 +180,7 @@ pub async fn create_user(mut req: crate::ServerRequest) -> Result<Response, Http
                 role: requested_role,
             },
             &auth_user.role,
+            &tenant_id,
         )
         .await
         .map_err(to_http)?;
@@ -282,6 +305,7 @@ async fn change_my_password_inner(
         jwt_expiry,
         auth_user.remember,
         token_version,
+        &user.tenant_id,
     )
     .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?;
 
@@ -374,7 +398,7 @@ pub async fn get_user(req: crate::ServerRequest) -> Result<Response, HttpError> 
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
     let result = service
-        .get_user_scoped(id, &auth_user.role)
+        .get_user_scoped(id, &auth_user.role, &auth_user.tenant_id)
         .await
         .map_err(to_http)?
         .ok_or_else(|| HttpError::not_found("User not found"))?;
@@ -400,9 +424,17 @@ pub struct UpdateUserRequest {
 }
 
 /// Validate role value against allowed roles.
+///
+/// The "system" role is explicitly rejected — it is a protected super-admin
+/// role that can only be assigned during bootstrap seeding.
 fn validate_role(role: &str) -> Result<(), ValidationError> {
     match role {
         "user" | "admin" => Ok(()),
+        "system" => {
+            let mut err = validator::ValidationError::new("invalid_role");
+            err.message = Some("system role cannot be assigned via API".into());
+            Err(err)
+        }
         _ => {
             let mut err = validator::ValidationError::new("invalid_role");
             err.message = Some("role must be 'user' or 'admin'".into());
@@ -448,6 +480,7 @@ pub async fn update_user(mut req: crate::ServerRequest) -> Result<Response, Http
                 role: requested_role,
             },
             &auth_user.role,
+            &auth_user.tenant_id,
         )
         .await
         .map_err(to_http)?;
@@ -475,7 +508,7 @@ pub async fn delete_user(req: crate::ServerRequest) -> Result<Response, HttpErro
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
     service
-        .delete_user(id, &auth_user.role, actor_id)
+        .delete_user(id, &auth_user.role, actor_id, &auth_user.tenant_id)
         .await
         .map_err(to_http)?;
 
@@ -511,7 +544,7 @@ pub async fn set_balance(mut req: crate::ServerRequest) -> Result<Response, Http
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
     let result = service
-        .set_balance(id, payload.balance, &auth_user.role)
+        .set_balance(id, payload.balance, &auth_user.role, &auth_user.tenant_id)
         .await
         .map_err(to_http)?;
 
@@ -551,7 +584,7 @@ pub async fn adjust_balance(mut req: crate::ServerRequest) -> Result<Response, H
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
     let result = service
-        .adjust_balance(id, payload.amount, &auth_user.role)
+        .adjust_balance(id, payload.amount, &auth_user.role, &auth_user.tenant_id)
         .await
         .map_err(to_http)?;
 

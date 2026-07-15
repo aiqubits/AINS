@@ -37,10 +37,19 @@ pub struct ReqwestTransport {
 
 impl ReqwestTransport {
     pub fn new() -> Self {
-        let inner = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .expect("failed to build reqwest client");
+        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
+
+        // Respect AINS_SYS_NO_PROXY environment variable for consistent
+        // proxy control across all reqwest clients in the project.
+        let no_proxy = std::env::var("AINS_SYS_NO_PROXY")
+            .ok()
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if no_proxy {
+            builder = builder.no_proxy();
+        }
+
+        let inner = builder.build().expect("failed to build reqwest client");
         Self { inner }
     }
 }

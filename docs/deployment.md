@@ -47,13 +47,29 @@ cargo binstall dioxus-cli --version 0.7.9 -y
 ```bash
 # 1. Docker 网络 & 数据库
 docker network create ains-net 2>/dev/null || true
-docker run -d --network ains-net --name ains-postgres-dev \
-  -e POSTGRES_PASSWORD=CHANGE_ME_POSTGRES_PASSWORD -e POSTGRES_DB=ains \
+docker run -d \
+  --name ains-postgres-dev \
+  --network ains-net \
+  -e POSTGRES_DB=ains \
+  -e POSTGRES_USER=ains \
+  -e POSTGRES_PASSWORD="${AINS_POSTGRES_PASSWORD:-CHANGE_ME_POSTGRES_PASSWORD}" \
+  -p 5432:5432 \
   -v ains-postgres-data:/var/lib/postgresql/data \
-  -p 5432:5432 postgres:16-alpine
-docker run -d --network ains-net --name ains-redis-dev \
-  -v ains-redis-data:/data -p 6379:6379 redis:7-alpine \
-  redis-server --requirepass CHANGE_ME_REDIS_PASSWORD
+  --restart unless-stopped \
+  postgres:16-alpine
+
+# Redis（用于缓存、会话和分布式限流）
+docker run -d \
+  --name ains-redis-dev \
+  --network ains-net \
+  -p 6379:6379 \
+  -v ains-redis-data:/data \
+  --restart unless-stopped \
+  redis:7-alpine \
+  redis-server \
+  --requirepass "${AINS_REDIS_PASSWORD:-CHANGE_ME_REDIS_PASSWORD}" \
+  --maxmemory 256mb \
+  --maxmemory-policy allkeys-lru
 
 # 2. 配置
 cp -n config.toml.example config.toml

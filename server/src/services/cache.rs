@@ -503,6 +503,40 @@ impl CacheService {
         }
     }
 
+    /// Atomically increment a key by `delta` and refresh TTL on each increment.
+    ///
+    /// Uses a Lua script to ensure INCRBY and EXPIRE are atomic:
+    /// - If the key does not exist, it is created with value `delta` and TTL set.
+    /// - If the key already exists, it is incremented by `delta` **and TTL is
+    ///   refreshed** (sliding-window semantics).
+    ///
+    /// Returns the new value after increment.
+    pub async fn increment_by(&self, key: &str, delta: u64, ttl: Duration) -> CacheResult<u64> {
+        let mut conn = match self.conn().await {
+            Some(c) => c,
+            None => return Ok(delta), // no-op mode: pretend we incremented
+        };
+
+        // Lua script: atomically INCRBY, always refresh EXPIRE (sliding window).
+        // KEYS[1] – the counter key
+        // ARGV[1] – TTL in seconds
+        // ARGV[2] – increment amount
+        const INCRBY_AND_EXPIRE: &str = r#"
+            local count = redis.call('INCRBY', KEYS[1], ARGV[2])
+            redis.call('EXPIRE', KEYS[1], ARGV[1])
+            return count
+        "#;
+
+        let count: u64 = bb8_redis::redis::Script::new(INCRBY_AND_EXPIRE)
+            .key(key)
+            .arg(ttl.as_secs())
+            .arg(delta)
+            .invoke_async(&mut *conn)
+            .await?;
+
+        Ok(count)
+    }
+
     /// Check if a key exists in the cache.
     pub async fn exists(&self, key: &str) -> CacheResult<bool> {
         let mut conn = match self.conn().await {

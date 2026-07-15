@@ -4,12 +4,15 @@
 
 use ains_axum::{Body, BodyExt, Method, Request, Router, StatusCode};
 use ains_server::AppState;
-use distributed_ratelimit::RedisRateLimiter;
+use ains_server::services::{MeteringService, QuotaService};
+use ains_server::utils::config::QuotaConfig;
+use distributed_ratelimit::{RateLimitConfig, RedisRateLimiter};
 use serde_json::Value;
 use std::sync::Arc;
 use tower::ServiceExt;
 
 use crate::common;
+use crate::common::DEFAULT_TEST_PASSWORD;
 
 /// Create a test router with the same middleware stack as the production app.
 pub async fn create_app() -> Router {
@@ -27,12 +30,21 @@ pub async fn create_app_and_state() -> (Router, AppState) {
     let cache = common::create_cache_service().await;
     let config = Arc::new(common::load_test_config());
 
+    let gateway = Arc::new(
+        ains_server::services::gateway::GatewayService::new_with_proxy_flag(
+            db.clone(),
+            &config.jwt_secret,
+            true, /* no_proxy — tests always bypass system proxy */
+        ),
+    );
+
     let state = AppState {
         db,
         cache,
         config,
         email: common::default_email_service(),
         wechat: None,
+        gateway,
     };
 
     // 使用生产级的 build_app_router，注入禁用的 rate limiter
@@ -83,16 +95,39 @@ pub async fn body_to_json(response: ains_axum::Response) -> Value {
 }
 
 /// Extract body bytes from axum Response.
-pub async fn body_bytes(response: ains_axum::Response) -> bytes::Bytes {
-    response.into_body().collect().await.unwrap().to_bytes()
+pub async fn body_bytes(response: ains_axum::Response) -> Vec<u8> {
+    response
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec()
+}
+
+/// Login with an existing user and return JWT token (no registration).
+pub async fn login(app: &Router, email: &str) -> String {
+    let login_payload = serde_json::json!({
+        "email": email,
+        "password": DEFAULT_TEST_PASSWORD
+    });
+    let login_response = send_json_post(app, "/api/public/auth/login", &login_payload).await;
+    assert_eq!(
+        login_response.status(),
+        StatusCode::OK,
+        "login should succeed for {}",
+        email
+    );
+    let login_body = body_to_json(login_response).await;
+    login_body["token"].as_str().unwrap().to_string()
 }
 
 /// Register a user and return JWT token.
 pub async fn register_and_login(app: &Router, email: &str) -> String {
     let register_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!",
-        "password_confirm": "Password123!",
+        "password": DEFAULT_TEST_PASSWORD,
+        "password_confirm": DEFAULT_TEST_PASSWORD,
         "name": "Test User"
     });
 
@@ -102,7 +137,7 @@ pub async fn register_and_login(app: &Router, email: &str) -> String {
 
     let login_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!"
+        "password": DEFAULT_TEST_PASSWORD
     });
 
     let login_response = send_json_post(app, "/api/public/auth/login", &login_payload).await;
@@ -117,8 +152,8 @@ pub async fn register_and_login(app: &Router, email: &str) -> String {
 pub async fn register_and_login_with_refresh(app: &Router, email: &str) -> (String, String) {
     let register_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!",
-        "password_confirm": "Password123!",
+        "password": DEFAULT_TEST_PASSWORD,
+        "password_confirm": DEFAULT_TEST_PASSWORD,
         "name": "Test User"
     });
 
@@ -128,7 +163,7 @@ pub async fn register_and_login_with_refresh(app: &Router, email: &str) -> (Stri
     // Login with remember=true to get JWT + refresh token
     let login_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!",
+        "password": DEFAULT_TEST_PASSWORD,
         "remember": true,
     });
 
@@ -165,11 +200,57 @@ pub async fn register_and_login_with_refresh(app: &Router, email: &str) -> (Stri
     (jwt, refresh_token)
 }
 
+/// Create a system-role user in the database and return the JWT token.
+pub async fn create_system_and_login(app: &Router, email: &str) -> String {
+    use ains_runtime::auth::JwtClaims;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let token = register_and_login(app, email).await;
+    let secret = common::load_test_config().jwt_secret;
+
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.set_issuer(&["ains-server"]);
+    validation.set_audience(&["ains"]);
+    let token_data = jsonwebtoken::decode::<JwtClaims>(
+        &token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .expect("Failed to decode token");
+
+    let user_id: i64 = token_data.claims.sub.parse().expect("Invalid user ID");
+
+    let config = common::load_test_config();
+    let db = sea_orm::Database::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to database");
+
+    // Atomic SQL UPDATE — avoids the read-modify-write pattern (token_version = token_version + 1)
+    // that would otherwise be required by the ActiveModel approach.
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE users SET role = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2",
+        ["system".into(), user_id.into()],
+    ))
+    .await
+    .expect("Failed to update user to system");
+
+    // Re-login to get a new token with the updated role
+    let login_payload = serde_json::json!({
+        "email": email,
+        "password": DEFAULT_TEST_PASSWORD
+    });
+    let login_response = send_json_post(app, "/api/public/auth/login", &login_payload).await;
+    assert_eq!(login_response.status(), StatusCode::OK);
+    let login_body = body_to_json(login_response).await;
+    login_body["token"].as_str().unwrap().to_string()
+}
+
 /// Create an admin user in the database and return the JWT token.
 pub async fn create_admin_and_login(app: &Router, email: &str) -> String {
     use ains_runtime::auth::JwtClaims;
-    use ains_server::repositories::user::{ActiveModel, Column, Entity as UserEntity};
-    use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
     // Register normally first
     let token = register_and_login(app, email).await;
@@ -193,38 +274,79 @@ pub async fn create_admin_and_login(app: &Router, email: &str) -> String {
         .parse()
         .expect("Invalid user ID in token");
 
-    // Connect to DB directly to update the user role to admin
+    // Connect to DB directly to update the user role to admin using atomic SQL.
+    // Uses token_version = token_version + 1 to match the production pattern.
     let config = common::load_test_config();
     let db = sea_orm::Database::connect(&config.database_url)
         .await
         .expect("Failed to connect to database");
 
-    let user = UserEntity::find()
-        .filter(Column::Id.eq(user_id))
-        .one(&db)
-        .await
-        .expect("Failed to find user")
-        .expect("User not found");
-
-    let current_version = user.token_version;
-    let mut active_model: ActiveModel = user.into();
-    active_model.role = Set("admin".to_string());
-    // NOTE: read-modify-write is safe here (single-threaded test, no concurrency).
-    // In production code, always use the atomic UPDATE … SET token_version = token_version + 1 pattern.
-    active_model.token_version = Set(current_version.saturating_add(1));
-    active_model.updated_at = Set(chrono::Utc::now());
-    active_model
-        .update(&db)
-        .await
-        .expect("Failed to update user to admin");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE users SET role = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2",
+        ["admin".into(), user_id.into()],
+    ))
+    .await
+    .expect("Failed to update user to admin");
 
     // Re-login to get a new token with the updated role
     let login_payload = serde_json::json!({
         "email": email,
-        "password": "Password123!"
+        "password": DEFAULT_TEST_PASSWORD
     });
     let login_response = send_json_post(app, "/api/public/auth/login", &login_payload).await;
     assert_eq!(login_response.status(), StatusCode::OK);
     let login_body = body_to_json(login_response).await;
     login_body["token"].as_str().unwrap().to_string()
+}
+
+/// Create a test router with quota and metering services enabled.
+///
+/// Unlike `create_app_and_state()` which uses a disabled rate limiter and
+/// gateway without quota, this helper enables the full quota stack (RPM/TPM
+/// checks and circuit breaker) and token metering, backed by real Redis.
+///
+/// The `quota_config` parameter allows tests to set custom limits (e.g.,
+/// a low `cb_failure_threshold` or `channel_max_rpm`) without modifying
+/// the shared config.toml.
+pub async fn create_app_with_quota(quota_config: QuotaConfig) -> Router {
+    let db = common::create_test_db_and_run_migrations().await;
+    let cache = common::create_cache_service().await;
+    let config = Arc::new(common::load_test_config());
+
+    // Create a real Redis rate limiter from the cache service's Redis client.
+    let rate_limiter = cache
+        .redis_client()
+        .map(|client| RedisRateLimiter::new(client.clone(), RateLimitConfig::default()));
+
+    let quota = QuotaService::new(rate_limiter, cache.clone(), Arc::new(quota_config));
+    let metering = MeteringService::new(db.clone());
+    let secret = if !config.gateway_encryption_key.is_empty() {
+        &config.gateway_encryption_key
+    } else {
+        &config.jwt_secret
+    };
+    let gateway = Arc::new(ains_server::services::gateway::GatewayService::with_quota(
+        db.clone(),
+        secret,
+        quota,
+        Some(metering),
+        true, /* no_proxy — tests always bypass system proxy */
+    ));
+
+    let state = AppState {
+        db,
+        cache,
+        config,
+        email: common::default_email_service(),
+        wechat: None,
+        gateway,
+    };
+
+    let limiter = RedisRateLimiter::disabled(distributed_ratelimit::RateLimitConfig::default());
+    let router =
+        ains_server::bootstrap::axum::build_app_router(state.clone(), "development", limiter);
+    let router = router.with_state(state.clone());
+
+    router
 }

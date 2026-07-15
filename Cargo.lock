@@ -79,6 +79,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "tokio",
+ "tokio-stream",
  "tower-http",
  "tracing",
 ]
@@ -97,6 +98,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 
@@ -122,14 +124,17 @@ dependencies = [
 name = "ains-server"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ains-axum",
  "ains-runtime",
  "ains-salvo",
  "anyhow",
  "argon2",
  "async-trait",
+ "base64",
  "bb8",
  "bb8-redis",
+ "bytes",
  "chrono",
  "clap",
  "config",
@@ -138,6 +143,7 @@ dependencies = [
  "emailserver",
  "futures",
  "hex",
+ "hkdf",
  "http",
  "jsonwebtoken",
  "parking_lot",
@@ -152,6 +158,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
  "tracing-subscriber",
