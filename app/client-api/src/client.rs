@@ -52,18 +52,18 @@ impl Client {
     pub fn new(config: ClientConfig) -> Result<Self, ClientError> {
         config.validate()?;
 
-        // 检查是否应禁用系统 HTTP 代理：
-        // 1. 配置中显式设置 no_proxy = true
-        // 2. 环境变量 AINS_SYS_NO_PROXY = true（全局覆盖）
-        let no_proxy = config.no_proxy
-            || std::env::var("AINS_SYS_NO_PROXY")
-                .ok()
-                .map(|v| v.eq_ignore_ascii_case("true"))
-                .unwrap_or(false);
-
         let client = {
             #[cfg(not(target_arch = "wasm32"))]
             {
+                // 检查是否应禁用系统 HTTP 代理：
+                // 1. 配置中显式设置 no_proxy = true
+                // 2. 环境变量 AINS_SYS_NO_PROXY = true（全局覆盖）
+                let no_proxy = config.no_proxy
+                    || std::env::var("AINS_SYS_NO_PROXY")
+                        .ok()
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+
                 let mut builder = reqwest::Client::builder()
                     .timeout(Duration::from_secs(config.timeout_secs))
                     .cookie_store(true);
