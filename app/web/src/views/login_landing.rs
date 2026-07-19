@@ -43,14 +43,14 @@ pub fn LoginLanding() -> Element {
         auth_for_clear.clear_pending_registration();
     });
 
-    // 已登录则直接跳到 dashboard
+    // 已登录则直接跳到个人中心（所有角色的默认落地页）
     let authenticated_at_render = auth.is_authenticated();
     let auth_for_effect = auth.clone();
     use_effect(move || {
         // 显式读取 auth.user 以建立响应式依赖
         // 当登录成功后 auth.user 变化时，此 effect 会重新执行并触发导航
         if auth_for_effect.is_authenticated() {
-            nav.replace(Route::Dashboard {});
+            nav.replace(Route::PersonalCenter {});
         }
     });
 
@@ -102,12 +102,12 @@ pub fn LoginLanding() -> Element {
             rel: "stylesheet",
             href: asset!("/assets/styling/login_landing.css"),
         }
-        div { class: "ws-landing",
+        div { class: "ains-landing",
             // ── 左侧：登录/注册表单 ──
-            div { class: "ws-landing__left",
-                div { class: "ws-landing__brand",
-                    h1 { class: "ws-landing__brand-title", "AINS" }
-                    p { class: "ws-landing__brand-subtitle", {t.login_brand_subtitle} }
+            div { class: "ains-landing__left",
+                div { class: "ains-landing__brand",
+                    h1 { class: "ains-landing__brand-title", "AINS" }
+                    p { class: "ains-landing__brand-subtitle", {t.login_brand_subtitle} }
                 }
                 AuthForm {
                     mode,
@@ -240,28 +240,28 @@ pub fn LoginLanding() -> Element {
             }
 
             // ── 右侧：二维码 + 版权 + GitHub ──
-            div { class: "ws-landing__right",
-                div { class: "ws-landing__info-card",
+            div { class: "ains-landing__right",
+                div { class: "ains-landing__info-card",
                     // 公众号二维码区域
-                    div { class: "ws-landing__qr-section",
-                        div { class: "ws-landing__qr-placeholder",
+                    div { class: "ains-landing__qr-section",
+                        div { class: "ains-landing__qr-placeholder",
                             img {
-                                class: "ws-landing__qr-img",
+                                class: "ains-landing__qr-img",
                                 src: QRCODE_IMG,
                                 alt: "openpick qrcode",
                             }
-                            p { class: "ws-landing__qr-label", {t.login_qr_label} }
-                            p { class: "ws-landing__qr-hint", {t.login_qr_hint} }
+                            p { class: "ains-landing__qr-label", {t.login_qr_label} }
+                            p { class: "ains-landing__qr-hint", {t.login_qr_hint} }
                         }
                     }
 
                     // 分隔线
-                    div { class: "ws-landing__divider" }
+                    div { class: "ains-landing__divider" }
 
                     // GitHub 项目地址
-                    div { class: "ws-landing__github",
+                    div { class: "ains-landing__github",
                         a {
-                            class: "ws-landing__github-link",
+                            class: "ains-landing__github-link",
                             href: "https://github.com/aiqubits/ains",
                             target: "_blank",
                             rel: "noopener noreferrer",
@@ -277,11 +277,9 @@ pub fn LoginLanding() -> Element {
                     }
 
                     // 版权声明
-                    div { class: "ws-landing__copyright",
-                        p { class: "ws-landing__copyright-text",
-                            "© 2026 AINS. All rights reserved."
-                        }
-                        p { class: "ws-landing__copyright-sub", {t.login_copyright_sub} }
+                    div { class: "ains-landing__copyright",
+                        p { class: "ains-landing__copyright-text", "© 2026 AINS. All rights reserved." }
+                        p { class: "ains-landing__copyright-sub", {t.login_copyright_sub} }
                     }
                 }
             }

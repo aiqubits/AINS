@@ -1,5 +1,5 @@
 /* Badge —— 5 种变体 */
-.ws-badge {
+.ains-badge {
   display: inline-flex;
   align-items: center;
   font-family: var(--font-family);
@@ -12,31 +12,31 @@
   white-space: nowrap;
 }
 
-.ws-badge--success {
+.ains-badge--success {
   background: var(--color-success-bg);
   color: var(--color-success-text);
   border-color: var(--color-success-border);
 }
 
-.ws-badge--warning {
+.ains-badge--warning {
   background: var(--color-warning-bg);
   color: var(--color-warning-text);
   border-color: var(--color-warning-border);
 }
 
-.ws-badge--admin {
+.ains-badge--admin {
   background: var(--color-accent-purple-soft-bg);
   color: #9333ea;
   border-color: var(--color-accent-purple-soft-border);
 }
 
-.ws-badge--user {
+.ains-badge--user {
   background: #f1f5f9;
   color: var(--color-text-secondary);
   border-color: rgba(226, 232, 240, 0.6);
 }
 
-.ws-badge--amber-compact {
+.ains-badge--amber-compact {
   background: var(--color-warning-bg);
   color: var(--color-warning-text);
   border-color: rgba(253, 230, 138, 0.6);

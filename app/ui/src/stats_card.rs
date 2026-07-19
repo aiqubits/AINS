@@ -13,19 +13,19 @@ pub fn StatsCard(
     #[props(default = StatsAccent::Indigo)] accent: StatsAccent,
     #[props(default)] value_color: StatsValueColor,
 ) -> Element {
-    let icon_class = format!("ws-stats__icon ws-stats__icon--{}", accent.modifier());
+    let icon_class = format!("ains-stats__icon ains-stats__icon--{}", accent.modifier());
     let value_class = format!(
-        "ws-stats__value ws-stats__value--{}",
+        "ains-stats__value ains-stats__value--{}",
         value_color.modifier()
     );
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/stats_card.css") }
-        div { class: "ws-stats",
-            div { class: "ws-stats__body",
-                span { class: "ws-stats__label", "{label}" }
+        div { class: "ains-stats",
+            div { class: "ains-stats__body",
+                span { class: "ains-stats__label", "{label}" }
                 span { class: value_class, "{value}" }
-                span { class: "ws-stats__sub", "{sub}" }
+                span { class: "ains-stats__sub", "{sub}" }
             }
             div { class: icon_class, {icon} }
         }

@@ -5,9 +5,9 @@ use dioxus::prelude::*;
 /// 按 DESIGN.md §3.13 规格。三种语义色与 HTTP 方法对应。
 #[component]
 pub fn RouteCard(method: RouteMethod, path: String, description: String) -> Element {
-    let card_class = format!("ws-route ws-route--{}", method.card_modifier());
+    let card_class = format!("ains-route ains-route--{}", method.card_modifier());
     let badge_class = format!(
-        "ws-route__badge ws-route__badge--{}",
+        "ains-route__badge ains-route__badge--{}",
         method.badge_modifier()
     );
 
@@ -15,9 +15,9 @@ pub fn RouteCard(method: RouteMethod, path: String, description: String) -> Elem
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/route_card.css") }
         div { class: card_class,
             span { class: badge_class, "{method.label()}" }
-            div { class: "ws-route__body",
-                span { class: "ws-route__path", "{path}" }
-                span { class: "ws-route__desc", "{description}" }
+            div { class: "ains-route__body",
+                span { class: "ains-route__path", "{path}" }
+                span { class: "ains-route__desc", "{description}" }
             }
         }
     }

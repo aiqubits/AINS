@@ -96,6 +96,9 @@ pub struct UpdateUserInput {
     pub email: Option<String>,
     pub name: Option<String>,
     pub role: Option<String>,
+    /// Tenant reassignment (only effective when actor is system; validated as an
+    /// active tenant at the handler layer). `None` leaves the tenant unchanged.
+    pub tenant_id: Option<String>,
 }
 
 /// User response (without sensitive data)
@@ -120,6 +123,10 @@ pub struct UserResponse {
     pub name: String,
     pub role: String,
     pub tenant_id: String,
+    /// Tenant display name, resolved best-effort at the handler layer for
+    /// admin-facing list endpoints. `None` when not enriched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_name: Option<String>,
     pub email_verified: bool,
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
@@ -145,6 +152,7 @@ impl From<Model> for UserResponse {
             name: model.name,
             role: model.role,
             tenant_id: model.tenant_id,
+            tenant_name: None,
             email_verified: model.email_verified,
             created_at: model.created_at,
             updated_at: model.updated_at,
@@ -256,6 +264,7 @@ mod tests {
             balance: 500,
             wx_openid: None,
             tenant_id: "default".to_string(),
+            tenant_name: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

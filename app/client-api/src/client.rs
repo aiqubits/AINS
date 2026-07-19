@@ -348,18 +348,22 @@ impl Client {
     /// 创建用户 — `POST /api/users`（需要 admin 角色）
     ///
     /// `role` 仅在当前用户为 system 时生效；admin 创建时强制为 "user"。
+    /// `tenant_id` 同样仅对 system 生效，用于选择归属租户；admin 由服务端
+    /// 强制归入自身租户，忽略该字段。
     pub async fn create_user(
         &self,
         email: impl Into<String>,
         password: impl Into<String>,
         name: impl Into<String>,
         role: Option<String>,
+        tenant_id: Option<String>,
     ) -> Result<UserResponse, ClientError> {
         let body = CreateUserRequest {
             email: email.into(),
             password: password.into(),
             name: name.into(),
             role,
+            tenant_id,
         };
         self.post_json("/api/users", &body, None).await
     }
@@ -367,14 +371,22 @@ impl Client {
     /// 更新用户 — `PUT /api/users/{id}`（需要 admin 角色）
     ///
     /// 仅传入的字段会被更新；`None` 字段保持原值不变。
+    /// `tenant_id` 仅对 system 生效（可将用户重新归属到目标租户）；
+    /// admin 由服务端强制限定在自身租户，忽略该字段。
     pub async fn update_user(
         &self,
         id: String,
         email: Option<String>,
         name: Option<String>,
         role: Option<String>,
+        tenant_id: Option<String>,
     ) -> Result<UserResponse, ClientError> {
-        let body = UpdateUserRequest { email, name, role };
+        let body = UpdateUserRequest {
+            email,
+            name,
+            role,
+            tenant_id,
+        };
         self.put_json(&format!("/api/users/{}", id), &body, None)
             .await
     }
@@ -406,6 +418,180 @@ impl Client {
         let body = AdjustBalanceRequest { amount };
         self.post_json(&format!("/api/users/{}/balance/adjust", id), &body, None)
             .await
+    }
+
+    // ──────────────────────────────────────────
+    //  Admin: Tenant management
+    // ──────────────────────────────────────────
+
+    /// 分页列出租户 — `GET /api/tenants?page=...&per_page=...`（需要 system 角色）
+    pub async fn list_tenants(
+        &self,
+        page: u64,
+        per_page: u64,
+    ) -> Result<TenantListResponse, ClientError> {
+        if page == 0 || per_page == 0 {
+            return Err(ClientError::Config(
+                "page and per_page must be greater than 0".to_string(),
+            ));
+        }
+        let url = self.inner.config.build_url("/api/tenants");
+        let builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        self.send_and_parse(builder).await
+    }
+
+    /// 创建租户 — `POST /api/tenants`（需要 system 角色）
+    pub async fn create_tenant(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<TenantResponse, ClientError> {
+        let body = CreateTenantRequest { name: name.into() };
+        self.post_json("/api/tenants", &body, None).await
+    }
+
+    /// 更新租户 — `PUT /api/tenants/{id}`（需要 system 角色，admin 仅可更新自身租户）
+    pub async fn update_tenant(
+        &self,
+        id: &str,
+        name: Option<String>,
+        status: Option<String>,
+    ) -> Result<TenantResponse, ClientError> {
+        let body = UpdateTenantRequest { name, status };
+        self.put_json(&format!("/api/tenants/{}", id), &body, None)
+            .await
+    }
+
+    /// 删除租户 — `DELETE /api/tenants/{id}`（需要 system 角色）
+    ///
+    /// 若租户下存在用户或渠道则返回 409 Conflict。
+    pub async fn delete_tenant(&self, id: &str) -> Result<DeleteResponse, ClientError> {
+        self.delete_json(&format!("/api/tenants/{}", id), None)
+            .await
+    }
+
+    // ──────────────────────────────────────────
+    //  Admin: Channel management
+    // ──────────────────────────────────────────
+
+    /// 分页列出渠道 — `GET /api/channels?page=...&per_page=...`（需要 admin/system 角色）
+    pub async fn list_channels(
+        &self,
+        page: u64,
+        per_page: u64,
+    ) -> Result<ChannelListResponse, ClientError> {
+        if page == 0 || per_page == 0 {
+            return Err(ClientError::Config(
+                "page and per_page must be greater than 0".to_string(),
+            ));
+        }
+        let url = self.inner.config.build_url("/api/channels");
+        let builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        self.send_and_parse(builder).await
+    }
+
+    /// 创建渠道 — `POST /api/channels`（需要 admin/system 角色）
+    pub async fn create_channel(
+        &self,
+        input: CreateChannelRequest,
+    ) -> Result<ChannelResponse, ClientError> {
+        self.post_json("/api/channels", &input, None).await
+    }
+
+    /// 更新渠道 — `PUT /api/channels/{id}`（需要 admin/system 角色）
+    pub async fn update_channel(
+        &self,
+        id: &str,
+        input: UpdateChannelRequest,
+    ) -> Result<ChannelResponse, ClientError> {
+        self.put_json(&format!("/api/channels/{}", id), &input, None)
+            .await
+    }
+
+    /// 禁用渠道 — 通过 `PUT /api/channels/{id} { is_active: false }` 实现（需要 admin/system 角色）
+    ///
+    /// 此方法仅将渠道标记为 `is_active = false`，不删除记录。
+    /// 若要物理删除，请使用 [`Self::delete_channel`]。
+    pub async fn disable_channel(&self, id: &str) -> Result<(), ClientError> {
+        self.put_json::<serde_json::Value, _>(
+            &format!("/api/channels/{}", id),
+            &serde_json::json!({"is_active": false}),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 物理删除渠道 — `DELETE /api/channels/{id}`（需要 admin/system 角色）
+    ///
+    /// 若渠道存在关联的 token_usage 记录则会返回 409 Conflict，
+    /// 必须先清理历史用量数据后才能删除。
+    pub async fn delete_channel(&self, id: &str) -> Result<DeleteResponse, ClientError> {
+        self.delete_json(&format!("/api/channels/{}", id), None)
+            .await
+    }
+
+    // ──────────────────────────────────────────
+    //  Admin: Token usage / Metering
+    // ──────────────────────────────────────────
+
+    /// 分页查询 token 用量 — `GET /api/usage`（需要 admin/system 角色）
+    pub async fn list_usage(
+        &self,
+        page: u64,
+        per_page: u64,
+        filter: Option<&ListUsageFilter>,
+    ) -> Result<PaginatedUsageResponse, ClientError> {
+        let url = self.inner.config.build_url("/api/usage");
+        let mut builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        if let Some(f) = filter {
+            builder = Self::apply_usage_filter(builder, f);
+        }
+        self.send_and_parse(builder).await
+    }
+
+    /// 获取 token 用量统计 — `GET /api/usage/stats`（需要 admin/system 角色）
+    pub async fn get_usage_stats(
+        &self,
+        filter: Option<&UsageStatsFilter>,
+    ) -> Result<UsageStatsResponse, ClientError> {
+        let url = self.inner.config.build_url("/api/usage/stats");
+        let mut builder = self.request_with_auth(Method::GET, &url, None)?;
+        if let Some(f) = filter {
+            builder = Self::apply_usage_filter(builder, f);
+        }
+        self.send_and_parse(builder).await
+    }
+
+    /// Apply optional usage filter parameters to a request builder.
+    fn apply_usage_filter(
+        mut builder: reqwest::RequestBuilder,
+        filter: &ListUsageFilter,
+    ) -> reqwest::RequestBuilder {
+        if let Some(user_id) = filter.user_id {
+            builder = builder.query(&[("user_id", user_id)]);
+        }
+        if let Some(ref channel_id) = filter.channel_id {
+            builder = builder.query(&[("channel_id", channel_id)]);
+        }
+        if let Some(ref model) = filter.model {
+            builder = builder.query(&[("model", model)]);
+        }
+        if let Some(ref request_type) = filter.request_type {
+            builder = builder.query(&[("request_type", request_type)]);
+        }
+        if let Some(ref date_from) = filter.date_from {
+            builder = builder.query(&[("date_from", date_from)]);
+        }
+        if let Some(ref date_to) = filter.date_to {
+            builder = builder.query(&[("date_to", date_to)]);
+        }
+        builder
     }
 
     // ──────────────────────────────────────────

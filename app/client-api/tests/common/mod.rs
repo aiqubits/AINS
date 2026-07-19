@@ -35,12 +35,14 @@ pub mod fixtures {
         role: &str,
         created_at: &str,
         updated_at: &str,
+        tenant_id: &str,
     ) -> serde_json::Value {
         serde_json::json!({
             "id": id,
             "email": email,
             "name": name,
             "role": role,
+            "tenant_id": tenant_id,
             "created_at": created_at,
             "updated_at": updated_at,
         })

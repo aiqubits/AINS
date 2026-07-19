@@ -466,6 +466,7 @@ async fn test_login_and_use_token_for_authenticated_request() {
                 "admin",
                 "2024-01-01T00:00:00Z",
                 "2024-06-01T00:00:00Z",
+                "default",
             )],
             "total": 1,
             "page": 1,

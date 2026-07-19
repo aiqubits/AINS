@@ -133,5 +133,6 @@ mod tests {
         );
         assert!(migrations[0].1.contains("ai_gateway_channels"));
         assert!(migrations[0].1.contains("token_usage"));
+        assert!(migrations[0].1.contains("idx_token_usage_model"));
     }
 }

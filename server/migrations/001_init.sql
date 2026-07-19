@@ -121,3 +121,10 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_tenant
 -- Index for per-channel usage queries (e.g. channel cost analysis).
 CREATE INDEX IF NOT EXISTS idx_token_usage_channel
     ON token_usage(channel_id, created_at DESC);
+
+-- Index for per-model usage stats queries (e.g. model cost analysis).
+-- The `get_usage_stats` function filters by model with GROUP BY model,
+-- and `list_usage` filters by model with ORDER BY created_at DESC.
+-- A composite index on (model, created_at DESC) covers both query patterns.
+CREATE INDEX IF NOT EXISTS idx_token_usage_model
+    ON token_usage(model, created_at DESC);

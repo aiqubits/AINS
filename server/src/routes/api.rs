@@ -5,7 +5,8 @@ use crate::handlers::api::{
     adjust_balance, change_my_password, create_user, delete_user, get_me, get_user, health_check,
     list_users, logout_all, set_balance, update_user,
 };
-use crate::handlers::gateway::{create_channel, disable_channel, list_channels, update_channel};
+use crate::handlers::gateway::{create_channel, delete_channel, list_channels, update_channel};
+use crate::handlers::metering::{get_token_usage_stats, list_token_usage};
 use crate::handlers::responses::responses_chat;
 use crate::handlers::tenant::{
     create_tenant, delete_tenant, list_tenants, move_user_tenant, update_tenant,
@@ -30,7 +31,9 @@ pub fn api_routes() -> AppRouter {
             .route("/channels", get(list_channels))
             .route("/channels", post(create_channel))
             .route("/channels/{id}", put(update_channel))
-            .route("/channels/{id}", delete(disable_channel)),
+            .route("/channels/{id}", delete(delete_channel))
+            .route("/usage", get(list_token_usage))
+            .route("/usage/stats", get(get_token_usage_stats)),
     );
 
     // Self-service routes for any authenticated user (no admin role required).

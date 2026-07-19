@@ -1,5 +1,5 @@
 /* CodeConsole —— Dashboard 终端面板 */
-.ws-console {
+.ains-console {
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -7,20 +7,20 @@
   min-height: 0;
 }
 
-.ws-console__header {
+.ains-console__header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
 }
 
-.ws-console__title-block {
+.ains-console__title-block {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.ws-console__title {
+.ains-console__title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 14px;
@@ -28,7 +28,7 @@
   color: var(--color-text-primary);
 }
 
-.ws-console__subtitle {
+.ains-console__subtitle {
   margin: 0;
   font-family: var(--font-family);
   font-size: 11px;
@@ -36,7 +36,7 @@
   color: var(--color-text-muted);
 }
 
-.ws-console__live-tag {
+.ains-console__live-tag {
   font-family: var(--font-mono);
   font-size: 10px;
   font-weight: 700;
@@ -47,7 +47,7 @@
   white-space: nowrap;
 }
 
-.ws-console__scroll {
+.ains-console__scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
@@ -64,14 +64,14 @@
   line-height: 1.5;
 }
 
-.ws-console__row {
+.ains-console__row {
   display: flex;
   align-items: center;
   gap: 8px;
   white-space: nowrap;
 }
 
-.ws-console__dot {
+.ains-console__dot {
   display: inline-block;
   width: 6px;
   height: 6px;
@@ -79,53 +79,53 @@
   flex-shrink: 0;
 }
 
-.ws-console__dot--success {
+.ains-console__dot--success {
   background: var(--color-code-success);
 }
 
-.ws-console__dot--info {
+.ains-console__dot--info {
   background: var(--color-code-info);
 }
 
-.ws-console__dot--amber {
+.ains-console__dot--amber {
   background: var(--color-code-amber);
 }
 
-.ws-console__dot--rose {
+.ains-console__dot--rose {
   background: var(--color-code-error);
 }
 
-.ws-console__ts {
+.ains-console__ts {
   color: #64748b;
   font-size: 11px;
 }
 
-.ws-console__method {
+.ains-console__method {
   font-weight: 700;
   letter-spacing: 0.04em;
 }
 
-.ws-console__method--success {
+.ains-console__method--success {
   color: var(--color-code-success);
 }
 
-.ws-console__method--info {
+.ains-console__method--info {
   color: var(--color-code-info);
 }
 
-.ws-console__method--amber {
+.ains-console__method--amber {
   color: var(--color-code-amber);
 }
 
-.ws-console__method--rose {
+.ains-console__method--rose {
   color: var(--color-code-error);
 }
 
-.ws-console__path {
+.ains-console__path {
   color: var(--color-code-text);
 }
 
-.ws-console__status {
+.ains-console__status {
   color: #94a3b8;
   font-size: 11px;
 }

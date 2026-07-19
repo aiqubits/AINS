@@ -1,12 +1,12 @@
 /* AppShell —— 根布局 */
-.ws-app-shell {
+.ains-app-shell {
   display: flex;
   min-height: 100vh;
   width: 100%;
   background: var(--color-page-gradient);
 }
 
-.ws-app-shell__main {
+.ains-app-shell__main {
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -17,7 +17,7 @@
   z-index: 10;
 }
 
-.ws-app-shell__content {
+.ains-app-shell__content {
   flex: 1;
   width: 100%;
   max-width: 1280px;

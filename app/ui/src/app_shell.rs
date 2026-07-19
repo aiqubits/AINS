@@ -10,11 +10,11 @@ use dioxus::prelude::*;
 pub fn AppShell(sidebar: Element, top_header: Element, children: Element) -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/app_shell.css") }
-        div { class: "ws-app-shell",
+        div { class: "ains-app-shell",
             {sidebar}
-            div { class: "ws-app-shell__main",
+            div { class: "ains-app-shell__main",
                 {top_header}
-                main { class: "ws-app-shell__content", {children} }
+                main { class: "ains-app-shell__content", {children} }
             }
         }
     }

@@ -21,9 +21,9 @@ pub fn TextInput(
     let mut show_password = use_signal(|| false);
 
     let input_class = if dense {
-        "ws-input__field ws-input__field--dense"
+        "ains-input__field ains-input__field--dense"
     } else {
-        "ws-input__field"
+        "ains-input__field"
     };
     let type_attr = if input_type == InputType::Password && *show_password.read() {
         "text"
@@ -37,18 +37,18 @@ pub fn TextInput(
     };
 
     let field_class = if input_type == InputType::Password {
-        format!("{} ws-input__field--pw", input_class)
+        format!("{} ains-input__field--pw", input_class)
     } else {
         input_class.to_string()
     };
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/text_input.css") }
-        div { class: "ws-input",
+        div { class: "ains-input",
             if let Some(label_text) = label.as_ref() {
-                label { class: "ws-input__label", "{label_text}" }
+                label { class: "ains-input__label", "{label_text}" }
             }
-            div { class: "ws-input__field-wrapper",
+            div { class: "ains-input__field-wrapper",
                 input {
                     class: "{field_class}",
                     r#type: type_attr,
@@ -64,7 +64,7 @@ pub fn TextInput(
                 }
                 if input_type == InputType::Password {
                     button {
-                        class: "ws-input__toggle-pw",
+                        class: "ains-input__toggle-pw",
                         r#type: "button",
                         tabindex: "-1",
                         aria_label: if *show_password.read() { "Hide password" } else { "Show password" },
@@ -81,9 +81,9 @@ pub fn TextInput(
                 }
             }
             if let Some(err) = error.as_ref() {
-                p { class: "ws-input__error", "{err}" }
+                p { class: "ains-input__error", "{err}" }
             } else if let Some(hint_text) = hint.as_ref() {
-                p { class: "ws-input__hint", "{hint_text}" }
+                p { class: "ains-input__hint", "{hint_text}" }
             }
         }
     }

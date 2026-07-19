@@ -167,6 +167,11 @@ pub struct UserResponse {
     pub email: String,
     pub name: String,
     pub role: String,
+    #[serde(default)]
+    pub tenant_id: String,
+    /// Tenant display name resolved server-side (best-effort; may be absent).
+    #[serde(default)]
+    pub tenant_name: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     /// User balance (stored as big value, 1 display unit = 10^10 stored units)
@@ -182,6 +187,10 @@ pub struct CreateUserRequest {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Only effective when the actor is `system`; tenant admins are scoped to
+    /// their own tenant server-side regardless of this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Update user request body (admin — all fields optional)
@@ -193,6 +202,10 @@ pub struct UpdateUserRequest {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
+    /// Only effective when the actor is `system`; tenant admins are scoped to
+    /// their own tenant server-side regardless of this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 /// Paginated list of users
@@ -303,3 +316,218 @@ pub struct AdjustBalanceResponse {
     pub display_balance: f64,
     pub message: String,
 }
+
+// ──────────────────────────────────────────────
+//  Tenant types
+// ──────────────────────────────────────────────
+
+/// Tenant response (mirrors server's `TenantResponse`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct TenantResponse {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    #[serde(default)]
+    pub user_count: u64,
+    #[serde(default)]
+    pub channel_count: u64,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Tenant list response (paginated)
+#[derive(Debug, Deserialize)]
+pub struct TenantListResponse {
+    pub items: Vec<TenantResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Create tenant request body
+#[derive(Debug, Serialize)]
+pub struct CreateTenantRequest {
+    pub name: String,
+}
+
+/// Update tenant request body
+#[derive(Debug, Serialize)]
+pub struct UpdateTenantRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+// ──────────────────────────────────────────────
+//  Channel types
+// ──────────────────────────────────────────────
+
+/// Channel response (mirrors server's `ChannelResponse`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChannelResponse {
+    pub id: String,
+    pub tenant_id: String,
+    /// Tenant display name resolved server-side (best-effort; may be absent).
+    #[serde(default)]
+    pub tenant_name: Option<String>,
+    pub name: String,
+    pub protocol_type: String,
+    pub models: serde_json::Value,
+    pub capabilities: serde_json::Value,
+    pub base_url: String,
+    pub is_active: bool,
+    pub weight: i32,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Channel list response (paginated)
+#[derive(Debug, Deserialize)]
+pub struct ChannelListResponse {
+    pub items: Vec<ChannelResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Create channel request body
+#[derive(Serialize)]
+pub struct CreateChannelRequest {
+    pub name: String,
+    pub protocol_type: String,
+    pub models: Vec<String>,
+    pub capabilities: Vec<String>,
+    pub api_key: String,
+    pub base_url: String,
+    pub weight: i32,
+    pub is_active: bool,
+    /// Only required when actor is system (to specify which tenant the channel belongs to)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+}
+
+impl std::fmt::Debug for CreateChannelRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateChannelRequest")
+            .field("name", &self.name)
+            .field("protocol_type", &self.protocol_type)
+            .field("models", &self.models)
+            .field("capabilities", &self.capabilities)
+            .field("api_key", &"<redacted>")
+            .field("base_url", &self.base_url)
+            .field("weight", &self.weight)
+            .field("is_active", &self.is_active)
+            .field("tenant_id", &self.tenant_id)
+            .finish()
+    }
+}
+
+/// Update channel request body (all fields optional)
+#[derive(Serialize)]
+pub struct UpdateChannelRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_active: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub weight: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+}
+
+impl std::fmt::Debug for UpdateChannelRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateChannelRequest")
+            .field("name", &self.name)
+            .field("protocol_type", &self.protocol_type)
+            .field("models", &self.models)
+            .field("capabilities", &self.capabilities)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &self.base_url)
+            .field("is_active", &self.is_active)
+            .field("weight", &self.weight)
+            .field("tenant_id", &self.tenant_id)
+            .finish()
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Token usage / Metering types
+// ──────────────────────────────────────────────
+
+/// Token usage record response
+#[derive(Debug, Clone, Deserialize)]
+pub struct TokenUsageResponse {
+    pub id: i64,
+    pub user_id: i64,
+    pub tenant_id: String,
+    pub channel_id: String,
+    pub model: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub total_tokens: i64,
+    pub request_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Paginated token usage response
+#[derive(Debug, Deserialize)]
+pub struct PaginatedUsageResponse {
+    pub items: Vec<TokenUsageResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Usage statistics response
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageStatsResponse {
+    pub total_requests: u64,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub total_tokens: i64,
+    pub model_breakdown: Vec<ModelUsageSummary>,
+}
+
+/// Per-model usage summary
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelUsageSummary {
+    pub model: String,
+    pub request_count: u64,
+    pub total_tokens: i64,
+}
+
+/// Query parameters for listing token usage (used as query string)
+/// All filter fields are optional.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ListUsageFilter {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_type: Option<String>,
+    /// ISO 8601 date string (e.g. "2026-01-01T00:00:00Z")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_from: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_to: Option<String>,
+}
+
+/// Query parameters for usage stats (alias of `ListUsageFilter` — identical fields).
+pub type UsageStatsFilter = ListUsageFilter;

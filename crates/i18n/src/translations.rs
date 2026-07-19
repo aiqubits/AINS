@@ -14,19 +14,21 @@ mod tests {
 
     /// 品牌名 / 技术术语豁免列表——这些字段 EN=ZH 是正常预期，不触发断言。
     const EXEMPT: &[&str] = &[
-        "sidebar_brand_title",             // 品牌名 AINS Admin 不翻译
-        "sidebar_brand_subtitle",          // 品牌标语 Fullend System 不翻译
-        "top_header_node_online",          // 技术术语 Node Online 不翻译
-        "dashboard_middleware_active",     // 技术术语 Active 不翻译
-        "login_copyright_sub",             // 品牌标语 Fullend Admin System 不翻译
-        "auth_name_placeholder",           // 占位符 e.g., rust_master 中英相同
-        "auth_email_placeholder_login",    // name@domain.com
-        "auth_email_placeholder_register", // master@rust.org
-        "auth_password_placeholder",       // ••••••••
-        "app_shell_guest",                 // Guest 品牌名不翻译
-        "dashboard_stats_users_sub",       // 技术术语 GET /api/users 不翻译
-        "users_form_name_placeholder",     // 占位符 e.g., rust_master 中英相同
-        "users_form_email_placeholder",    // 占位符 master@rust.org 中英相同
+        "sidebar_brand_title",               // 品牌名 AINS 不翻译
+        "top_header_node_online",            // 技术术语 Node Online 不翻译
+        "dashboard_middleware_active",       // 技术术语 Active 不翻译
+        "auth_name_placeholder",             // 占位符 e.g., rust_master 中英相同
+        "auth_email_placeholder_login",      // name@domain.com
+        "auth_email_placeholder_register",   // master@rust.org
+        "auth_password_placeholder",         // ••••••••
+        "app_shell_guest",                   // Guest 品牌名不翻译
+        "users_form_name_placeholder",       // 占位符 e.g., rust_master 中英相同
+        "users_form_email_placeholder",      // 占位符 master@rust.org 中英相同
+        "channels_form_protocol_anthropic",  // 品牌名 Anthropic 不翻译
+        "channels_form_api_key_label",       // 技术术语 API Key 不翻译
+        "channels_form_api_key_placeholder", // 占位符 sk-… 不翻译
+        "metering_column_prompt_tokens",     // 技术术语 Prompt 不翻译
+        "metering_column_completion_tokens", // 技术术语 Completion 不翻译
     ];
 
     /// 防止 EN/ZH 倒挂粘贴错误。
@@ -61,8 +63,8 @@ mod tests {
     fn all_translation_fields_count() {
         let count = ALL_TRANSLATION_FIELDS.len();
         assert_eq!(
-            count, 219,
-            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (219)。如果新增/删除了 translate! 字段，请同步更新此断言。"
+            count, 350,
+            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (350)。如果新增/删除了 translate! 字段，请同步更新此断言。"
         );
     }
 }

@@ -29,6 +29,12 @@ pub struct TenantResponse {
     pub name: String,
     pub status: String,
     pub created_at: DateTimeUtc,
+    /// Number of users in this tenant.
+    #[serde(default)]
+    pub user_count: u64,
+    /// Number of AI gateway channels in this tenant.
+    #[serde(default)]
+    pub channel_count: u64,
 }
 impl From<Model> for TenantResponse {
     fn from(value: Model) -> Self {
@@ -37,6 +43,8 @@ impl From<Model> for TenantResponse {
             name: value.name,
             status: value.status,
             created_at: value.created_at,
+            user_count: 0,
+            channel_count: 0,
         }
     }
 }

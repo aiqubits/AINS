@@ -51,17 +51,17 @@ pub fn ResetPassword(email: Option<String>) -> Element {
     }
 
     rsx! {
-        div { class: "ws-reset",
-            div { class: "ws-reset__orb ws-reset__orb--cyan" }
-            div { class: "ws-reset__orb ws-reset__orb--purple" }
+        div { class: "ains-reset",
+            div { class: "ains-reset__orb ains-reset__orb--cyan" }
+            div { class: "ains-reset__orb ains-reset__orb--purple" }
 
-            div { class: "ws-reset__card",
-                div { class: "ws-reset__icon" }
-                h1 { class: "ws-reset__title", {t.reset_pw_title} }
-                p { class: "ws-reset__subtitle", {t.reset_pw_subtitle} }
+            div { class: "ains-reset__card",
+                div { class: "ains-reset__icon" }
+                h1 { class: "ains-reset__title", {t.reset_pw_title} }
+                p { class: "ains-reset__subtitle", {t.reset_pw_subtitle} }
 
                 form {
-                    class: "ws-reset__form",
+                    class: "ains-reset__form",
                     onsubmit: move |e| {
                         e.prevent_default();
                         if *submitting.read() {
@@ -168,20 +168,20 @@ pub fn ResetPassword(email: Option<String>) -> Element {
                         autocomplete: Some("new-password".to_string()),
                     }
                     if let Some(err) = error_msg.read().as_ref() {
-                        p { class: "ws-form-error", "{err}" }
+                        p { class: "ains-form-error", "{err}" }
                     }
                     Button {
                         button_type: ButtonType::Submit,
                         full_width: true,
                         disabled: *submitting.read(),
                         loading: *submitting.read(),
-                        "{t.reset_pw_submit} [POST /reset-password]"
+                        "{t.reset_pw_submit}"
                     }
                 }
 
-                div { class: "ws-reset__back-row",
+                div { class: "ains-reset__back-row",
                     a {
-                        class: "ws-reset__back",
+                        class: "ains-reset__back",
                         href: "#",
                         onclick: move |e| {
                             e.prevent_default();

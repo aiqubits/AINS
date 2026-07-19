@@ -81,7 +81,7 @@ pub async fn list_users(req: crate::ServerRequest) -> Result<Response, HttpError
     let query: ListUsersQuery = req.parse_query().map_err(HttpError::bad_request)?;
 
     let service = UserService::new(state.db.clone(), state.cache.clone());
-    let result = service
+    let mut result = service
         .list_users(
             PaginationParams {
                 page: query.page,
@@ -92,6 +92,19 @@ pub async fn list_users(req: crate::ServerRequest) -> Result<Response, HttpError
         )
         .await
         .map_err(to_http)?;
+
+    // Best-effort enrich each row with its tenant display name so the admin UI
+    // can render names without pre-fetching the entire tenant set. A lookup
+    // failure leaves `tenant_name` as None; the client falls back to the ID.
+    let tenant_ids: Vec<String> = result.items.iter().map(|u| u.tenant_id.clone()).collect();
+    if let Ok(names) = crate::services::tenant::TenantService::new(state.db.clone())
+        .names_for(&tenant_ids)
+        .await
+    {
+        for item in result.items.iter_mut() {
+            item.tenant_name = names.get(&item.tenant_id).cloned();
+        }
+    }
 
     Response::json(&PaginatedUsersResponse::from(result))
 }
@@ -421,6 +434,10 @@ pub struct UpdateUserRequest {
 
     #[validate(custom(function = "validate_role"))]
     role: Option<String>,
+
+    /// Tenant reassignment (only effective when actor is system; tenant admins
+    /// are scoped to their own tenant and this field is ignored for them).
+    tenant_id: Option<String>,
 }
 
 /// Validate role value against allowed roles.
@@ -458,9 +475,13 @@ pub async fn update_user(mut req: crate::ServerRequest) -> Result<Response, Http
         .validate()
         .map_err(|e| HttpError::bad_request(e.to_string()))?;
 
-    if payload.email.is_none() && payload.name.is_none() && payload.role.is_none() {
+    if payload.email.is_none()
+        && payload.name.is_none()
+        && payload.role.is_none()
+        && payload.tenant_id.is_none()
+    {
         return Err(HttpError::bad_request(
-            "At least one field (email, name, or role) must be provided",
+            "At least one field (email, name, role, or tenant_id) must be provided",
         ));
     }
 
@@ -470,6 +491,27 @@ pub async fn update_user(mut req: crate::ServerRequest) -> Result<Response, Http
         None
     };
 
+    // Tenant reassignment is system-only; verify the target tenant is active
+    // (mirrors create_user). Non-system actors never move users across tenants.
+    let requested_tenant_id = if auth_user.role == "system" {
+        payload.tenant_id
+    } else {
+        None
+    };
+    if let Some(ref tenant_id) = requested_tenant_id
+        && !crate::services::tenant::TenantService::with_cache(
+            state.db.clone(),
+            state.cache.clone(),
+        )
+        .is_active(tenant_id)
+        .await
+        .map_err(|_| HttpError::internal("Failed to verify tenant"))?
+    {
+        return Err(HttpError::bad_request(
+            "Tenant does not exist or is disabled",
+        ));
+    }
+
     let service = UserService::new(state.db.clone(), state.cache.clone());
     let result = service
         .update_user(
@@ -478,6 +520,7 @@ pub async fn update_user(mut req: crate::ServerRequest) -> Result<Response, Http
                 email: payload.email,
                 name: payload.name,
                 role: requested_role,
+                tenant_id: requested_tenant_id,
             },
             &auth_user.role,
             &auth_user.tenant_id,

@@ -29,26 +29,26 @@ pub fn Modal(
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/modal.css") }
         div {
-            class: "ws-modal__backdrop",
+            class: "ains-modal__backdrop",
             onclick: move |e| {
                 if !disable_backdrop {
                     on_close.call(e);
                 }
             },
         }
-        div { class: "ws-modal__wrap", role: "dialog", aria_modal: "true",
-            div { class: "ws-modal__card",
-                header { class: "ws-modal__header",
-                    h3 { class: "ws-modal__title", "{title}" }
+        div { class: "ains-modal__wrap", role: "dialog", aria_modal: "true",
+            div { class: "ains-modal__card",
+                header { class: "ains-modal__header",
+                    h3 { class: "ains-modal__title", "{title}" }
                     button {
-                        class: "ws-modal__close",
+                        class: "ains-modal__close",
                         r#type: "button",
                         aria_label: t.modal_close,
                         onclick: move |e| on_close.call(e),
                         X {}
                     }
                 }
-                div { class: "ws-modal__body", {children} }
+                div { class: "ains-modal__body", {children} }
             }
         }
     }

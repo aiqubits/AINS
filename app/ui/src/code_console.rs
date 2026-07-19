@@ -17,7 +17,7 @@ pub fn CodeConsole(lines: ReadSignal<Vec<ConsoleLine>>) -> Element {
         }
         spawn(async move {
             let _ = document::eval(
-                "const el = document.getElementById('ws-console-scroll'); \
+                "const el = document.getElementById('ains-console-scroll'); \
                  if (el) { el.scrollTop = el.scrollHeight; }",
             )
             .await;
@@ -29,17 +29,17 @@ pub fn CodeConsole(lines: ReadSignal<Vec<ConsoleLine>>) -> Element {
             rel: "stylesheet",
             href: asset!("/assets/styling/code_console.css"),
         }
-        section { class: "ws-console",
-            header { class: "ws-console__header",
-                div { class: "ws-console__title-block",
-                    h2 { class: "ws-console__title", {t.code_console_title} }
-                    p { class: "ws-console__subtitle", {t.code_console_subtitle} }
+        section { class: "ains-console",
+            header { class: "ains-console__header",
+                div { class: "ains-console__title-block",
+                    h2 { class: "ains-console__title", {t.code_console_title} }
+                    p { class: "ains-console__subtitle", {t.code_console_subtitle} }
                 }
-                span { class: "ws-console__live-tag", "live_stream" }
+                span { class: "ains-console__live-tag", "live_stream" }
             }
             div {
-                id: "ws-console-scroll",
-                class: "ws-console__scroll no-scrollbar",
+                id: "ains-console-scroll",
+                class: "ains-console__scroll no-scrollbar",
                 {
                     let snapshot = lines.read().clone();
                     snapshot.into_iter().map(line_row)
@@ -50,23 +50,26 @@ pub fn CodeConsole(lines: ReadSignal<Vec<ConsoleLine>>) -> Element {
 }
 
 fn line_row(line: ConsoleLine) -> Element {
-    let dot_class = format!("ws-console__dot ws-console__dot--{}", line.kind.modifier());
+    let dot_class = format!(
+        "ains-console__dot ains-console__dot--{}",
+        line.kind.modifier()
+    );
     let method_class = format!(
-        "ws-console__method ws-console__method--{}",
+        "ains-console__method ains-console__method--{}",
         line.kind.modifier()
     );
     rsx! {
-        div { class: "ws-console__row",
+        div { class: "ains-console__row",
             span { class: dot_class }
             if let Some(ts) = &line.timestamp {
-                span { class: "ws-console__ts", "[{ts}]" }
+                span { class: "ains-console__ts", "[{ts}]" }
             }
             if let Some(method) = &line.method {
                 span { class: method_class, "{method}" }
             }
-            span { class: "ws-console__path", "{line.path}" }
+            span { class: "ains-console__path", "{line.path}" }
             if !line.status.is_empty() {
-                span { class: "ws-console__status", "→ {line.status}" }
+                span { class: "ains-console__status", "→ {line.status}" }
             }
         }
     }

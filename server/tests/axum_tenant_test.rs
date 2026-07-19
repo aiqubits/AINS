@@ -291,7 +291,7 @@ async fn test_tenant_delete_empty_tenant_succeeds() {
     let tenant_id = body["id"].as_str().unwrap().to_string();
 
     let (status, _body) = delete(&app, &format!("/api/tenants/{}", tenant_id), Some(&token)).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test]
@@ -351,8 +351,8 @@ async fn test_tenant_delete_with_users_returns_409() {
     assert_eq!(status, StatusCode::CONFLICT);
     let msg = body["message"].as_str().unwrap_or("");
     assert!(
-        msg.contains("users or channels"),
-        "should indicate tenant still contains users or channels; got: {}",
+        msg.contains("user(s)") && msg.contains("Remove them first"),
+        "should indicate tenant still contains users; got: {}",
         msg
     );
 }

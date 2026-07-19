@@ -46,7 +46,7 @@ pub fn VerifyEmail(email: String) -> Element {
     let auth_for_auth_guard = auth.clone();
     use_effect(move || {
         if auth_for_auth_guard.is_authenticated() {
-            nav.replace(Route::Dashboard {});
+            nav.replace(Route::PersonalCenter {});
         }
     });
 
@@ -238,29 +238,29 @@ pub fn VerifyEmail(email: String) -> Element {
             rel: "stylesheet",
             href: asset!("/assets/styling/verify_email.css"),
         }
-        div { class: "ws-verify",
-            div { class: "ws-verify__orb ws-verify__orb--blue" }
-            div { class: "ws-verify__orb ws-verify__orb--cyan" }
+        div { class: "ains-verify",
+            div { class: "ains-verify__orb ains-verify__orb--blue" }
+            div { class: "ains-verify__orb ains-verify__orb--cyan" }
 
-            div { class: "ws-verify__card",
-                div { class: "ws-verify__icon" }
+            div { class: "ains-verify__card",
+                div { class: "ains-verify__icon" }
 
-                h1 { class: "ws-verify__title", {t.verify_email_title} }
-                p { class: "ws-verify__subtitle",
+                h1 { class: "ains-verify__title", {t.verify_email_title} }
+                p { class: "ains-verify__subtitle",
                     {t.verify_email_code_sent_prefix}
                     strong { "{email}" }
                     {t.verify_email_code_sent_suffix}
                 }
 
                 form {
-                    class: "ws-verify__form",
+                    class: "ains-verify__form",
                     onsubmit: move |e| {
                         e.prevent_default();
                         do_verify();
                     },
-                    label { class: "ws-verify__label", {t.verify_email_code_label} }
+                    label { class: "ains-verify__label", {t.verify_email_code_label} }
                     input {
-                        class: "ws-verify__code-input",
+                        class: "ains-verify__code-input",
                         r#type: "text",
                         inputmode: "numeric",
                         autocomplete: "one-time-code",
@@ -280,24 +280,24 @@ pub fn VerifyEmail(email: String) -> Element {
                             error_msg.set(None);
                         },
                     }
-                    p { class: "ws-verify__hint", {t.verify_email_spam_hint} }
+                    p { class: "ains-verify__hint", {t.verify_email_spam_hint} }
 
                     if let Some(info) = info_msg.read().as_ref() {
-                        p { class: "ws-verify__info", "{info}" }
+                        p { class: "ains-verify__info", "{info}" }
                     }
                     if let Some(err) = error_msg.read().as_ref() {
-                        p { class: "ws-verify__error", "{err}" }
+                        p { class: "ains-verify__error", "{err}" }
                     }
 
                     if locked {
-                        div { class: "ws-verify__locked",
+                        div { class: "ains-verify__locked",
                             strong { {t.verify_email_max_attempts} }
                             {t.verify_email_locked_hint}
                         }
                     }
 
                     button {
-                        class: "ws-verify__submit",
+                        class: "ains-verify__submit",
                         r#type: "submit",
                         disabled: verify_disabled,
                         if *loading.read() {
@@ -310,16 +310,16 @@ pub fn VerifyEmail(email: String) -> Element {
                     }
                 }
 
-                div { class: "ws-verify__resend-row",
+                div { class: "ains-verify__resend-row",
                     button {
-                        class: "ws-verify__resend",
+                        class: "ains-verify__resend",
                         r#type: "button",
                         disabled: *loading.read() || *countdown.read() > 0,
                         onclick: on_resend,
                         "{resend_label}"
                     }
                     a {
-                        class: "ws-verify__back",
+                        class: "ains-verify__back",
                         href: "#",
                         onclick: move |e| {
                             e.prevent_default();

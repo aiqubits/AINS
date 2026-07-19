@@ -30,6 +30,12 @@ pub enum ErrorContext {
     /// 密码重置页面：与 verify-email 类似，服务端对所有失败分支统一
     /// 400 + 通用文案以防 enumeration / 凭证探测。
     PasswordReset,
+    /// 租户管理页面
+    TenantManagement,
+    /// 渠道管理页面
+    ChannelManagement,
+    /// 用量统计页面
+    Metering,
 }
 
 /// 将 `ClientError` 翻译为当前语言提示，根据 `ctx` 差异化状态码文案。
@@ -82,6 +88,26 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (503, _) => "Password reset is currently unavailable".to_string(),
                         _ => format!("Request failed (HTTP {status}): {msg}"),
                     },
+                    ErrorContext::TenantManagement => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (403, _) => "Insufficient permissions (system role required)".to_string(),
+                        (404, _) => "Tenant not found".to_string(),
+                        (409, _) => msg,
+                        (_, "validation_error") => format!("Validation error: {msg}"),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::ChannelManagement => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (403, _) => "Insufficient permissions (admin required)".to_string(),
+                        (404, _) => "Channel not found".to_string(),
+                        (_, "validation_error") => format!("Validation error: {msg}"),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::Metering => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (403, _) => "Insufficient permissions (admin required)".to_string(),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
                 },
                 Language::Zh => match ctx {
                     ErrorContext::Auth => match (status, code.as_str()) {
@@ -106,6 +132,26 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                     ErrorContext::PasswordReset => match (status, code.as_str()) {
                         (400, _) => "重置验证码无效或已过期".to_string(),
                         (503, _) => "密码重置功能暂不可用".to_string(),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::TenantManagement => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (403, _) => "权限不足 (需 system 角色)".to_string(),
+                        (404, _) => "租户不存在".to_string(),
+                        (409, _) => msg,
+                        (_, "validation_error") => format!("参数错误: {msg}"),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::ChannelManagement => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (403, _) => "权限不足 (需 admin)".to_string(),
+                        (404, _) => "渠道不存在".to_string(),
+                        (_, "validation_error") => format!("参数错误: {msg}"),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::Metering => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (403, _) => "权限不足 (需 admin)".to_string(),
                         _ => format!("请求失败 (HTTP {status}): {msg}"),
                     },
                 },
@@ -173,7 +219,7 @@ pub async fn handle_unauth(
             "403".to_string(),
             LogKind::Important,
         );
-        nav.replace(Route::Dashboard {});
+        nav.replace(Route::PersonalCenter {});
         true
     } else {
         false
@@ -444,5 +490,79 @@ mod tests {
         let err = ClientError::Other(503, r#"{"error":"mail_unconfigured"}"#.into());
         let msg = humanize_error(&err, ErrorContext::PasswordReset, Language::En);
         assert_eq!(msg, "Password reset is currently unavailable");
+    }
+
+    // ── humanize_error: ChannelManagement context ───────
+
+    #[test]
+    fn humanize_channel_401_zh() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::Zh);
+        assert_eq!(msg, "未登录或会话已过期");
+    }
+
+    #[test]
+    fn humanize_channel_401_en() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::En);
+        assert_eq!(msg, "Not logged in or session expired");
+    }
+
+    #[test]
+    fn humanize_channel_403_zh() {
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::Zh);
+        assert_eq!(msg, "权限不足 (需 admin)");
+    }
+
+    #[test]
+    fn humanize_channel_403_en() {
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::En);
+        assert_eq!(msg, "Insufficient permissions (admin required)");
+    }
+
+    #[test]
+    fn humanize_channel_404_zh() {
+        let err = ClientError::Other(404, r#"{"error":"not_found"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::Zh);
+        assert_eq!(msg, "渠道不存在");
+    }
+
+    #[test]
+    fn humanize_channel_404_en() {
+        let err = ClientError::Other(404, r#"{"error":"not_found"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::ChannelManagement, Language::En);
+        assert_eq!(msg, "Channel not found");
+    }
+
+    // ── humanize_error: Metering context ────────────────
+
+    #[test]
+    fn humanize_metering_401_zh() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::Metering, Language::Zh);
+        assert_eq!(msg, "未登录或会话已过期");
+    }
+
+    #[test]
+    fn humanize_metering_401_en() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::Metering, Language::En);
+        assert_eq!(msg, "Not logged in or session expired");
+    }
+
+    #[test]
+    fn humanize_metering_403_zh() {
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::Metering, Language::Zh);
+        assert_eq!(msg, "权限不足 (需 admin)");
+    }
+
+    #[test]
+    fn humanize_metering_403_en() {
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::Metering, Language::En);
+        assert_eq!(msg, "Insufficient permissions (admin required)");
     }
 }

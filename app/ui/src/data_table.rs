@@ -21,9 +21,9 @@ pub enum Align {
 impl Align {
     fn class(&self) -> &'static str {
         match self {
-            Self::Left => "ws-table__align--left",
-            Self::Center => "ws-table__align--center",
-            Self::Right => "ws-table__align--right",
+            Self::Left => "ains-table__align--left",
+            Self::Center => "ains-table__align--center",
+            Self::Right => "ains-table__align--right",
         }
     }
 }
@@ -67,25 +67,25 @@ pub fn DataTable(
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/data_table.css") }
-        div { class: "ws-table",
-            table { class: "ws-table__table",
-                thead { class: "ws-table__head",
+        div { class: "ains-table",
+            table { class: "ains-table__table",
+                thead { class: "ains-table__head",
                     tr {
                         for col in columns.iter() {
                             th {
-                                class: "ws-table__th {col.align.class()} {col.width.clone().unwrap_or_default()}",
+                                class: "ains-table__th {col.align.class()} {col.width.clone().unwrap_or_default()}",
                                 scope: "col",
                                 "{col.header}"
                             }
                         }
                     }
                 }
-                tbody { class: "ws-table__body",
+                tbody { class: "ains-table__body",
                     if rows.is_empty() {
                         if let Some(placeholder) = empty {
                             tr {
                                 td {
-                                    class: "ws-table__empty",
+                                    class: "ains-table__empty",
                                     colspan: columns.len(),
                                     {placeholder}
                                 }
@@ -93,7 +93,7 @@ pub fn DataTable(
                         } else {
                             tr {
                                 td {
-                                    class: "ws-table__empty",
+                                    class: "ains-table__empty",
                                     colspan: columns.len(),
                                     {t.data_table_no_data}
                                 }

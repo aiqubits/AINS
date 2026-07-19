@@ -20,7 +20,7 @@ pub use lock::{
     AcquireResult, LockGuard, acquire_lock, acquire_lock_with_client, release_lock,
     release_lock_with_client,
 };
-pub use metering::MeteringService;
+pub use metering::{ListUsageParams, MeteringService, UsageStatsResponse};
 pub use password_reset::{PasswordResetError, PasswordResetOutcome, PasswordResetService};
 pub use quota::QuotaService;
 pub use user::{UserError, UserService};

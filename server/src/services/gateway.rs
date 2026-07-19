@@ -8,7 +8,10 @@ use chrono::Utc;
 use hkdf::Hkdf;
 use rand::Rng;
 use reqwest::header::{HeaderMap, HeaderValue};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, sea_query::Expr};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    sea_query::Expr,
+};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -39,6 +42,8 @@ pub enum GatewayError {
     InvalidInput(String),
     #[error("Upstream AI provider failed: {0}")]
     Upstream(String),
+    #[error("Channel {id} has {usage_count} token usage record(s); cannot delete")]
+    HasUsage { id: String, usage_count: u64 },
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -71,6 +76,7 @@ pub struct UpdateChannelInput {
     pub base_url: Option<String>,
     pub is_active: Option<bool>,
     pub weight: Option<i32>,
+    pub tenant_id: Option<String>,
 }
 
 pub struct GatewayService {
@@ -153,21 +159,36 @@ impl GatewayService {
         }
     }
 
-    pub async fn list_channels(
+    /// List channels with pagination.
+    ///
+    /// Returns `(items, total_count)` — the handler layer wraps this into
+    /// a paginated JSON response.
+    pub async fn list_paginated(
         &self,
         tenant_id: Option<&str>,
-    ) -> Result<Vec<ChannelResponse>, GatewayError> {
-        let mut query = Entity::find();
+        page: u64,
+        per_page: u64,
+    ) -> Result<(Vec<ChannelResponse>, u64), GatewayError> {
+        let page = page.clamp(1, 1_000_000);
+        let per_page = per_page.clamp(1, 100);
+
+        let mut query = Entity::find().order_by_desc(Column::CreatedAt);
         if let Some(id) = tenant_id {
             query = query.filter(Column::TenantId.eq(id));
         }
-        Ok(query
-            .all(&*self.db)
+
+        let paginator = query.paginate(&*self.db, per_page);
+        let total = paginator.num_items().await.context("count channels")?;
+
+        let items: Vec<ChannelResponse> = paginator
+            .fetch_page(page - 1)
             .await
-            .context("list channels")?
+            .context("fetch channels page")?
             .into_iter()
             .map(Into::into)
-            .collect())
+            .collect();
+
+        Ok((items, total))
     }
     pub async fn create_channel(
         &self,
@@ -199,11 +220,13 @@ impl GatewayService {
             created_at: Set(now),
             updated_at: Set(now),
         };
-        Ok(model
+        let channel: ChannelResponse = model
             .insert(self.db.write_conn())
             .await
             .context("create channel")?
-            .into())
+            .into();
+        tracing::info!(channel_id = %channel.id, tenant_id = %channel.tenant_id, name = %channel.name, "Channel created");
+        Ok(channel)
     }
     pub async fn update_channel(
         &self,
@@ -262,27 +285,59 @@ impl GatewayService {
         if let Some(v) = input.weight {
             active.weight = Set(v);
         }
+        if let Some(v) = input.tenant_id {
+            active.tenant_id = Set(v);
+        }
         active.updated_at = Set(Utc::now());
-        Ok(active
+        let result: ChannelResponse = active
             .update(self.db.write_conn())
             .await
             .context("update channel")?
-            .into())
+            .into();
+        tracing::info!(channel_id = %id, "Channel updated");
+        Ok(result)
     }
-    pub async fn disable_channel(&self, id: Uuid) -> Result<(), GatewayError> {
-        self.update_channel(
-            id,
-            UpdateChannelInput {
-                name: None,
-                models: None,
-                capabilities: None,
-                api_key: None,
-                base_url: None,
-                is_active: Some(false),
-                weight: None,
-            },
-        )
-        .await?;
+    /// 物理删除渠道（硬删除）。
+    ///
+    /// 检查该渠道是否存在关联的 token_usage 记录，若有则拒绝删除
+    /// 返回 [`GatewayError::HasUsage`]。清理完历史用量数据后方可删除。
+    pub async fn delete_channel(&self, id: Uuid) -> Result<(), GatewayError> {
+        // 一致性说明：存在性检查与 token_usage 计数都走 write_conn（主库），
+        // 而非默认的读副本路由。token_usage.channel_id 没有外键约束，删除渠道
+        // 前的“是否存在用量”校验必须读取到最新写入，否则读副本的复制延迟会让
+        // 刚产生的用量记录不可见，从而误删仍被引用的渠道、留下孤儿审计数据。
+        let conn = self.db.write_conn();
+
+        // 1. 确认渠道存在
+        let _found = Entity::find_by_id(id)
+            .one(conn)
+            .await
+            .context("load channel")?
+            .ok_or(GatewayError::NotFound)?;
+
+        // 2. 检查 token_usage 关联记录
+        use crate::repositories::token_usage;
+        let usage_count = token_usage::Entity::find()
+            .filter(token_usage::Column::ChannelId.eq(id))
+            .count(conn)
+            .await
+            .context("count token usage")?;
+
+        if usage_count > 0 {
+            return Err(GatewayError::HasUsage {
+                id: id.to_string(),
+                usage_count,
+            });
+        }
+
+        // 3. 安全删除
+        Entity::delete_by_id(id)
+            .exec(conn)
+            .await
+            .context("delete channel")?;
+
+        tracing::info!(channel_id = %id, "Channel deleted");
+
         Ok(())
     }
     pub async fn proxy(

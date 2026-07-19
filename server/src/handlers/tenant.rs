@@ -8,12 +8,31 @@ use crate::{
 };
 use ains_runtime::{HttpError, RequestContext, Response};
 use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 fn error(e: TenantError) -> HttpError {
     match e {
         TenantError::NotFound => HttpError::not_found("Tenant not found"),
-        TenantError::NotEmpty => HttpError::conflict("Tenant still contains users or channels"),
+        TenantError::NotEmpty {
+            id,
+            users,
+            channels,
+        } => {
+            let msg = if users > 0 && channels > 0 {
+                format!(
+                    "Tenant '{}' has {users} user(s) and {channels} channel(s). Remove them first.",
+                    id
+                )
+            } else if users > 0 {
+                format!("Tenant '{}' has {users} user(s). Remove them first.", id)
+            } else {
+                format!(
+                    "Tenant '{}' has {channels} channel(s). Remove them first.",
+                    id
+                )
+            };
+            HttpError::conflict(msg)
+        }
         TenantError::InvalidStatus => HttpError::bad_request("status must be active or disabled"),
         TenantError::CannotDisableDefault => {
             HttpError::bad_request("Cannot disable the default tenant")
@@ -37,29 +56,65 @@ pub struct UpdateTenantRequest {
     pub name: Option<String>,
     pub status: Option<String>,
 }
-#[derive(serde::Serialize)]
-struct TenantList {
+#[derive(Deserialize)]
+struct ListTenantsQuery {
+    #[serde(default = "default_page")]
+    page: u64,
+    #[serde(default = "default_per_page")]
+    per_page: u64,
+}
+
+fn default_page() -> u64 {
+    1
+}
+fn default_per_page() -> u64 {
+    10
+}
+
+#[derive(Serialize)]
+struct PaginatedTenantResponse {
     items: Vec<TenantResponse>,
+    total: u64,
+    page: u64,
+    per_page: u64,
+    total_pages: u64,
 }
 
 pub async fn list_tenants(req: crate::ServerRequest) -> Result<Response, HttpError> {
     let (state, auth_user) = extract_handler_context(&req)?;
-    let items = if auth_user.role == "system" {
-        TenantService::new(state.db).list().await.map_err(error)?
+    let query: ListTenantsQuery = req.parse_query().map_err(HttpError::bad_request)?;
+
+    // Clamp 与 Service 层保持一致，避免响应回传未经校正的原始参数。
+    let page = query.page.clamp(1, 1_000_000);
+    let per_page = query.per_page.clamp(1, 100);
+
+    let (items, total) = if auth_user.role == "system" {
+        TenantService::new(state.db)
+            .list_paginated(page, per_page)
+            .await
+            .map_err(error)?
     } else if auth_user.role == "admin" {
         // Admin can only see their own tenant
-        vec![
-            TenantService::new(state.db.clone())
-                .get(&auth_user.tenant_id)
-                .await
-                .map_err(error)?,
-        ]
+        let tenant = TenantService::new(state.db.clone())
+            .get(&auth_user.tenant_id)
+            .await
+            .map_err(error)?;
+        (vec![tenant], 1u64)
     } else {
         return Err(HttpError::forbidden(
             "Only system and admin can list tenants",
         ));
     };
-    Response::json(&TenantList { items })
+
+    let total_pages = total.div_ceil(per_page);
+
+    Response::json(&PaginatedTenantResponse {
+        items,
+        total,
+        page,
+        per_page,
+        total_pages,
+    })
 }
 pub async fn create_tenant(mut req: crate::ServerRequest) -> Result<Response, HttpError> {
     let (state, auth_user) = extract_handler_context(&req)?;
@@ -112,7 +167,7 @@ pub async fn delete_tenant(req: crate::ServerRequest) -> Result<Response, HttpEr
         .delete(&id)
         .await
         .map_err(error)?;
-    Ok(Response::with_status(http::StatusCode::NO_CONTENT))
+    Response::json(&serde_json::json!({"message": "Tenant deleted successfully"}))
 }
 #[derive(Deserialize)]
 pub struct MoveUserRequest {
@@ -210,6 +265,8 @@ pub async fn move_user_tenant(mut req: crate::ServerRequest) -> Result<Response,
             .invalidate(&format!("user:count:user:{}", tenant))
             .await;
     }
+
+    tracing::info!(user_id = %user_id, from_tenant = %old_tenant_id, to_tenant = %new_tenant_id, "User moved to another tenant");
 
     Response::json(&crate::repositories::user::UserResponse::from(updated))
 }

@@ -34,7 +34,7 @@ pub fn ForgotPassword() -> Element {
     let auth_for_auth_guard = auth.clone();
     use_effect(move || {
         if *auth_for_auth_guard.initialized.read() && auth_for_auth_guard.is_authenticated() {
-            nav.replace(Route::Dashboard {});
+            nav.replace(Route::PersonalCenter {});
         }
     });
 
@@ -45,17 +45,17 @@ pub fn ForgotPassword() -> Element {
     }
 
     rsx! {
-        div { class: "ws-forgot",
-            div { class: "ws-forgot__orb ws-forgot__orb--blue" }
-            div { class: "ws-forgot__orb ws-forgot__orb--indigo" }
+        div { class: "ains-forgot",
+            div { class: "ains-forgot__orb ains-forgot__orb--blue" }
+            div { class: "ains-forgot__orb ains-forgot__orb--indigo" }
 
-            div { class: "ws-forgot__card",
-                div { class: "ws-forgot__icon" }
-                h1 { class: "ws-forgot__title", {t.forgot_pw_title} }
-                p { class: "ws-forgot__subtitle", {t.forgot_pw_subtitle} }
+            div { class: "ains-forgot__card",
+                div { class: "ains-forgot__icon" }
+                h1 { class: "ains-forgot__title", {t.forgot_pw_title} }
+                p { class: "ains-forgot__subtitle", {t.forgot_pw_subtitle} }
 
                 form {
-                    class: "ws-forgot__form",
+                    class: "ains-forgot__form",
                     onsubmit: move |e| {
                         e.prevent_default();
                         if *submitting.read() {
@@ -111,20 +111,20 @@ pub fn ForgotPassword() -> Element {
                         autocomplete: Some("email".to_string()),
                     }
                     if let Some(err) = error_msg.read().as_ref() {
-                        p { class: "ws-form-error", "{err}" }
+                        p { class: "ains-form-error", "{err}" }
                     }
                     Button {
                         button_type: ButtonType::Submit,
                         full_width: true,
                         disabled: *submitting.read(),
                         loading: *submitting.read(),
-                        "{t.forgot_pw_submit} [POST /forgot-password]"
+                        "{t.forgot_pw_submit}"
                     }
                 }
 
-                div { class: "ws-forgot__back-row",
+                div { class: "ains-forgot__back-row",
                     a {
-                        class: "ws-forgot__back",
+                        class: "ains-forgot__back",
                         href: "#",
                         onclick: move |e| {
                             e.prevent_default();

@@ -2823,6 +2823,7 @@ async fn test_cache_invalidation_after_user_update() {
                 name: Some("Updated Name".to_string()),
                 email: None,
                 role: None,
+                tenant_id: None,
             },
             "system",
             "default",

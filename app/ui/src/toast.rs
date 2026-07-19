@@ -45,10 +45,10 @@ impl ToastMethod {
 
     pub fn class(&self) -> &'static str {
         match self {
-            Self::Get => "ws-toast__method--get",
-            Self::Post => "ws-toast__method--post",
-            Self::Put => "ws-toast__method--put",
-            Self::Delete => "ws-toast__method--delete",
+            Self::Get => "ains-toast__method--get",
+            Self::Post => "ains-toast__method--post",
+            Self::Put => "ains-toast__method--put",
+            Self::Delete => "ains-toast__method--delete",
         }
     }
 }
@@ -63,16 +63,16 @@ pub enum ToastKind {
 impl ToastKind {
     pub fn class(&self) -> &'static str {
         match self {
-            Self::Success => "ws-toast--success",
-            Self::Error => "ws-toast--error",
-            Self::Important => "ws-toast--important",
+            Self::Success => "ains-toast--success",
+            Self::Error => "ains-toast--error",
+            Self::Important => "ains-toast--important",
         }
     }
 
     pub fn status_class(&self) -> &'static str {
         match self {
-            Self::Success => "ws-toast__status--success",
-            Self::Error | Self::Important => "ws-toast__status--error",
+            Self::Success => "ains-toast__status--success",
+            Self::Error | Self::Important => "ains-toast__status--error",
         }
     }
 }
@@ -89,7 +89,7 @@ pub fn ToastStack(
 ) -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/toast.css") }
-        div { class: "ws-toast-container",
+        div { class: "ains-toast-container",
             for entry in entries.cloned() {
                 Toast {
                     key: "{entry.id}",
@@ -136,13 +136,13 @@ fn Toast(entry: ToastEntry, auto_dismiss_ms: u64, on_dismiss: EventHandler<u64>)
 
     let class = if exiting() {
         format!(
-            "ws-toast ws-toast--exiting {} {}",
+            "ains-toast ains-toast--exiting {} {}",
             entry.kind.class(),
             entry.method_variant.class()
         )
     } else {
         format!(
-            "ws-toast {} {}",
+            "ains-toast {} {}",
             entry.kind.class(),
             entry.method_variant.class()
         )
@@ -152,17 +152,17 @@ fn Toast(entry: ToastEntry, auto_dismiss_ms: u64, on_dismiss: EventHandler<u64>)
 
     rsx! {
         div { class: "{class}",
-            span { class: "ws-toast__method",
-                span { class: "ws-toast__method-text", "{entry.method_variant.as_str()}" }
+            span { class: "ains-toast__method",
+                span { class: "ains-toast__method-text", "{entry.method_variant.as_str()}" }
             }
-            div { class: "ws-toast__body",
-                div { class: "ws-toast__path", "{entry.path}" }
-                div { class: "ws-toast__status {entry.kind.status_class()}",
+            div { class: "ains-toast__body",
+                div { class: "ains-toast__path", "{entry.path}" }
+                div { class: "ains-toast__status {entry.kind.status_class()}",
                     "{status_text}"
                 }
             }
             button {
-                class: "ws-toast__close",
+                class: "ains-toast__close",
                 onclick: move |_| on_dismiss.call(id),
                 X {}
             }

@@ -17,6 +17,9 @@ pub struct JwtPayload {
     pub iat: u64,
     /// "user" | "admin"
     pub role: String,
+    /// Tenant ID for multi-tenant isolation
+    #[serde(default)]
+    pub tenant_id: String,
 }
 
 /// 解码 JWT payload。失败时返回 `None`。

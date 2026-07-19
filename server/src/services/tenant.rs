@@ -1,6 +1,10 @@
 use anyhow::Context;
 use chrono::Utc;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, DatabaseBackend, EntityTrait, FromQueryResult, PaginatorTrait,
+    QueryFilter, QueryOrder, Set, Statement,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -19,8 +23,12 @@ use crate::{
 pub enum TenantError {
     #[error("Tenant not found")]
     NotFound,
-    #[error("Tenant contains users or channels")]
-    NotEmpty,
+    #[error("Tenant {id} has {users} user(s) and {channels} channel(s)")]
+    NotEmpty {
+        id: String,
+        users: u64,
+        channels: u64,
+    },
     #[error("Invalid tenant status")]
     InvalidStatus,
     #[error("Cannot disable the default tenant")]
@@ -53,14 +61,119 @@ impl TenantService {
             cache: Some(cache),
         }
     }
-    pub async fn list(&self) -> Result<Vec<TenantResponse>, TenantError> {
-        Ok(Entity::find()
+
+    /// List tenants with pagination.
+    ///
+    /// Returns `(items, total_count)` — the handler layer wraps this into
+    /// a paginated JSON response.
+    pub async fn list_paginated(
+        &self,
+        page: u64,
+        per_page: u64,
+    ) -> Result<(Vec<TenantResponse>, u64), TenantError> {
+        let db = &*self.db;
+        let page = page.clamp(1, 1_000_000);
+        let per_page = per_page.clamp(1, 100);
+
+        let paginator = Entity::find()
+            .order_by_asc(crate::repositories::tenant::Column::CreatedAt)
+            .paginate(db, per_page);
+
+        let total = paginator.num_items().await.context("count tenants")?;
+
+        let tenant_models: Vec<crate::repositories::tenant::Model> = paginator
+            .fetch_page(page - 1)
+            .await
+            .context("fetch tenants page")?;
+
+        if tenant_models.is_empty() {
+            return Ok((vec![], total));
+        }
+
+        // Full GROUP BY for user counts (same as the legacy list() —
+        // the aggregation queries are cheap enough that a WHERE IN
+        // filter per page is unnecessary complexity).
+        #[derive(FromQueryResult)]
+        struct UserCountRow {
+            tenant_id: Option<String>,
+            cnt: Option<i64>,
+        }
+        let all_user_counts: HashMap<String, u64> =
+            UserCountRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT tenant_id, COUNT(*)::BIGINT as cnt FROM users GROUP BY tenant_id",
+                [],
+            ))
+            .all(db)
+            .await
+            .context("count users per tenant")?
+            .into_iter()
+            .filter_map(|r| r.tenant_id.zip(r.cnt.and_then(|c| u64::try_from(c).ok())))
+            .collect();
+
+        // Full GROUP BY for channel counts.
+        #[derive(FromQueryResult)]
+        struct ChannelCountRow {
+            tenant_id: Option<String>,
+            cnt: Option<i64>,
+        }
+        let all_channel_counts: HashMap<String, u64> =
+            ChannelCountRow::find_by_statement(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT tenant_id, COUNT(*)::BIGINT as cnt FROM ai_gateway_channels GROUP BY tenant_id",
+                [],
+            ))
+            .all(db)
+            .await
+            .context("count channels per tenant")?
+            .into_iter()
+            .filter_map(|r| {
+                r.tenant_id
+                    .zip(r.cnt.and_then(|c| u64::try_from(c).ok()))
+            })
+            .collect();
+
+        // Merge counts into tenant responses.
+        let items: Vec<TenantResponse> = tenant_models
+            .into_iter()
+            .map(|m| {
+                let mut resp = TenantResponse::from(m);
+                resp.user_count = all_user_counts.get(&resp.id).copied().unwrap_or(0);
+                resp.channel_count = all_channel_counts.get(&resp.id).copied().unwrap_or(0);
+                resp
+            })
+            .collect();
+
+        Ok((items, total))
+    }
+
+    /// Batch-resolve tenant IDs to display names.
+    ///
+    /// Used to enrich admin-facing list responses (users/channels) with a
+    /// `tenant_name` field so the UI need not pre-fetch the full tenant set.
+    /// Unknown IDs are simply absent from the returned map — callers fall
+    /// back to displaying the raw ID.
+    pub async fn names_for(&self, ids: &[String]) -> Result<HashMap<String, String>, TenantError> {
+        use crate::repositories::tenant::Column;
+        use std::collections::HashSet;
+
+        let unique: Vec<String> = ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<String>>()
+            .into_iter()
+            .collect();
+        if unique.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = Entity::find()
+            .filter(Column::Id.is_in(unique))
             .all(&*self.db)
             .await
-            .context("list tenants")?
-            .into_iter()
-            .map(Into::into)
-            .collect())
+            .context("batch fetch tenant names")?;
+
+        Ok(rows.into_iter().map(|m| (m.id, m.name)).collect())
     }
     pub async fn create(&self, name: String) -> Result<TenantResponse, TenantError> {
         let model = ActiveModel {
@@ -69,12 +182,15 @@ impl TenantService {
             status: Set("active".into()),
             created_at: Set(Utc::now()),
         };
-        Ok(model
+        let result: TenantResponse = model
             .insert(self.db.write_conn())
             .await
             .context("create tenant")?
-            .into())
+            .into();
+        tracing::info!(tenant_id = %result.id, name = %result.name, "Tenant created");
+        Ok(result)
     }
+
     pub async fn update(
         &self,
         id: &str,
@@ -111,6 +227,8 @@ impl TenantService {
             .context("update tenant")?
             .into();
 
+        tracing::info!(tenant_id = %id, "Tenant updated");
+
         // Invalidate is_active cache when status changes.
         if status_changed && let Some(ref cache) = self.cache {
             let cache_key = format!("tenant:active:{}", id);
@@ -143,12 +261,18 @@ impl TenantService {
             .await
             .context("count channels")?;
         if users != 0 || channels != 0 {
-            return Err(TenantError::NotEmpty);
+            return Err(TenantError::NotEmpty {
+                id: id.to_string(),
+                users,
+                channels,
+            });
         }
         Entity::delete_by_id(id)
             .exec(db)
             .await
             .context("delete tenant")?;
+
+        tracing::info!(tenant_id = %id, "Tenant deleted");
 
         // Invalidate is_active cache so stale "active=true" results don't
         // linger after the tenant has been deleted.
@@ -230,8 +354,22 @@ mod tests {
     fn tenant_error_formatting() {
         assert_eq!(TenantError::NotFound.to_string(), "Tenant not found");
         assert_eq!(
-            TenantError::NotEmpty.to_string(),
-            "Tenant contains users or channels"
+            TenantError::NotEmpty {
+                id: "t1".into(),
+                users: 3,
+                channels: 2,
+            }
+            .to_string(),
+            "Tenant t1 has 3 user(s) and 2 channel(s)"
+        );
+        assert_eq!(
+            TenantError::NotEmpty {
+                id: "t2".into(),
+                users: 0,
+                channels: 1,
+            }
+            .to_string(),
+            "Tenant t2 has 0 user(s) and 1 channel(s)"
         );
         assert_eq!(
             TenantError::InvalidStatus.to_string(),

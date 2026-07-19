@@ -69,34 +69,28 @@ pub fn Settings() -> Element {
     let nav_for_logout = nav;
     let bus_for_logout = log_bus;
 
-    let update_password_btn = format!(
-        "{} [POST /api/users/me/password]",
-        t.settings_update_password_btn
-    );
-    let logout_all_btn = format!(
-        "{} [POST /api/users/me/logout-all]",
-        t.settings_logout_all_btn
-    );
+    let update_password_btn = t.settings_update_password_btn.to_string();
+    let logout_all_btn = t.settings_logout_all_btn.to_string();
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/settings.css") }
-        div { class: "ws-settings",
-            header { class: "ws-settings__header",
-                div { class: "ws-settings__title-block",
-                    h1 { class: "ws-settings__title", "{t.settings_title}" }
-                    p { class: "ws-settings__subtitle", "{t.settings_subtitle}" }
+        div { class: "ains-settings",
+            header { class: "ains-settings__header",
+                div { class: "ains-settings__title-block",
+                    h1 { class: "ains-settings__title", "{t.settings_title}" }
+                    p { class: "ains-settings__subtitle", "{t.settings_subtitle}" }
                 }
             }
 
-            section { class: "ws-settings__section",
-                h2 { class: "ws-settings__section-title", "{t.settings_account_title}" }
-                div { class: "ws-settings__identity", {render_identity(auth.clone(), t)} }
+            section { class: "ains-settings__section",
+                h2 { class: "ains-settings__section-title", "{t.settings_account_title}" }
+                div { class: "ains-settings__identity", {render_identity(auth.clone(), t)} }
             }
 
-            section { class: "ws-settings__section",
-                h2 { class: "ws-settings__section-title", "{t.settings_change_password_title}" }
+            section { class: "ains-settings__section",
+                h2 { class: "ains-settings__section-title", "{t.settings_change_password_title}" }
                 form {
-                    class: "ws-settings__form",
+                    class: "ains-settings__form",
                     onsubmit: move |e| {
                         e.prevent_default();
                         if *submitting.read() {
@@ -210,10 +204,10 @@ pub fn Settings() -> Element {
                         autocomplete: Some("new-password".to_string()),
                     }
                     if let Some(err) = form_error.read().as_ref() {
-                        p { class: "ws-form-error", "{err}" }
+                        p { class: "ains-form-error", "{err}" }
                     }
                     if let Some(msg) = success_msg.read().as_ref() {
-                        p { class: "ws-form-success", "{msg}" }
+                        p { class: "ains-form-success", "{msg}" }
                     }
                     Button {
                         button_type: ButtonType::Submit,
@@ -225,9 +219,9 @@ pub fn Settings() -> Element {
                 }
             }
 
-            section { class: "ws-settings__section",
-                h2 { class: "ws-settings__section-title", "{t.settings_session_title}" }
-                p { class: "ws-settings__desc", "{t.settings_session_desc}" }
+            section { class: "ains-settings__section",
+                h2 { class: "ains-settings__section-title", "{t.settings_session_title}" }
+                p { class: "ains-settings__desc", "{t.settings_session_desc}" }
                 Button {
                     button_type: ButtonType::Danger,
                     full_width: true,
@@ -276,25 +270,25 @@ fn render_identity(auth: AuthState, t: &Translations) -> Element {
     let snapshot = auth.user.read().clone();
     match snapshot {
         Some(user) => rsx! {
-            div { class: "ws-settings__identity-row",
-                span { class: "ws-settings__identity-label", "{t.settings_account_label}" }
-                span { class: "ws-settings__identity-value", "{user.name}" }
+            div { class: "ains-settings__identity-row",
+                span { class: "ains-settings__identity-label", "{t.settings_account_label}" }
+                span { class: "ains-settings__identity-value", "{user.name}" }
             }
-            div { class: "ws-settings__identity-row",
-                span { class: "ws-settings__identity-label", "{t.settings_email_label}" }
-                span { class: "ws-settings__identity-value", "{user.email}" }
+            div { class: "ains-settings__identity-row",
+                span { class: "ains-settings__identity-label", "{t.settings_email_label}" }
+                span { class: "ains-settings__identity-value", "{user.email}" }
             }
-            div { class: "ws-settings__identity-row",
-                span { class: "ws-settings__identity-label", "{t.settings_role_label}" }
-                span { class: "ws-settings__identity-value", "{user.role}" }
+            div { class: "ains-settings__identity-row",
+                span { class: "ains-settings__identity-label", "{t.settings_role_label}" }
+                span { class: "ains-settings__identity-value", "{user.role}" }
             }
-            div { class: "ws-settings__identity-row",
-                span { class: "ws-settings__identity-label", "{t.settings_balance_label}" }
-                span { class: "ws-settings__identity-value", "{format_balance(user.balance)}" }
+            div { class: "ains-settings__identity-row",
+                span { class: "ains-settings__identity-label", "{t.settings_balance_label}" }
+                span { class: "ains-settings__identity-value", "{format_balance(user.balance)}" }
             }
         },
         None => rsx! {
-            span { class: "ws-settings__identity-value", "{t.settings_not_logged_in}" }
+            span { class: "ains-settings__identity-value", "{t.settings_not_logged_in}" }
         },
     }
 }

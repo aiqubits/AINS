@@ -51,6 +51,13 @@ pub fn handle_gateway_error(e: GatewayError) -> HttpError {
         }
         GatewayError::NotFound => HttpError::not_found("Channel not found"),
         GatewayError::InvalidInput(s) => HttpError::bad_request(s),
+        GatewayError::HasUsage { id, usage_count } => {
+            let msg = format!(
+                "Channel \"{id}\" has {usage_count} token usage record(s). \
+                 Disable the channel instead, or clean up usage data first.",
+            );
+            HttpError::conflict(msg)
+        }
         GatewayError::Upstream(e) => {
             tracing::warn!(upstream_error = %e, "AI provider request failed");
             HttpError::service_unavailable("AI provider request failed")
@@ -127,6 +134,18 @@ mod tests {
         let http = handle_gateway_error(err);
         assert_eq!(http.status, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(http.message.contains("gateway operation"));
+    }
+
+    #[test]
+    fn handle_gateway_error_has_usage() {
+        let err = GatewayError::HasUsage {
+            id: "abc-123".into(),
+            usage_count: 5,
+        };
+        let http = handle_gateway_error(err);
+        assert_eq!(http.status, StatusCode::CONFLICT);
+        assert!(http.message.contains("abc-123"));
+        assert!(http.message.contains("5"));
     }
 
     #[test]

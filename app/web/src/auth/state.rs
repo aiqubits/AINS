@@ -52,6 +52,7 @@ mod tests {
             name: String::new(),
             email: String::new(),
             balance: 0,
+            tenant_id: String::new(),
         }
     }
 
@@ -111,6 +112,7 @@ pub struct CurrentUser {
     pub name: String,
     pub email: String,
     pub balance: i64,
+    pub tenant_id: String,
 }
 
 impl CurrentUser {
@@ -124,6 +126,7 @@ impl CurrentUser {
             name: String::new(),
             email: String::new(),
             balance: 0,
+            tenant_id: payload.tenant_id.clone(),
         })
     }
 
@@ -131,6 +134,7 @@ impl CurrentUser {
         self.name = profile.name.clone();
         self.email = profile.email.clone();
         self.balance = profile.balance;
+        self.tenant_id = profile.tenant_id.clone();
         self
     }
 
@@ -246,6 +250,7 @@ impl AuthState {
                     name: profile.name.clone(),
                     email: profile.email.clone(),
                     balance: profile.balance,
+                    tenant_id: profile.tenant_id.clone(),
                 });
                 self.user.set(user);
             }
@@ -262,6 +267,7 @@ impl AuthState {
                                     name: profile.name.clone(),
                                     email: profile.email.clone(),
                                     balance: profile.balance,
+                                    tenant_id: profile.tenant_id.clone(),
                                 });
                                 self.user.set(user);
                             }
@@ -389,6 +395,7 @@ impl AuthState {
                     name: profile.name.clone(),
                     email: profile.email.clone(),
                     balance: profile.balance,
+                    tenant_id: profile.tenant_id.clone(),
                 });
                 self.user.set(user);
             }

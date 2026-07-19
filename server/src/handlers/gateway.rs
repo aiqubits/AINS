@@ -5,6 +5,7 @@ use crate::{
 };
 use ains_runtime::{HttpError, RequestContext, Response};
 use sea_orm::EntityTrait;
+use serde::Deserialize;
 use uuid::Uuid;
 
 fn error(e: GatewayError) -> HttpError {
@@ -37,23 +38,71 @@ async fn assert_channel_scope(
     }
     Ok(())
 }
-#[derive(serde::Serialize)]
-struct ChannelList {
-    items: Vec<ChannelResponse>,
+fn default_page() -> u64 {
+    1
 }
+fn default_per_page() -> u64 {
+    10
+}
+
+#[derive(Deserialize)]
+struct ListChannelsQuery {
+    #[serde(default = "default_page")]
+    page: u64,
+    #[serde(default = "default_per_page")]
+    per_page: u64,
+}
+
+#[derive(serde::Serialize)]
+struct PaginatedChannelResponse {
+    items: Vec<ChannelResponse>,
+    total: u64,
+    page: u64,
+    per_page: u64,
+    total_pages: u64,
+}
+
 pub async fn list_channels(req: crate::ServerRequest) -> Result<Response, HttpError> {
     let (state, actor) = helpers::extract_handler_context(&req)?;
+    let query: ListChannelsQuery = req.parse_query().map_err(HttpError::bad_request)?;
+
     let tenant = if actor.role == "system" {
         None
     } else {
         require_active_tenant(&state, &actor.tenant_id).await?;
-        Some(&actor.tenant_id)
+        Some(actor.tenant_id.clone())
     };
-    Response::json(&ChannelList {
-        items: service(&state)
-            .list_channels(tenant.map(|x| x.as_str()))
-            .await
-            .map_err(error)?,
+
+    // Clamp 与 Service 层保持一致，避免响应回传未经校正的原始参数：
+    // 否则 per_page=200 时实际只返回 100 条却声称 200（total_pages 偏小，
+    // 前端翻不到全部数据），per_page=0 时字段自相矛盾。
+    let page = query.page.clamp(1, 1_000_000);
+    let per_page = query.per_page.clamp(1, 100);
+    let (items, total) = service(&state)
+        .list_paginated(tenant.as_deref(), page, per_page)
+        .await
+        .map_err(error)?;
+
+    let mut items = items;
+    // Best-effort enrich each row with its tenant display name (see list_users).
+    let tenant_ids: Vec<String> = items.iter().map(|c| c.tenant_id.clone()).collect();
+    if let Ok(names) = crate::services::tenant::TenantService::new(state.db.clone())
+        .names_for(&tenant_ids)
+        .await
+    {
+        for item in items.iter_mut() {
+            item.tenant_name = names.get(&item.tenant_id).cloned();
+        }
+    }
+
+    let total_pages = total.div_ceil(per_page);
+
+    Response::json(&PaginatedChannelResponse {
+        items,
+        total,
+        page,
+        per_page,
+        total_pages,
     })
 }
 pub async fn create_channel(mut req: crate::ServerRequest) -> Result<Response, HttpError> {
@@ -87,6 +136,18 @@ pub async fn update_channel(mut req: crate::ServerRequest) -> Result<Response, H
     let id: Uuid = req.parse_param("id").map_err(HttpError::bad_request)?;
     assert_channel_scope(&state, &actor, id).await?;
     let input: UpdateChannelInput = req.parse_json().await.map_err(HttpError::bad_request)?;
+
+    // Only system can change a channel's tenant; admin is scoped to their own.
+    if input.tenant_id.is_some() && actor.role != "system" {
+        return Err(HttpError::forbidden(
+            "Only system can change channel tenant",
+        ));
+    }
+    // If tenant_id is being changed, verify the target tenant is active.
+    if let Some(ref new_tenant_id) = input.tenant_id {
+        helpers::require_active_tenant(&state, new_tenant_id).await?;
+    }
+
     Response::json(
         &service(&state)
             .update_channel(id, input)
@@ -94,10 +155,10 @@ pub async fn update_channel(mut req: crate::ServerRequest) -> Result<Response, H
             .map_err(error)?,
     )
 }
-pub async fn disable_channel(req: crate::ServerRequest) -> Result<Response, HttpError> {
+pub async fn delete_channel(req: crate::ServerRequest) -> Result<Response, HttpError> {
     let (state, actor) = helpers::extract_handler_context(&req)?;
     let id: Uuid = req.parse_param("id").map_err(HttpError::bad_request)?;
     assert_channel_scope(&state, &actor, id).await?;
-    service(&state).disable_channel(id).await.map_err(error)?;
-    Ok(Response::with_status(http::StatusCode::NO_CONTENT))
+    service(&state).delete_channel(id).await.map_err(error)?;
+    Response::json(&serde_json::json!({"message": "Channel deleted successfully"}))
 }

@@ -1,5 +1,5 @@
 /* Button — 唯一 CTA 变体 */
-.ws-btn {
+.ains-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -20,18 +20,18 @@
   user-select: none;
 }
 
-.ws-btn:hover:not(:disabled) {
+.ains-btn:hover:not(:disabled) {
   transform: translateY(-2px);
   box-shadow: var(--shadow-brand-hover);
   filter: brightness(1.05);
 }
 
-.ws-btn:active:not(:disabled) {
+.ains-btn:active:not(:disabled) {
   transform: translateY(0);
   filter: brightness(0.98);
 }
 
-.ws-btn:disabled {
+.ains-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
   filter: none;
@@ -39,18 +39,18 @@
   box-shadow: var(--shadow-sm);
 }
 
-.ws-btn--block {
+.ains-btn--block {
   width: 100%;
 }
 
-.ws-btn__spinner {
+.ains-btn__spinner {
   width: 14px;
   height: 14px;
-  animation: ws-spin 1s linear infinite;
+  animation: ains-spin 1s linear infinite;
 }
 
-/* Pill-sized variant: same gradient as ws-btn--primary, same size as ws-form-pill */
-.ws-btn--pill {
+/* Pill-sized variant: same gradient as ains-btn--primary, same size as ains-form-pill */
+.ains-btn--pill {
   flex: 1;
   min-width: 100px;
   padding: 8px 12px;
@@ -59,6 +59,6 @@
   font-weight: 600;
 }
 
-@keyframes ws-spin {
+@keyframes ains-spin {
   to { transform: rotate(360deg); }
 }

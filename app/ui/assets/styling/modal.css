@@ -1,16 +1,16 @@
 /* AINS UI — Modal */
 
-.ws-modal__backdrop {
+.ains-modal__backdrop {
   position: fixed;
   inset: 0;
   z-index: 60;
   background: rgba(15, 23, 42, 0.45);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
-  animation: ws-modal-fade-in 150ms ease-out;
+  animation: ains-modal-fade-in 150ms ease-out;
 }
 
-.ws-modal__wrap {
+.ains-modal__wrap {
   position: fixed;
   inset: 0;
   z-index: 70;
@@ -21,7 +21,7 @@
   pointer-events: none;
 }
 
-.ws-modal__card {
+.ains-modal__card {
   pointer-events: auto;
   width: 100%;
   max-width: 28rem;
@@ -34,12 +34,12 @@
     0 20px 25px -5px rgba(15, 23, 42, 0.12),
     0 8px 10px -6px rgba(15, 23, 42, 0.08);
   padding: 24px;
-  animation: ws-modal-pop-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
+  animation: ains-modal-pop-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
   max-height: calc(100vh - 32px);
   overflow: auto;
 }
 
-.ws-modal__header {
+.ains-modal__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -47,7 +47,7 @@
   margin-bottom: 16px;
 }
 
-.ws-modal__title {
+.ains-modal__title {
   margin: 0;
   font-size: 14px;
   font-weight: 700;
@@ -55,7 +55,7 @@
   letter-spacing: -0.01em;
 }
 
-.ws-modal__close {
+.ains-modal__close {
   width: 24px;
   height: 24px;
   display: inline-flex;
@@ -67,28 +67,28 @@
   transition: background 150ms ease, color 150ms ease;
 }
 
-.ws-modal__close svg {
+.ains-modal__close svg {
   width: 14px;
   height: 14px;
 }
 
-.ws-modal__close:hover {
+.ains-modal__close:hover {
   background: #f1f5f9;
   color: var(--color-text-secondary);
 }
 
-.ws-modal__body {
+.ains-modal__body {
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
-@keyframes ws-modal-fade-in {
+@keyframes ains-modal-fade-in {
   from { opacity: 0; }
   to { opacity: 1; }
 }
 
-@keyframes ws-modal-pop-in {
+@keyframes ains-modal-pop-in {
   from { opacity: 0; transform: translateY(8px) scale(0.96); }
   to { opacity: 1; transform: translateY(0) scale(1); }
 }

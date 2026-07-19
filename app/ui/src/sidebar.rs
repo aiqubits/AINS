@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{ChartPie, ExternalLink, Layers, UserCog, X};
+use dioxus_icons::lucide::{
+    Activity, ChartPie, ExternalLink, Layers, Route, Server, UserCog, Wallet, X,
+};
 
 use crate::I18nContext;
 use crate::badge::{Badge, BadgeVariant};
@@ -26,82 +28,121 @@ pub fn Sidebar(
         // 移动端 overlay
         if open() {
             div {
-                class: "ws-sidebar-overlay",
+                class: "ains-sidebar-overlay",
                 onclick: move |e| on_close.call(e),
             }
         }
-        aside { class: if open() { "ws-sidebar ws-sidebar--open" } else { "ws-sidebar" },
+        aside { class: if open() { "ains-sidebar ains-sidebar--open" } else { "ains-sidebar" },
             // Logo 块
-            div { class: "ws-sidebar__logo",
-                div { class: "ws-sidebar__logo-icon", Layers {} }
-                div { class: "ws-sidebar__logo-text",
-                    span { class: "ws-sidebar__logo-title", {t.sidebar_brand_title} }
-                    span { class: "ws-sidebar__logo-subtitle", {t.sidebar_brand_subtitle} }
+            div { class: "ains-sidebar__logo",
+                div { class: "ains-sidebar__logo-icon", Layers {} }
+                div { class: "ains-sidebar__logo-text",
+                    span { class: "ains-sidebar__logo-title", {t.sidebar_brand_title} }
+                    span { class: "ains-sidebar__logo-subtitle", {t.sidebar_brand_subtitle} }
                 }
                 // 移动端关闭按钮
                 button {
-                    class: "ws-sidebar__close",
+                    class: "ains-sidebar__close",
                     onclick: move |e| on_close.call(e),
                     X {}
                 }
             }
 
             // 导航
-            nav { class: "ws-sidebar__nav no-scrollbar",
-                // 系统监控
-                div { class: "ws-sidebar__group",
-                    div { class: "ws-sidebar__group-caption", {t.sidebar_group_monitoring} }
+            nav { class: "ains-sidebar__nav no-scrollbar",
+                // 个人中心（所有角色可见）—— 置于数据管理之上
+                div { class: "ains-sidebar__group",
+                    div { class: "ains-sidebar__group-caption", {t.sidebar_group_account} }
                     SidebarItem {
                         icon: rsx! {
-                            ChartPie {}
+                            Wallet {}
                         },
-                        label: format!("{} (/health)", t.sidebar_dashboard_label),
-                        active: active == NavKey::Dashboard,
-                        onclick: move |_| on_select.call(NavKey::Dashboard),
+                        label: t.sidebar_personal_center_label.to_string(),
+                        active: active == NavKey::PersonalCenter,
+                        onclick: move |_| on_select.call(NavKey::PersonalCenter),
                     }
                 }
 
                 // 数据管理 + admin_layer 徽章（仅 admin/system 角色可见）
                 if show_admin_modules {
-                    div { class: "ws-sidebar__group",
-                        div { class: "ws-sidebar__group-caption-row",
-                            span { class: "ws-sidebar__group-caption", {t.sidebar_data_management} }
+                    div { class: "ains-sidebar__group",
+                        div { class: "ains-sidebar__group-caption-row",
+                            span { class: "ains-sidebar__group-caption", {t.sidebar_data_management} }
                             Badge { variant: BadgeVariant::AmberCompact, "admin_layer" }
                         }
                         SidebarItem {
                             icon: rsx! {
                                 UserCog {}
                             },
-                            label: format!("{} (/users)", t.sidebar_user_management_label),
+                            label: t.sidebar_user_management_label.to_string(),
                             active: active == NavKey::Users,
                             onclick: move |_| on_select.call(NavKey::Users),
+                        }
+                        SidebarItem {
+                            icon: rsx! {
+                                Server {}
+                            },
+                            label: t.sidebar_tenant_management_label.to_string(),
+                            active: active == NavKey::Tenants,
+                            onclick: move |_| on_select.call(NavKey::Tenants),
+                        }
+                        SidebarItem {
+                            icon: rsx! {
+                                Route {}
+                            },
+                            label: t.sidebar_channel_management_label.to_string(),
+                            active: active == NavKey::Channels,
+                            onclick: move |_| on_select.call(NavKey::Channels),
+                        }
+                        SidebarItem {
+                            icon: rsx! {
+                                Activity {}
+                            },
+                            label: t.sidebar_metering_label.to_string(),
+                            active: active == NavKey::Metering,
+                            onclick: move |_| on_select.call(NavKey::Metering),
+                        }
+                    }
+                }
+
+                // 系统监控 —— 控制中心，移动到数据管理下面（仅 admin/system 角色可见）
+                if show_admin_modules {
+                    div { class: "ains-sidebar__group",
+                        div { class: "ains-sidebar__group-caption", {t.sidebar_group_monitoring} }
+                        SidebarItem {
+                            icon: rsx! {
+                                ChartPie {}
+                            },
+                            label: t.sidebar_dashboard_label.to_string(),
+                            active: active == NavKey::Dashboard,
+                            onclick: move |_| on_select.call(NavKey::Dashboard),
                         }
                     }
                 }
             }
 
             // Footer
-            div { class: "ws-sidebar__footer",
+            div { class: "ains-sidebar__footer",
                 a {
-                    class: "ws-sidebar__github-card",
+                    class: "ains-sidebar__github-card",
                     href: "https://github.com/aiqubits/ains",
                     target: "_blank",
                     svg {
                         xmlns: "http://www.w3.org/2000/svg",
                         view_box: "0 0 24 24",
                         fill: "currentColor",
-                        class: "ws-sidebar__github-icon",
+                        class: "ains-sidebar__github-icon",
                         path { d: "M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" }
                     }
-                    div { class: "ws-sidebar__github-text",
-                        span { class: "ws-sidebar__github-repo", "aiqubits/ains" }
-                        span { class: "ws-sidebar__github-sub", {t.sidebar_github_sub} }
+                    div { class: "ains-sidebar__github-text",
+                        span { class: "ains-sidebar__github-repo", "aiqubits/ains" }
+                        span { class: "ains-sidebar__github-sub", {t.sidebar_github_sub} }
                     }
-                    ExternalLink { class: "ws-sidebar__github-arrow" }
+                    ExternalLink { class: "ains-sidebar__github-arrow" }
                 }
-                div { class: "ws-sidebar__copyright",
+                div { class: "ains-sidebar__copyright",
                     div { "© 2026 AINS Fullstack Framework." }
-                    div { "Powered by AINS" }
+                    div { "Powered by " }
                 }
             }
         }
@@ -110,8 +151,12 @@ pub fn Sidebar(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavKey {
+    PersonalCenter,
     Dashboard,
     Users,
+    Tenants,
+    Channels,
+    Metering,
 }
 
 #[component]
@@ -122,14 +167,14 @@ fn SidebarItem(
     onclick: EventHandler<MouseEvent>,
 ) -> Element {
     let class = if active {
-        "ws-sidebar__item ws-sidebar__item--active"
+        "ains-sidebar__item ains-sidebar__item--active"
     } else {
-        "ws-sidebar__item"
+        "ains-sidebar__item"
     };
     rsx! {
         button { class, onclick,
             {icon}
-            span { class: "ws-sidebar__item-label", "{label}" }
+            span { class: "ains-sidebar__item-label", "{label}" }
         }
     }
 }

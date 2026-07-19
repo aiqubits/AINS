@@ -11,11 +11,11 @@ pub fn NotFound(route: Vec<String>) -> Element {
     let t = i18n.t();
     let _ = route; // catch-all 段保留以满足 Routable trait
     rsx! {
-        div { class: "ws-view-placeholder",
+        div { class: "ains-view-placeholder",
             Compass {}
             h1 { "404" }
             p { {t.not_found_page} }
-            Link { to: Route::Dashboard {}, {t.not_found_back_to_dashboard} }
+            Link { to: Route::PersonalCenter {}, {t.not_found_back_to_dashboard} }
         }
     }
 }

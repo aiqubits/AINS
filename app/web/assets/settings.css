@@ -1,5 +1,5 @@
 /* Settings —— 个人设置页面 */
-.ws-settings {
+.ains-settings {
   max-width: 720px;
   margin: 0 auto;
   padding: 32px 24px;
@@ -8,13 +8,13 @@
   gap: 32px;
 }
 
-.ws-settings__header {
+.ains-settings__header {
   display: flex;
   flex-direction: column;
   gap: 8px;
 }
 
-.ws-settings__title {
+.ains-settings__title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 28px;
@@ -23,7 +23,7 @@
   color: var(--color-text-primary);
 }
 
-.ws-settings__subtitle {
+.ains-settings__subtitle {
   margin: 0;
   font-family: var(--font-family);
   font-size: 14px;
@@ -32,7 +32,7 @@
   color: var(--color-text-muted);
 }
 
-.ws-settings__section {
+.ains-settings__section {
   background: var(--glass-panel-bg);
   backdrop-filter: var(--glass-panel-blur);
   -webkit-backdrop-filter: var(--glass-panel-blur);
@@ -45,7 +45,7 @@
   box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.04);
 }
 
-.ws-settings__section-title {
+.ains-settings__section-title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 16px;
@@ -54,13 +54,13 @@
   color: var(--color-text-primary);
 }
 
-.ws-settings__identity {
+.ains-settings__identity {
   display: flex;
   flex-direction: column;
   gap: 12px;
 }
 
-.ws-settings__identity-row {
+.ains-settings__identity-row {
   display: flex;
   align-items: center;
   gap: 16px;
@@ -68,11 +68,11 @@
   border-bottom: 1px solid rgba(226, 232, 240, 0.3);
 }
 
-.ws-settings__identity-row:last-child {
+.ains-settings__identity-row:last-child {
   border-bottom: none;
 }
 
-.ws-settings__identity-label {
+.ains-settings__identity-label {
   font-family: var(--font-family);
   font-size: 12px;
   font-weight: 600;
@@ -83,7 +83,7 @@
   min-width: 80px;
 }
 
-.ws-settings__identity-value {
+.ains-settings__identity-value {
   font-family: var(--font-family);
   font-size: 14px;
   font-weight: 500;
@@ -92,13 +92,13 @@
   word-break: break-all;
 }
 
-.ws-settings__form {
+.ains-settings__form {
   display: flex;
   flex-direction: column;
   gap: 16px;
 }
 
-.ws-form-success {
+.ains-form-success {
   margin: 0;
   padding: 10px 14px;
   border-radius: 10px;

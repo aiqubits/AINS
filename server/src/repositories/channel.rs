@@ -66,6 +66,10 @@ impl ModelCapability {
 pub struct ChannelResponse {
     pub id: Uuid,
     pub tenant_id: String,
+    /// Tenant display name, resolved best-effort at the handler layer for
+    /// admin-facing list endpoints. `None` when not enriched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_name: Option<String>,
     pub name: String,
     pub protocol_type: String,
     pub models: Json,
@@ -81,6 +85,7 @@ impl From<Model> for ChannelResponse {
         Self {
             id: v.id,
             tenant_id: v.tenant_id,
+            tenant_name: None,
             name: v.name,
             protocol_type: v.protocol_type,
             models: v.models,

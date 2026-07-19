@@ -1,6 +1,6 @@
 /* DataTable —— 玻璃面板容器 + 表头 + 行 hover */
 
-.ws-table {
+.ains-table {
   background: var(--glass-panel-bg);
   backdrop-filter: var(--glass-panel-blur);
   -webkit-backdrop-filter: var(--glass-panel-blur);
@@ -9,19 +9,19 @@
   box-shadow: var(--shadow-sm);
 }
 
-.ws-table__table {
+.ains-table__table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   font-family: var(--font-family);
 }
 
-.ws-table__head {
+.ains-table__head {
   background: rgba(248, 250, 252, 0.7);
   border-bottom: 1px solid var(--color-border-subtle);
 }
 
-.ws-table__th {
+.ains-table__th {
   padding: 16px 24px;
   font-size: 11px;
   font-weight: 700;
@@ -32,41 +32,41 @@
   white-space: nowrap;
 }
 
-.ws-table__align--left { text-align: left; }
-.ws-table__align--center { text-align: center; }
-.ws-table__align--right { text-align: right; }
+.ains-table__align--left { text-align: left; }
+.ains-table__align--center { text-align: center; }
+.ains-table__align--right { text-align: right; }
 
 /* Tailwind 风格的固定宽度工具类，供 Column::width 使用 */
-.ws-table__table .w-24 { width: 6rem; }
-.ws-table__table .w-40 { width: 10rem; }
-.ws-table__table .w-44 { width: 11rem; }
+.ains-table__table .w-24 { width: 6rem; }
+.ains-table__table .w-40 { width: 10rem; }
+.ains-table__table .w-44 { width: 11rem; }
 
-.ws-table__body {
+.ains-table__body {
   font-size: 12px;
   font-weight: 500;
   line-height: 16px;
   color: var(--color-text-secondary);
 }
 
-.ws-table__body tr {
+.ains-table__body tr {
   border-bottom: 1px solid rgba(241, 245, 249, 0.6);
   transition: background 120ms ease;
 }
 
-.ws-table__body tr:last-child {
+.ains-table__body tr:last-child {
   border-bottom: none;
 }
 
-.ws-table__body tr:hover {
+.ains-table__body tr:hover {
   background: rgba(248, 250, 252, 0.4);
 }
 
-.ws-table__body td {
+.ains-table__body td {
   padding: 14px 24px;
   vertical-align: middle;
 }
 
-.ws-table__empty {
+.ains-table__empty {
   padding: 32px 24px;
   text-align: center;
   color: var(--color-text-muted);
@@ -74,7 +74,7 @@
 }
 
 /* 行内工具元素 */
-.ws-table__action {
+.ains-table__action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -90,24 +90,24 @@
   margin: 0 2px;
 }
 
-.ws-table__action:hover {
+.ains-table__action:hover {
   background: var(--color-surface-hover, rgba(99, 102, 241, 0.08));
   color: var(--color-text-primary);
 }
 
-.ws-table__action--danger:hover {
+.ains-table__action--danger:hover {
   background: rgba(244, 63, 94, 0.1);
   color: #e11d48;
 }
 
-.ws-table__row-actions {
+.ains-table__row-actions {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: 4px;
 }
 
-.ws-table__pill {
+.ains-table__pill {
   display: inline-flex;
   align-items: center;
   font-family: var(--font-family);
@@ -118,7 +118,7 @@
   font-variant-numeric: tabular-nums;
 }
 
-.ws-table__mono {
+.ains-table__mono {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--color-text-muted);
@@ -126,7 +126,7 @@
 }
 
 /* system 角色保护标识 */
-.ws-table__protected {
+.ains-table__protected {
   display: inline-flex;
   align-items: center;
   gap: 4px;

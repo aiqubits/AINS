@@ -1,6 +1,6 @@
 /* AINS UI — AuthForm */
 
-.ws-auth {
+.ains-auth {
   position: relative;
   width: 100%;
   max-width: 28rem;
@@ -17,7 +17,7 @@
   overflow: hidden;
 }
 
-.ws-auth__orb {
+.ains-auth__orb {
   position: absolute;
   width: 144px;
   height: 144px;
@@ -27,19 +27,19 @@
   z-index: 0;
 }
 
-.ws-auth__orb--purple {
+.ains-auth__orb--purple {
   top: -64px;
   right: -64px;
   background: rgba(192, 132, 252, 0.35);
 }
 
-.ws-auth__orb--indigo {
+.ains-auth__orb--indigo {
   bottom: -64px;
   left: -64px;
   background: rgba(165, 180, 252, 0.35);
 }
 
-.ws-auth__tabs {
+.ains-auth__tabs {
   position: relative;
   z-index: 1;
   display: flex;
@@ -49,7 +49,7 @@
   margin-bottom: 32px;
 }
 
-.ws-auth__tab {
+.ains-auth__tab {
   flex: 1;
   padding: 8px 0;
   font-size: 12px;
@@ -61,17 +61,17 @@
   cursor: pointer;
 }
 
-.ws-auth__tab:hover {
+.ains-auth__tab:hover {
   color: var(--color-text-secondary);
 }
 
-.ws-auth__tab--active {
+.ains-auth__tab--active {
   background: #ffffff;
   color: var(--color-brand-indigo-deep, #4f46e5);
   box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.05);
 }
 
-.ws-auth__form {
+.ains-auth__form {
   position: relative;
   z-index: 1;
   display: flex;
@@ -79,7 +79,7 @@
   gap: 16px;
 }
 
-.ws-auth__meta {
+.ains-auth__meta {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -87,7 +87,7 @@
   font-size: 11px;
 }
 
-.ws-auth__remember {
+.ains-auth__remember {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -95,7 +95,7 @@
   cursor: pointer;
 }
 
-.ws-auth__remember input[type="checkbox"] {
+.ains-auth__remember input[type="checkbox"] {
   width: 14px;
   height: 14px;
   border-radius: 4px;
@@ -104,18 +104,18 @@
   cursor: pointer;
 }
 
-.ws-auth__forgot {
+.ains-auth__forgot {
   color: #6366f1;
   font-weight: 500;
   text-decoration: none;
   transition: text-decoration 150ms ease;
 }
 
-.ws-auth__forgot:hover {
+.ains-auth__forgot:hover {
   text-decoration: underline;
 }
 
-.ws-auth__error {
+.ains-auth__error {
   margin: 0;
   padding: 10px 12px;
   background: rgba(254, 226, 226, 0.6);
@@ -129,36 +129,36 @@
 
 /* 移动端：减小表单卡片内边距 */
 @media (max-width: 640px) {
-  .ws-auth {
+  .ains-auth {
     padding: 24px 20px;
     max-width: 100%;
   }
 
-  .ws-auth__tabs {
+  .ains-auth__tabs {
     margin-bottom: 24px;
   }
 
-  .ws-auth__form {
+  .ains-auth__form {
     gap: 14px;
   }
 
-  .ws-auth__meta {
+  .ains-auth__meta {
     flex-wrap: wrap;
     gap: 8px;
   }
 
-  .ws-auth__remember input[type="checkbox"] {
+  .ains-auth__remember input[type="checkbox"] {
     width: 18px;
     height: 18px;
   }
 }
 
 @media (max-width: 400px) {
-  .ws-auth {
+  .ains-auth {
     padding: 20px 16px;
   }
 
-  .ws-auth__meta {
+  .ains-auth__meta {
     flex-direction: column;
     align-items: flex-start;
     gap: 6px;

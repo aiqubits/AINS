@@ -26,18 +26,18 @@ pub fn TopHeader(
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/top_header.css") }
-        header { class: "ws-top-header",
+        header { class: "ains-top-header",
             // 左侧：汉堡菜单 + 搜索框
-            div { class: "ws-top-header__left",
+            div { class: "ains-top-header__left",
                 button {
-                    class: "ws-top-header__hamburger",
+                    class: "ains-top-header__hamburger",
                     onclick: move |e| on_sidebar_toggle.call(e),
                     Menu {}
                 }
-                div { class: "ws-top-header__search",
-                    Search { class: "ws-top-header__search-icon" }
+                div { class: "ains-top-header__search",
+                    Search { class: "ains-top-header__search-icon" }
                     input {
-                        class: "ws-top-header__search-input",
+                        class: "ains-top-header__search-input",
                         r#type: "text",
                         placeholder: t.top_header_search_placeholder,
                         value: search_value,
@@ -47,41 +47,41 @@ pub fn TopHeader(
             }
 
             // 右侧：语言切换 + 状态 + 用户下拉菜单
-            div { class: "ws-top-header__right",
+            div { class: "ains-top-header__right",
                 // 语言切换单按钮
                 LanguageSwitcher { variant: LanguageSwitcherVariant::Header }
 
-                span { class: "ws-top-header__status",
-                    span { class: "ws-top-header__status-dot" }
-                    span { class: "ws-top-header__status-text", {t.top_header_node_online} }
+                span { class: "ains-top-header__status",
+                    span { class: "ains-top-header__status-dot" }
+                    span { class: "ains-top-header__status-text", {t.top_header_node_online} }
                 }
 
                 // 用户下拉菜单容器
-                div { class: "ws-top-header__user-menu",
+                div { class: "ains-top-header__user-menu",
                     // 触发区：头像 + 身份
                     div {
-                        class: "ws-top-header__user ws-top-header__user--clickable",
+                        class: "ains-top-header__user ains-top-header__user--clickable",
                         title: t.top_header_click_to_expand,
                         onclick: move |_| dropdown_open.toggle(),
-                        div { class: "ws-top-header__avatar", "WS" }
-                        div { class: "ws-top-header__identity",
-                            span { class: "ws-top-header__name", "{user_name}" }
-                            span { class: "ws-top-header__email", "{user_email}" }
+                        div { class: "ains-top-header__avatar", "WS" }
+                        div { class: "ains-top-header__identity",
+                            span { class: "ains-top-header__name", "{user_name}" }
+                            span { class: "ains-top-header__email", "{user_email}" }
                         }
-                        ChevronDown { class: "ws-top-header__user-chevron" }
+                        ChevronDown { class: "ains-top-header__user-chevron" }
                     }
 
                     // 下拉菜单
                     if dropdown_open() {
                         // 全屏透明遮罩 —— 点击非菜单区域关闭下拉菜单
                         div {
-                            class: "ws-top-header__dropdown-overlay",
+                            class: "ains-top-header__dropdown-overlay",
                             onclick: move |_| dropdown_open.set(false),
                         }
-                        div { class: "ws-top-header__dropdown",
+                        div { class: "ains-top-header__dropdown",
                             // 菜单项：个人设置
                             button {
-                                class: "ws-top-header__dropdown-item",
+                                class: "ains-top-header__dropdown-item",
                                 r#type: "button",
                                 onclick: move |e| {
                                     dropdown_open.set(false);
@@ -89,14 +89,14 @@ pub fn TopHeader(
                                         h.call(e);
                                     }
                                 },
-                                Settings { class: "ws-top-header__dropdown-icon" }
+                                Settings { class: "ains-top-header__dropdown-icon" }
                                 span { {t.top_header_settings_label} }
                             }
                             // 分隔线
-                            div { class: "ws-top-header__dropdown-divider" }
+                            div { class: "ains-top-header__dropdown-divider" }
                             // 菜单项：登出
                             button {
-                                class: "ws-top-header__dropdown-item ws-top-header__dropdown-item--danger",
+                                class: "ains-top-header__dropdown-item ains-top-header__dropdown-item--danger",
                                 r#type: "button",
                                 onclick: move |e| {
                                     dropdown_open.set(false);
@@ -104,7 +104,7 @@ pub fn TopHeader(
                                         h.call(e);
                                     }
                                 },
-                                LogOut { class: "ws-top-header__dropdown-icon" }
+                                LogOut { class: "ains-top-header__dropdown-icon" }
                                 span { {t.top_header_logout_label} }
                             }
                         }

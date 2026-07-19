@@ -1,5 +1,5 @@
 /* StatsCard —— Dashboard 顶部统计卡片 */
-.ws-stats {
+.ains-stats {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -14,20 +14,20 @@
   transition: var(--ease-card);
 }
 
-.ws-stats:hover {
+.ains-stats:hover {
   transform: translateY(-4px);
   box-shadow: var(--shadow-card-hover);
   border-color: rgba(99, 102, 241, 0.2);
 }
 
-.ws-stats__body {
+.ains-stats__body {
   display: flex;
   flex-direction: column;
   gap: 6px;
   min-width: 0;
 }
 
-.ws-stats__label {
+.ains-stats__label {
   font-family: var(--font-family);
   font-size: 12px;
   font-weight: 500;
@@ -35,7 +35,7 @@
   letter-spacing: 0.01em;
 }
 
-.ws-stats__value {
+.ains-stats__value {
   font-family: var(--font-family);
   font-size: 20px;
   font-weight: 700;
@@ -43,22 +43,22 @@
   color: var(--color-text-primary);
 }
 
-.ws-stats__value--emerald {
+.ains-stats__value--emerald {
   color: var(--color-success-text);
 }
 
-.ws-stats__value--amber {
+.ains-stats__value--amber {
   color: var(--color-warning-text);
 }
 
-.ws-stats__sub {
+.ains-stats__sub {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 500;
   color: var(--color-text-muted);
 }
 
-.ws-stats__icon {
+.ains-stats__icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -68,27 +68,27 @@
   flex-shrink: 0;
 }
 
-.ws-stats__icon svg {
+.ains-stats__icon svg {
   width: 22px;
   height: 22px;
 }
 
-.ws-stats__icon--emerald {
+.ains-stats__icon--emerald {
   background: rgba(16, 185, 129, 0.1);
   color: #10b981;
 }
 
-.ws-stats__icon--indigo {
+.ains-stats__icon--indigo {
   background: rgba(99, 102, 241, 0.1);
   color: var(--color-brand-indigo);
 }
 
-.ws-stats__icon--purple {
+.ains-stats__icon--purple {
   background: rgba(168, 85, 247, 0.1);
   color: var(--color-brand-purple);
 }
 
-.ws-stats__icon--amber {
+.ains-stats__icon--amber {
   background: rgba(245, 158, 11, 0.1);
   color: #f59e0b;
 }

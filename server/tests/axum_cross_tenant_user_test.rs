@@ -567,3 +567,103 @@ async fn test_admin_cannot_move_user_to_other_tenant() {
         "admin should not be able to move user to another tenant"
     );
 }
+
+#[tokio::test]
+async fn test_update_user_tenant_reassignment_invalidates_token() {
+    // Regression: moving a user across tenants via the `update_user` path
+    // (`PUT /api/users/{id}` with a `tenant_id` field) MUST increment
+    // token_version, otherwise the user keeps a valid JWT carrying the OLD
+    // tenant_id claim and can access old-tenant resources until expiry.
+    // (The dedicated `/api/users/{id}/tenant` endpoint was always correct;
+    //  this covers the previously-vulnerable update_user branch.)
+    let app = axum_helpers::create_app().await;
+    let config = common::load_test_config();
+    let sys_email = common::unique_email("upd_mv_sys");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    // Create two tenants
+    let (status, body) = post_json(
+        &app,
+        "/api/tenants",
+        Some(&sys_token),
+        &json!({"name": "Upd Src Tenant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tenant_a = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post_json(
+        &app,
+        "/api/tenants",
+        Some(&sys_token),
+        &json!({"name": "Upd Tgt Tenant"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tenant_b = body["id"].as_str().unwrap().to_string();
+
+    // Create a user in tenant_a
+    let user_email = common::unique_email("upd_mv_user");
+    let (status, body) = post_json(
+        &app,
+        "/api/users",
+        Some(&sys_token),
+        &json!({
+            "email": user_email, "password": "Password123!", "name": "Upd Moveable",
+            "tenant_id": tenant_a,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let user_id = body["id"].as_str().unwrap().to_string();
+    assert_eq!(body["tenant_id"], tenant_a);
+
+    // Login and capture token_version before the move.
+    let user_token = axum_helpers::login(&app, &user_email).await;
+    let (_uid, tid_before, tv_before) = decode_token_version(&user_token, &config.jwt_secret);
+    assert_eq!(tid_before, tenant_a, "JWT should carry the original tenant");
+
+    // System moves the user to tenant_b via the update_user endpoint.
+    let (status, body) = put_json(
+        &app,
+        &format!("/api/users/{}", user_id),
+        Some(&sys_token),
+        Some(&json!({"tenant_id": tenant_b})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "system should reassign tenant via update_user"
+    );
+    assert_eq!(
+        body["tenant_id"].as_str(),
+        Some(tenant_b.as_str()),
+        "user should now be in tenant_b"
+    );
+
+    // The OLD JWT (still carrying tenant_a) MUST now be rejected.
+    let (status, _body) = get_json(&app, "/api/users/me", Some(&user_token)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "old JWT must be rejected after update_user tenant reassignment"
+    );
+
+    // A fresh login yields an incremented token_version and a working token.
+    let new_token = axum_helpers::login(&app, &user_email).await;
+    let (_, tid_after, tv_after) = decode_token_version(&new_token, &config.jwt_secret);
+    assert!(
+        tv_after > tv_before,
+        "token_version should be incremented after update_user tenant move ({} > {})",
+        tv_after,
+        tv_before
+    );
+    assert_eq!(tid_after, tenant_b, "new JWT should carry the new tenant");
+    let (status, _body) = get_json(&app, "/api/users/me", Some(&new_token)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "new JWT should work after tenant move"
+    );
+}

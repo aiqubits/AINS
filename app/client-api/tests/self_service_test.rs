@@ -143,6 +143,7 @@ async fn test_get_me_success() {
                 "user",
                 TS,
                 TS,
+                "default",
             )),
         )
         .mount(&mock_server)

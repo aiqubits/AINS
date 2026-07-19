@@ -186,32 +186,32 @@ pub fn Dashboard() -> Element {
     ];
 
     rsx! {
-        div { class: "ws-dashboard",
-            section { class: "ws-hero",
-                span { class: "ws-hero__orb ws-hero__orb--indigo" }
-                span { class: "ws-hero__orb ws-hero__orb--pink" }
-                div { class: "ws-hero__body",
-                    div { class: "ws-hero__text",
-                        h1 { class: "ws-hero__title", {t.dashboard_title} }
-                        p { class: "ws-hero__subtitle",
+        div { class: "ains-dashboard",
+            section { class: "ains-hero",
+                span { class: "ains-hero__orb ains-hero__orb--indigo" }
+                span { class: "ains-hero__orb ains-hero__orb--pink" }
+                div { class: "ains-hero__body",
+                    div { class: "ains-hero__text",
+                        h1 { class: "ains-hero__title", {t.dashboard_title} }
+                        p { class: "ains-hero__subtitle",
                             {tf(t.dashboard_hello_user, &[("name", &user_name)])}
                             " "
                             {t.dashboard_click_health_hint}
                         }
                     }
-                    div { class: "ws-hero__cta",
+                    div { class: "ains-hero__cta",
                         Button {
                             onclick: on_run_health,
                             disabled: checking(),
                             loading: checking(),
-                            HeartPulse { class: "ws-hero__cta-icon" }
+                            HeartPulse { class: "ains-hero__cta-icon" }
                             {t.dashboard_call_health_btn}
                         }
                     }
                 }
             }
 
-            section { class: "ws-stats-grid",
+            section { class: "ains-stats-grid",
                 StatsCard {
                     label: t.dashboard_stats_health_label.to_string(),
                     value: health_snapshot.status_label.clone(),
@@ -265,16 +265,16 @@ pub fn Dashboard() -> Element {
                 }
             }
 
-            section { class: "ws-dashboard__split",
-                div { class: "ws-panel ws-panel--console",
+            section { class: "ains-dashboard__split",
+                div { class: "ains-panel ains-panel--console",
                     CodeConsole { lines: console_lines_signal }
                 }
-                div { class: "ws-panel ws-panel--routes",
-                    header { class: "ws-routes__header",
-                        h2 { class: "ws-routes__title", {t.dashboard_routes_title} }
-                        p { class: "ws-routes__subtitle", {t.dashboard_routes_subtitle} }
+                div { class: "ains-panel ains-panel--routes",
+                    header { class: "ains-routes__header",
+                        h2 { class: "ains-routes__title", {t.dashboard_routes_title} }
+                        p { class: "ains-routes__subtitle", {t.dashboard_routes_subtitle} }
                     }
-                    div { class: "ws-routes__list",
+                    div { class: "ains-routes__list",
                         {
                             let filtered_routes: Vec<_> = if search_text.is_empty() {
                                 API_ROUTES.to_vec()
@@ -291,7 +291,7 @@ pub fn Dashboard() -> Element {
                             };
                             if filtered_routes.is_empty() && !search_text.is_empty() {
                                 rsx! {
-                                    p { class: "ws-routes__empty", {t.dashboard_no_match} }
+                                    p { class: "ains-routes__empty", {t.dashboard_no_match} }
                                 }
                             } else {
                                 rsx! {

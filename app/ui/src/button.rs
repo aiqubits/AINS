@@ -14,9 +14,9 @@ pub fn Button(
     #[props(default = false)] loading: bool,
 ) -> Element {
     let class = if full_width {
-        "ws-btn ws-btn--primary ws-btn--block"
+        "ains-btn ains-btn--primary ains-btn--block"
     } else {
-        "ws-btn ws-btn--primary"
+        "ains-btn ains-btn--primary"
     };
 
     let type_attr = match button_type {
@@ -37,7 +37,7 @@ pub fn Button(
                 }
             },
             if loading {
-                LoaderCircle { class: "ws-btn__spinner" }
+                LoaderCircle { class: "ains-btn__spinner" }
             }
             {children}
         }

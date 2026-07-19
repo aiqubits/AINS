@@ -108,7 +108,7 @@ async fn delete(app: &Router, uri: &str, token: Option<&str>) -> (StatusCode, Va
     let headers: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
     let resp = axum_helpers::send_request(app, Method::DELETE, uri, headers, Body::empty()).await;
     let status = resp.status();
-    // DELETE may return NO_CONTENT (204) with empty body — treat as empty JSON
+    // DELETE returns JSON with message — parse body
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
     let json_body = if bytes.is_empty() {
         serde_json::json!({})
@@ -328,6 +328,107 @@ async fn test_channel_list_system_sees_all() {
     assert!(!items.is_empty(), "system should see all channels");
 }
 
+/// 验证分页参数 clamp 后，响应字段（page/per_page/total_pages）与实际数据一致。
+///
+/// 重点覆盖两个边界：
+/// - per_page=200 → 被 clamp 到 100（Service 上限），total_pages 不得因未 clamp 而偏小；
+/// - per_page=0   → 被 clamp 到 1，total_pages == total，不得出现 total_pages=0 与实际有数据矛盾。
+///
+/// 为让 total 确定（不被其它测试在 default 租户创建的渠道污染），在独立租户内测试。
+#[tokio::test]
+async fn test_channel_list_pagination_clamps_boundaries() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let sys_email = common::unique_email("ch_pg_clamp_sys");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    // 隔离租户
+    let (status, tbody) = post(
+        &app,
+        "/api/tenants",
+        Some(&sys_token),
+        Some(&json!({ "name": "pg-clamp-tenant" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let tenant_id = tbody["id"].as_str().unwrap().to_string();
+
+    // 该租户内的 admin（列出渠道时服务端按自身租户过滤，保证 total 确定）
+    let admin_email = common::unique_email("ch_pg_clamp_admin");
+    let (status, _b) = post(
+        &app,
+        "/api/users",
+        Some(&sys_token),
+        Some(&json!({
+            "email": admin_email,
+            "password": "Password123!",
+            "name": "pg clamp admin",
+            "role": "admin",
+            "tenant_id": tenant_id,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, lb) = post(
+        &app,
+        "/api/public/auth/login",
+        None,
+        Some(&json!({ "email": admin_email, "password": "Password123!" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let admin_token = lb["token"].as_str().unwrap().to_string();
+
+    // 在隔离租户内创建 3 个渠道
+    for i in 0..3 {
+        let (status, _b) = post(
+            &app,
+            "/api/channels",
+            Some(&admin_token),
+            Some(&json!({
+                "name": format!("pg-clamp-ch-{i}"),
+                "protocol_type": "openai",
+                "models": ["gpt-4"],
+                "capabilities": ["chat"],
+                "api_key": format!("sk-pg-{i}"),
+                "base_url": "https://api.pg.com",
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    // 边界 1：per_page=200 → clamp 到 100
+    let (status, body) = get(
+        &app,
+        "/api/channels?page=1&per_page=200",
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"], 1);
+    assert_eq!(
+        body["per_page"], 100,
+        "per_page 应被 clamp 到 100，而非回传 200"
+    );
+    assert_eq!(body["total"], 3);
+    assert_eq!(body["total_pages"], 1, "ceil(3/100) = 1");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3, "3 条均在一页内返回");
+
+    // 边界 2：per_page=0 → clamp 到 1
+    let (status, body) = get(&app, "/api/channels?page=1&per_page=0", Some(&admin_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["page"], 1);
+    assert_eq!(body["per_page"], 1, "per_page 应被 clamp 到 1，而非回传 0");
+    assert_eq!(body["total"], 3);
+    assert_eq!(
+        body["total_pages"], 3,
+        "ceil(3/1) = 3，不得出现 total_pages=0 与实际有数据的矛盾"
+    );
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "clamp 后每页仅 1 条");
+}
+
 #[tokio::test]
 async fn test_channel_update() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
@@ -390,12 +491,17 @@ async fn test_channel_disable_soft_delete() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let channel_id = body["id"].as_str().unwrap();
+    let channel_id = body["id"].as_str().unwrap().to_string();
 
-    // Disable via DELETE (soft delete — sets is_active=false)
-    let (status, _body) =
-        delete(&app, &format!("/api/channels/{}", channel_id), Some(&token)).await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Soft-disable via PUT is_active=false
+    let (status, _body) = put(
+        &app,
+        &format!("/api/channels/{}", channel_id),
+        Some(&token),
+        Some(&json!({"is_active": false})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 
     // Verify it's disabled by fetching
     let (status, body) = get(&app, "/api/channels", Some(&token)).await;
@@ -405,7 +511,7 @@ async fn test_channel_disable_soft_delete() {
         .unwrap()
         .iter()
         .find(|c| c["id"] == channel_id)
-        .expect("channel should still exist after soft delete");
+        .expect("channel should still exist after soft disable");
     assert_eq!(
         channel["is_active"], false,
         "channel should be disabled, not deleted"
@@ -413,6 +519,76 @@ async fn test_channel_disable_soft_delete() {
     assert_eq!(
         channel["name"], "To Disable",
         "channel metadata should be preserved"
+    );
+}
+
+/// Hard-delete must be refused (409 Conflict) when the channel still has
+/// associated `token_usage` records, so historical accounting rows are never
+/// orphaned. The guard reads the usage count from the write connection, so a
+/// just-recorded usage row is always visible here.
+#[tokio::test]
+async fn test_channel_delete_rejected_when_usage_exists() {
+    let (app, state) = axum_helpers::create_app_and_state().await;
+    let email = common::unique_email("ch_del_usage");
+    let token = axum_helpers::create_admin_and_login(&app, &email).await;
+
+    // Create a channel to delete.
+    let (status, body) = post(
+        &app,
+        "/api/channels",
+        Some(&token),
+        Some(&json!({
+            "name": "Has Usage",
+            "protocol_type": "openai",
+            "models": ["gpt-4"],
+            "capabilities": ["chat"],
+            "api_key": "sk-has-usage",
+            "base_url": "https://api.hasusage.com",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["id"].as_str().unwrap().to_string();
+    let channel_uuid: uuid::Uuid = channel_id.parse().unwrap();
+    let tenant_id = body["tenant_id"].as_str().unwrap().to_string();
+
+    // Record a token_usage row referencing this channel.
+    let metering = ains_server::services::MeteringService::new(state.db.clone());
+    metering
+        .record_usage(
+            1_i64,
+            &tenant_id,
+            channel_uuid,
+            "gpt-4",
+            "chat",
+            &json!({"usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
+        )
+        .await
+        .expect("record usage should succeed");
+
+    // DELETE must be refused with 409 Conflict.
+    let (status, del_body) =
+        delete(&app, &format!("/api/channels/{}", channel_id), Some(&token)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "deleting a channel with usage must return 409, got {status}: {del_body:?}"
+    );
+    assert!(
+        error_message(&del_body).contains("usage"),
+        "409 message should mention usage records: {del_body:?}"
+    );
+
+    // Channel must still exist (not deleted).
+    let (status, list_body) = get(&app, "/api/channels", Some(&token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        list_body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["id"] == channel_id),
+        "channel must survive a rejected delete"
     );
 }
 
@@ -820,7 +996,7 @@ async fn test_cross_tenant_channel_disable_isolation() {
     assert_eq!(status, StatusCode::OK);
     let tenant_b_channel_id = body["id"].as_str().unwrap().to_string();
 
-    // Default admin cannot disable tenant B's channel
+    // Default admin cannot delete tenant B's channel
     let (status, _body) = delete(
         &app,
         &format!("/api/channels/{}", tenant_b_channel_id),
@@ -830,10 +1006,10 @@ async fn test_cross_tenant_channel_disable_isolation() {
     assert_eq!(
         status,
         StatusCode::NOT_FOUND,
-        "default admin should not be able to disable tenant B's channel"
+        "default admin should not be able to delete tenant B's channel"
     );
 
-    // Tenant B admin can disable their own channel
+    // Tenant B admin can delete their own channel
     let admin_b_email = common::unique_email("cross_dis_admin_b");
     let (status, _body) = post(
         &app,
@@ -870,8 +1046,8 @@ async fn test_cross_tenant_channel_disable_isolation() {
     .await;
     assert_eq!(
         status,
-        StatusCode::NO_CONTENT,
-        "tenant B admin should be able to disable their own channel"
+        StatusCode::OK,
+        "tenant B admin should be able to delete their own channel"
     );
 }
 
@@ -1693,5 +1869,233 @@ async fn test_metering_not_recorded_on_upstream_error() {
         "no token_usage records should exist for user {} after upstream error, got: {}",
         uid,
         records.len()
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Channel DELETE (hard delete) tests
+// ═══════════════════════════════════════════════════════════════════
+
+/// System 可以删除无用量记录的渠道 → 200
+#[tokio::test]
+async fn test_delete_channel_by_system_ok() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let sys_email = common::unique_email("del_ch_sys");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    // 创建渠道
+    let (status, body) = post(
+        &app,
+        "/api/channels",
+        Some(&sys_token),
+        Some(&json!({
+            "name": "Delete Test Channel",
+            "protocol_type": "openai",
+            "models": ["gpt-4"],
+            "capabilities": ["chat"],
+            "api_key": "sk-delete-test",
+            "base_url": "https://api.example.com",
+            "tenant_id": "default",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["id"].as_str().unwrap().to_string();
+
+    // 确认渠道存在
+    let (status, body) = get(&app, "/api/channels", Some(&sys_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(ids.contains(&channel_id.as_str()));
+
+    // 执行物理删除 → 200
+    let (status, body) = delete(
+        &app,
+        &format!("/api/channels/{}", channel_id),
+        Some(&sys_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["message"], "Channel deleted successfully");
+
+    // 确认渠道已从列表消失
+    let (status, body) = get(&app, "/api/channels", Some(&sys_token)).await;
+    assert_eq!(status, StatusCode::OK);
+    let ids_after: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    assert!(!ids_after.contains(&channel_id.as_str()));
+}
+
+/// Admin 可以删除本租户下无用量记录的渠道 → 200
+#[tokio::test]
+async fn test_delete_channel_by_admin_ok() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let admin_email = common::unique_email("del_ch_adm");
+    let admin_token = axum_helpers::create_admin_and_login(&app, &admin_email).await;
+
+    let (status, body) = post(
+        &app,
+        "/api/channels",
+        Some(&admin_token),
+        Some(&json!({
+            "name": "Admin Delete Test",
+            "protocol_type": "openai",
+            "models": ["gpt-4"],
+            "capabilities": ["chat"],
+            "api_key": "sk-admin-delete",
+            "base_url": "https://api.admin-test.com",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, _) = delete(
+        &app,
+        &format!("/api/channels/{}", channel_id),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// 删除不存在的渠道 → 404
+#[tokio::test]
+async fn test_delete_channel_not_found() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let sys_email = common::unique_email("del_ch_nf");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    let fake_id = "00000000-0000-0000-0000-000000000000";
+    let (status, _) = delete(
+        &app,
+        &format!("/api/channels/{}", fake_id),
+        Some(&sys_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Admin 尝试删除其他租户的渠道 → 404（跨租户隔离）
+#[tokio::test]
+async fn test_delete_channel_cross_tenant_forbidden() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let sys_email = common::unique_email("del_ch_ct_sys");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    // System 在另一个租户下创建渠道
+    let tenant_name = common::unique_table_name("del_ct_t");
+    let (status, body) = post(
+        &app,
+        "/api/tenants",
+        Some(&sys_token),
+        Some(&json!({"name": tenant_name})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let other_tenant_id = body["id"].as_str().unwrap().to_string();
+
+    let (status, body) = post(
+        &app,
+        "/api/channels",
+        Some(&sys_token),
+        Some(&json!({
+            "name": "Cross-tenant Channel",
+            "protocol_type": "openai",
+            "models": ["gpt-4"],
+            "capabilities": ["chat"],
+            "api_key": "sk-cross",
+            "base_url": "https://api.other-tenant.com",
+            "tenant_id": other_tenant_id,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["id"].as_str().unwrap().to_string();
+
+    // Admin 来自 default 租户，尝试删除 → 404（频道不可见）
+    let admin_email = common::unique_email("del_ch_ct_adm");
+    let admin_token = axum_helpers::create_admin_and_login(&app, &admin_email).await;
+
+    let (status, _) = delete(
+        &app,
+        &format!("/api/channels/{}", channel_id),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// 渠道存在关联的 token_usage 记录时删除 → 409
+#[tokio::test]
+async fn test_delete_channel_with_usage_conflict() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let sys_email = common::unique_email("del_ch_use_sys");
+    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
+
+    // 创建渠道
+    let (status, body) = post(
+        &app,
+        "/api/channels",
+        Some(&sys_token),
+        Some(&json!({
+            "name": "Channel With Usage",
+            "protocol_type": "openai",
+            "models": ["gpt-4"],
+            "capabilities": ["chat"],
+            "api_key": "sk-usage-test",
+            "base_url": "https://api.usage-test.com",
+            "tenant_id": "default",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let channel_id = body["id"].as_str().unwrap().to_string();
+    let channel_uuid: uuid::Uuid = channel_id.parse().unwrap();
+
+    // 直接插入一条 token_usage 记录到数据库
+    let db = common::create_test_db_and_run_migrations().await;
+    let db_conn = db.write_conn();
+    let now = chrono::Utc::now();
+    sea_orm::EntityTrait::insert(ains_server::repositories::token_usage::ActiveModel {
+        id: sea_orm::Set(ains_server::snowflake::generate_id()),
+        user_id: sea_orm::Set(1),
+        tenant_id: sea_orm::Set("default".to_string()),
+        channel_id: sea_orm::Set(channel_uuid),
+        model: sea_orm::Set("gpt-4".to_string()),
+        prompt_tokens: sea_orm::Set(10),
+        completion_tokens: sea_orm::Set(20),
+        total_tokens: sea_orm::Set(30),
+        request_type: sea_orm::Set("chat".to_string()),
+        created_at: sea_orm::Set(now),
+    })
+    .exec(db_conn)
+    .await
+    .expect("failed to insert token_usage record");
+
+    // 尝试删除 → 409 Conflict
+    let (status, body) = delete(
+        &app,
+        &format!("/api/channels/{}", channel_id),
+        Some(&sys_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("token usage"),
+        "expected conflict message about token usage, got: {:?}",
+        body
     );
 }

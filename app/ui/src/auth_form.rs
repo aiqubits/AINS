@@ -54,27 +54,27 @@ pub fn AuthForm(
 
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/auth_form.css") }
-        div { class: "ws-auth",
-            div { class: "ws-auth__orb ws-auth__orb--purple" }
-            div { class: "ws-auth__orb ws-auth__orb--indigo" }
+        div { class: "ains-auth",
+            div { class: "ains-auth__orb ains-auth__orb--purple" }
+            div { class: "ains-auth__orb ains-auth__orb--indigo" }
 
-            div { class: "ws-auth__tabs",
+            div { class: "ains-auth__tabs",
                 button {
                     r#type: "button",
-                    class: if *mode.read() == AuthMode::Login { "ws-auth__tab ws-auth__tab--active" } else { "ws-auth__tab" },
+                    class: if *mode.read() == AuthMode::Login { "ains-auth__tab ains-auth__tab--active" } else { "ains-auth__tab" },
                     onclick: move |_| mode.set(AuthMode::Login),
-                    "{t.auth_login_tab} (/login)"
+                    "{t.auth_login_tab}"
                 }
                 button {
                     r#type: "button",
-                    class: if *mode.read() == AuthMode::Register { "ws-auth__tab ws-auth__tab--active" } else { "ws-auth__tab" },
+                    class: if *mode.read() == AuthMode::Register { "ains-auth__tab ains-auth__tab--active" } else { "ains-auth__tab" },
                     onclick: move |_| mode.set(AuthMode::Register),
-                    "{t.auth_register_tab} (/register)"
+                    "{t.auth_register_tab}"
                 }
             }
 
             form {
-                class: "ws-auth__form",
+                class: "ains-auth__form",
                 novalidate: true,
                 onsubmit: move |e| {
                     e.prevent_default();
@@ -154,7 +154,7 @@ pub fn AuthForm(
 
                 if *mode.read() == AuthMode::Login && show_captcha_input {
                     // Captcha login hint + code input (shown inside Login mode when WeChat enabled).
-                    p { class: "ws-auth__captcha-hint", "{t.auth_captcha_hint}" }
+                    p { class: "ains-auth__captcha-hint", "{t.auth_captcha_hint}" }
                     if let Some(ref cc) = captcha_code {
                         TextInput {
                             label: t.auth_captcha_label.to_string(),
@@ -170,12 +170,12 @@ pub fn AuthForm(
                 }
 
                 if let Some(err) = error.as_ref() {
-                    p { class: "ws-auth__error", "{err}" }
+                    p { class: "ains-auth__error", "{err}" }
                 }
 
                 if *mode.read() == AuthMode::Login {
-                    div { class: "ws-auth__meta",
-                        label { class: "ws-auth__remember",
+                    div { class: "ains-auth__meta",
+                        label { class: "ains-auth__remember",
                             input {
                                 r#type: "checkbox",
                                 checked: remember.as_ref().map(|s| *s.read()).unwrap_or(false),
@@ -191,7 +191,7 @@ pub fn AuthForm(
                         // 「忘记凭证?」链接 —— 旧版硬编码 `href="#"` 是死链；
                         // 现由调用方注入 on_forgot 实现真正的导航，未传则降级为不可点击。
                         a {
-                            class: "ws-auth__forgot",
+                            class: "ains-auth__forgot",
                             href: "#",
                             onclick: move |e| {
                                 if let Some(ref h) = on_forgot {
@@ -210,9 +210,9 @@ pub fn AuthForm(
                     disabled: loading,
                     loading,
                     if *mode.read() == AuthMode::Login {
-                        "{t.auth_submit_login} [POST /login]"
+                        "{t.auth_submit_login}"
                     } else {
-                        "{t.auth_submit_register} [POST /register]"
+                        "{t.auth_submit_register}"
                     }
                 }
             }

@@ -1,14 +1,13 @@
-//! Users 管理视图（admin）。
+//! Channel 管理视图（admin/system）。
 //!
-//! Phase 3 —— 完整接入 `client-api` 的 list / create / update / delete。
-//! 通过 `LogBus` 写入 toast + console。
+//! 参照 `users.rs` 的架构模式，完整接入 `client-api` 的 channels 管理 API。
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
 use chrono::{DateTime, Utc};
-use client_api::{TenantResponse, UserResponse};
+use client_api::{ChannelResponse, TenantResponse};
 use dioxus::prelude::dioxus_router::Navigator;
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
@@ -22,20 +21,27 @@ use ui::{
 
 use crate::api::{ErrorContext, humanize_error};
 use crate::auth::AuthState;
-use crate::balance::{BALANCE_SCALE, format_balance};
 use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
-use ui::Language;
 
 /// DOM id of the tenant dropdown scroll panel — used by the infinite-scroll
 /// handler to read the panel's scroll position via `element_near_bottom`.
-const TENANT_PANEL_ID: &str = "user-tenant-dropdown-panel";
+const TENANT_PANEL_ID: &str = "channel-tenant-dropdown-panel";
+
+const ALL_CAPABILITIES: &[(&str, &str)] = &[
+    ("chat", "Chat"),
+    ("vision", "Vision"),
+    ("stt", "STT"),
+    ("tts", "TTS"),
+    ("websearch", "WebSearch"),
+    ("embedding", "Embedding"),
+];
 
 #[derive(Debug, Clone)]
 enum ListState {
     Loading,
-    Loaded(Vec<UserResponse>),
+    Loaded(Vec<ChannelResponse>),
     Error(String),
 }
 
@@ -48,18 +54,20 @@ enum ModalKind {
 }
 
 #[derive(Clone, Copy)]
-struct UsersSignals {
+struct ChannelsSignals {
     modal_kind: Signal<ModalKind>,
-    editing_user: Signal<Option<UserResponse>>,
-    deleting_user: Signal<Option<UserResponse>>,
+    editing_channel: Signal<Option<ChannelResponse>>,
+    deleting_channel: Signal<Option<ChannelResponse>>,
     form_name: Signal<String>,
-    form_email: Signal<String>,
-    form_password: Signal<String>,
-    form_role: Signal<String>,
-    form_balance: Signal<String>,
-    /// 创建用户时的目标租户（仅 system 生效；空串表示交由服务端默认）。
+    form_protocol: Signal<String>,
+    form_base_url: Signal<String>,
+    form_api_key: Signal<String>,
+    form_models: Signal<String>,
+    form_capabilities: Signal<Vec<String>>,
+    form_weight: Signal<String>,
+    form_is_active: Signal<bool>,
     form_tenant_id: Signal<String>,
-    /// 自定义租户下拉是否展开（原生 select 弹层无法与 Modal 风格对齐，故自绘）。
+    /// 自定义租户下拉是否展开（原生 select 的弹层无法与 Modal 风格对齐，故自绘）。
     tenant_dropdown_open: Signal<bool>,
     /// 租户下拉「无限滚动」分页状态：下一页页码、是否还有更多、是否正在加载。
     tenant_next_page: Signal<u64>,
@@ -68,8 +76,6 @@ struct UsersSignals {
     submitting: Signal<bool>,
     form_error: Signal<Option<String>>,
     list_version: Signal<u64>,
-    page: Signal<u64>,
-    per_page: Signal<u64>,
 }
 
 /// 分页状态（快照值 + 信号），用于 `render_table` 传参。
@@ -80,10 +86,11 @@ struct PaginationState {
     total: u64,
     total_pages: u64,
     page_signal: Signal<u64>,
+    per_page_signal: Signal<u64>,
 }
 
 #[component]
-pub fn Users() -> Element {
+pub fn Channels() -> Element {
     let auth = use_context::<AuthState>();
     let log_bus = use_context::<LogBus>();
     let nav = use_navigator();
@@ -96,18 +103,21 @@ pub fn Users() -> Element {
     let per_page = use_signal(|| 20u64);
     let total = use_signal(|| 0u64);
     let total_pages = use_signal(|| 0u64);
-    let available_tenants = use_signal(Vec::<TenantResponse>::new);
     let SearchSignal(search_query) = use_context::<SearchSignal>();
+    let available_tenants = use_signal(Vec::<TenantResponse>::new);
 
-    let signals = UsersSignals {
+    let signals = ChannelsSignals {
         modal_kind: use_signal(|| ModalKind::None),
-        editing_user: use_signal(|| Option::<UserResponse>::None),
-        deleting_user: use_signal(|| Option::<UserResponse>::None),
+        editing_channel: use_signal(|| Option::<ChannelResponse>::None),
+        deleting_channel: use_signal(|| Option::<ChannelResponse>::None),
         form_name: use_signal(String::new),
-        form_email: use_signal(String::new),
-        form_password: use_signal(String::new),
-        form_role: use_signal(|| "user".to_string()),
-        form_balance: use_signal(String::new),
+        form_protocol: use_signal(|| "openai".to_string()),
+        form_base_url: use_signal(String::new),
+        form_api_key: use_signal(String::new),
+        form_models: use_signal(String::new),
+        form_capabilities: use_signal(Vec::new),
+        form_weight: use_signal(|| "1".to_string()),
+        form_is_active: use_signal(|| true),
         form_tenant_id: use_signal(String::new),
         tenant_dropdown_open: use_signal(|| false),
         tenant_next_page: use_signal(|| 2u64),
@@ -116,13 +126,9 @@ pub fn Users() -> Element {
         submitting: use_signal(|| false),
         form_error: use_signal(|| Option::<String>::None),
         list_version,
-        page,
-        per_page,
     };
 
-    // 搜索变更时自动重置到第 1 页，避免翻到后面的页码后搜索结果为空。
-    // 使用 use_hook + Rc<Cell<bool>> 持有非响应式的 "首次运行" 标记，
-    // 避免写入信号触发 effect 自身重入（原 search_reset_done 方案会导致多余的重执行）。
+    // 搜索变更时自动重置到第 1 页
     {
         let search_for_reset = search_query;
         let mut page_for_reset = page;
@@ -138,8 +144,11 @@ pub fn Users() -> Element {
     }
 
     // 租户列表拉取：独立于分页 effect，挂载后仅执行一次。
-    // 用途：system 创建用户时的「所属租户」下拉选择。错误显式上报，
-    // 避免静默吞掉导致下拉为空。
+    // 用途：创建/编辑时的租户下拉选择 + 列表「所属租户」列的 ID→名称解析。
+    // 之前该请求耦合在分页 effect 中，位于 list_channels 的早退守卫之后，一旦
+    // 守卫命中或请求失败（错误被静默吞掉）就会导致 available_tenants 为空，
+    // 使所属租户列回退显示原始租户 ID（默认租户因 ID 恰为可读字符串 "default"
+    // 而看似正常，其余租户则暴露出 UUID）。
     {
         let client = auth.client.clone();
         let bus = log_bus;
@@ -168,12 +177,12 @@ pub fn Users() -> Element {
         });
     }
 
+    // 数据拉取
     {
         let client = auth.client.clone();
         let bus = log_bus;
         let auth_for_effect = auth.clone();
         use_effect(move || {
-            // 读取响应式依赖：list_version / page / per_page 变更时重新拉取
             let _ = list_version();
             let current_page = page();
             let current_per_page = per_page();
@@ -189,8 +198,7 @@ pub fn Users() -> Element {
                 let version = version_check();
                 list.set(ListState::Loading);
                 let lang = effect_lang;
-                let res = client.list_users(current_page, current_per_page).await;
-                // 丢弃过期响应：list_version / page / per_page 任一变化均视为过期
+                let res = client.list_channels(current_page, current_per_page).await;
                 if version_check() != version
                     || page() != current_page
                     || per_page() != current_per_page
@@ -199,7 +207,7 @@ pub fn Users() -> Element {
                 }
                 match res {
                     Ok(page_data) => {
-                        push_log_ok(bus, HttpMethod::Get, "/api/users");
+                        push_log_ok(bus, HttpMethod::Get, "/api/channels");
                         total_signal.set(page_data.total);
                         total_pages_signal.set(page_data.total_pages);
                         list.set(ListState::Loaded(page_data.items));
@@ -208,10 +216,10 @@ pub fn Users() -> Element {
                         if crate::api::handle_unauth(&err, auth_inner, nav, bus).await {
                             return;
                         }
-                        push_log_err(bus, HttpMethod::Get, "/api/users", &err);
+                        push_log_err(bus, HttpMethod::Get, "/api/channels", &err);
                         list.set(ListState::Error(humanize_error(
                             &err,
-                            ErrorContext::UserManagement,
+                            ErrorContext::ChannelManagement,
                             lang,
                         )));
                     }
@@ -222,50 +230,47 @@ pub fn Users() -> Element {
 
     let list_snapshot = list.cloned();
     let search_text = search_query.cloned();
-    let page_val = page();
-    let per_page_val = per_page();
-    let total_val = total();
-    let total_pages_val = total_pages();
     let kind_snapshot = *signals.modal_kind.read();
     let form_error_snapshot = signals.form_error.read().clone();
     let submitting_snapshot = *signals.submitting.read();
-    let editing_snapshot = signals.editing_user.read().clone();
-    let deleting_snapshot = signals.deleting_user.read().clone();
+    let editing_snapshot = signals.editing_channel.read().clone();
+    let deleting_snapshot = signals.deleting_channel.read().clone();
 
-    // Current user role and ID for permission checks
     let current_user = auth.user.read().as_ref().cloned();
-    let current_role = current_user
-        .as_ref()
-        .map(|u| u.role.clone())
-        .unwrap_or_default();
     let actor_is_system = current_user
         .as_ref()
         .map(|u| u.is_system())
         .unwrap_or(false);
-    let actor_is_admin = current_user.as_ref().map(|u| u.is_admin()).unwrap_or(false);
     let actor_tenant_id = current_user
-        .as_ref()
         .map(|u| u.tenant_id.clone())
         .unwrap_or_default();
-    let current_user_id = current_user.map(|u| u.id).unwrap_or_default();
 
-    // 租户 ID→名称映射：用于列表「所属租户」列的解析（与渠道管理界面对齐）。
+    let page_val = page();
+    let per_page_val = per_page();
+    let total_val = total();
+    let total_pages_val = total_pages();
+
+    let mut signals_for_open = signals;
+    let default_tenant_id = actor_tenant_id.clone();
     let tenant_name_map: HashMap<String, String> = available_tenants
         .cloned()
         .into_iter()
         .map(|t| (t.id, t.name))
         .collect();
-
-    let mut signals_for_open = signals;
     let open_create = move |_: MouseEvent| {
         signals_for_open.form_name.set(String::new());
-        signals_for_open.form_email.set(String::new());
-        signals_for_open.form_password.set(String::new());
-        signals_for_open.form_role.set("user".to_string());
-        signals_for_open.form_tenant_id.set(actor_tenant_id.clone());
-        signals_for_open.tenant_dropdown_open.set(false);
+        signals_for_open.form_protocol.set("openai".to_string());
+        signals_for_open.form_base_url.set(String::new());
+        signals_for_open.form_api_key.set(String::new());
+        signals_for_open.form_models.set(String::new());
+        signals_for_open.form_capabilities.set(Vec::new());
+        signals_for_open.form_weight.set("1".to_string());
+        signals_for_open.form_is_active.set(true);
+        signals_for_open
+            .form_tenant_id
+            .set(default_tenant_id.clone());
         signals_for_open.form_error.set(None);
-        signals_for_open.editing_user.set(None);
+        signals_for_open.editing_channel.set(None);
         signals_for_open.modal_kind.set(ModalKind::Create);
     };
 
@@ -273,41 +278,39 @@ pub fn Users() -> Element {
         div { class: "ains-users",
             header { class: "ains-users__header",
                 div { class: "ains-users__title-block",
-                    h1 { class: "ains-users__title", "{t.users_title}" }
-                    p { class: "ains-users__subtitle", "{t.users_subtitle}" }
+                    h1 { class: "ains-users__title", "{t.channels_title}" }
+                    p { class: "ains-users__subtitle", "{t.channels_subtitle}" }
                 }
                 div { class: "ains-users__header-actions",
                     span { class: "ains-users__guard-pill",
                         ShieldHalf {}
-                        "{t.users_guard_pill}"
+                        "{t.channels_guard_pill}"
                     }
                     Button { onclick: open_create,
                         Plus {}
-                        "{t.users_create_btn}"
+                        "{t.channels_create_btn}"
                     }
                 }
             }
 
             {
-                {
-                    render_table(
-                        t,
-                        list_snapshot,
-                        search_text,
-                        signals,
-                        current_user_id,
-                        actor_is_system,
-                        actor_is_admin,
-                        PaginationState {
-                            page: page_val,
-                            per_page: per_page_val,
-                            total: total_val,
-                            total_pages: total_pages_val,
-                            page_signal: page,
-                        },
-                        tenant_name_map.clone(),
-                    )
-                }
+                render_table(
+                    t,
+                    list_snapshot,
+                    search_text,
+                    signals,
+                    actor_is_system,
+                    actor_tenant_id.clone(),
+                    PaginationState {
+                        page: page_val,
+                        per_page: per_page_val,
+                        total: total_val,
+                        total_pages: total_pages_val,
+                        page_signal: page,
+                        per_page_signal: per_page,
+                    },
+                    tenant_name_map.clone(),
+                )
             }
 
             {
@@ -323,8 +326,8 @@ pub fn Users() -> Element {
                     log_bus,
                     auth.clone(),
                     nav,
-                    current_role,
                     actor_is_system,
+                    actor_tenant_id,
                     available_tenants,
                 )
             }
@@ -337,10 +340,9 @@ fn render_table(
     t: &'static Translations,
     list_snapshot: ListState,
     search_text: String,
-    mut signals: UsersSignals,
-    current_user_id: String,
+    signals: ChannelsSignals,
     actor_is_system: bool,
-    actor_is_admin: bool,
+    actor_tenant_id: String,
     pagination: PaginationState,
     tenant_name_map: HashMap<String, String>,
 ) -> Element {
@@ -348,7 +350,7 @@ fn render_table(
         ListState::Loading => rsx! {
             div { class: "ains-users__status",
                 LoaderCircle { class: "ains-btn__spinner" }
-                "{t.users_loading}"
+                "{t.channels_loading}"
             }
         },
         ListState::Error(msg) => rsx! {
@@ -358,29 +360,29 @@ fn render_table(
             }
         },
         ListState::Loaded(items) => {
-            // 前端实时搜索过滤：按用户名或邮箱（不区分大小写）
-            let filtered: Vec<UserResponse> = if search_text.is_empty() {
+            let filtered: Vec<ChannelResponse> = if search_text.is_empty() {
                 items
             } else {
                 let q = search_text.to_lowercase();
                 items
                     .into_iter()
-                    .filter(|u| {
-                        u.name.to_lowercase().contains(&q) || u.email.to_lowercase().contains(&q)
+                    .filter(|c| {
+                        c.name.to_lowercase().contains(&q)
+                            || c.base_url.to_lowercase().contains(&q)
+                            || c.id.to_lowercase().contains(&q)
                     })
                     .collect()
             };
             let columns = build_columns(t);
             let rows: Vec<Element> = filtered
                 .into_iter()
-                .map(|u| {
+                .map(|ch| {
                     row_element(
                         t,
-                        u,
+                        ch,
                         signals,
                         actor_is_system,
-                        actor_is_admin,
-                        current_user_id.clone(),
+                        actor_tenant_id.clone(),
                         &tenant_name_map,
                     )
                 })
@@ -391,7 +393,8 @@ fn render_table(
                 per_page,
                 total,
                 total_pages,
-                page_signal,
+                mut page_signal,
+                mut per_page_signal,
             } = pagination;
             let has_prev = page > 1;
             let has_next = page < total_pages;
@@ -422,7 +425,7 @@ fn render_table(
                     DataTable {
                         columns,
                         rows,
-                        empty: Some(rsx! { "{t.users_empty}" }),
+                        empty: Some(rsx! { "{t.channels_empty}" }),
                     }
                     div { class: "ains-pagination",
                         div { class: "ains-pagination__info", "{pagination_info}" }
@@ -447,8 +450,8 @@ fn render_table(
                                     onchange: move |evt| {
                                         if let Ok(v) = evt.value().parse::<u64>() {
                                             let v = v.clamp(1, 100);
-                                            signals.per_page.set(v);
-                                            signals.page.set(1);
+                                            per_page_signal.set(v);
+                                            page_signal.set(1);
                                         }
                                     },
                                     option { value: "20", "20" }
@@ -465,111 +468,133 @@ fn render_table(
     }
 }
 
+fn capability_badges(capabilities: &serde_json::Value) -> String {
+    if let Some(arr) = capabilities.as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    }
+}
+
+fn models_text(models: &serde_json::Value) -> String {
+    if let Some(arr) = models.as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str())
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    } else {
+        String::new()
+    }
+}
+
 fn row_element(
     t: &'static Translations,
-    u: UserResponse,
-    signals: UsersSignals,
+    ch: ChannelResponse,
+    signals: ChannelsSignals,
     actor_is_system: bool,
-    actor_is_admin: bool,
-    current_user_id: String,
+    actor_tenant_id: String,
     tenant_name_map: &HashMap<String, String>,
 ) -> Element {
-    // 直接从原结构上提取展示字段，避免先 clone 再逐字段 clone 的冗余。
-    let id_for_key = u.id.clone();
-    let name = u.name.clone();
-    let email = u.email.clone();
-    let role = u.role.clone();
-    let created = u.created_at;
-    let balance = u.balance;
-    let tenant_id = u.tenant_id.clone();
-    let tenant_name: String = u
+    let id = ch.id.clone();
+    let name = ch.name.clone();
+    let protocol = ch.protocol_type.clone();
+    let base_url = ch.base_url.clone();
+    let is_active = ch.is_active;
+    let weight = ch.weight;
+    let capabilities_str = capability_badges(&ch.capabilities);
+    let created = ch.created_at;
+    let tenant_name = ch
         .tenant_name
-        .clone()
+        .as_deref()
         .filter(|s| !s.is_empty())
-        .or_else(|| tenant_name_map.get(&tenant_id).cloned())
-        .unwrap_or_else(|| tenant_id.clone());
+        .or_else(|| tenant_name_map.get(&ch.tenant_id).map(|s| s.as_str()))
+        .unwrap_or(&ch.tenant_id);
 
-    let is_system = role == "system";
-    let is_admin_role = role == "admin";
-    // Protected rows: system accounts are editable only by other system accounts;
-    // admin accounts are also protected from admin-actor edits (only system can modify).
-    let is_protected = is_system || is_admin_role;
-    let is_self = u.id == current_user_id;
+    // RBAC: system 可操作所有渠道；admin 只能操作自己租户内的渠道
+    let is_same_tenant = ch.tenant_id == actor_tenant_id;
+    let can_edit = actor_is_system || (!actor_tenant_id.is_empty() && is_same_tenant);
+    let can_delete = actor_is_system || (!actor_tenant_id.is_empty() && is_same_tenant);
 
-    // Edit permission:
-    //   - system actor: can edit any role (including admin and other system accounts)
-    //   - admin actor:  can only edit user-role accounts (admin/system rows are protected)
-    // Protected rows (system & admin) are only editable by system actors.
-    let can_edit = actor_is_system || (actor_is_admin && role == "user");
-    // Delete permission: same as edit, but cannot delete self
-    let can_delete = can_edit && !is_self;
-
-    let u_for_edit = u.clone();
-    let u_for_delete = u.clone();
+    let ch_for_edit = ch.clone();
+    let ch_for_delete = ch.clone();
     let mut s_edit = signals;
     let mut s_delete = signals;
+
     let edit_handler = move |_: MouseEvent| {
-        s_edit.form_name.set(u_for_edit.name.clone());
-        s_edit.form_email.set(u_for_edit.email.clone());
-        s_edit.form_password.set(String::new());
-        s_edit.form_role.set(u_for_edit.role.clone());
-        s_edit.form_balance.set(String::new());
-        s_edit.form_tenant_id.set(u_for_edit.tenant_id.clone());
-        s_edit.tenant_dropdown_open.set(false);
+        // Parse models and capabilities from JSON
+        let models_str = models_text(&ch_for_edit.models);
+        s_edit.form_name.set(ch_for_edit.name.clone());
+        s_edit.form_protocol.set(ch_for_edit.protocol_type.clone());
+        s_edit.form_base_url.set(ch_for_edit.base_url.clone());
+        s_edit.form_api_key.set(String::new()); // Don't populate API key
+        s_edit.form_models.set(models_str);
+        s_edit
+            .form_capabilities
+            .set(parse_capability_vec(&ch_for_edit.capabilities));
+        s_edit.form_weight.set(ch_for_edit.weight.to_string());
+        s_edit.form_is_active.set(ch_for_edit.is_active);
+        s_edit.form_tenant_id.set(ch_for_edit.tenant_id.clone());
         s_edit.form_error.set(None);
-        s_edit.editing_user.set(Some(u_for_edit.clone()));
+        s_edit.editing_channel.set(Some(ch_for_edit.clone()));
         s_edit.modal_kind.set(ModalKind::Edit);
     };
     let delete_handler = move |_: MouseEvent| {
         s_delete.form_error.set(None);
-        s_delete.deleting_user.set(Some(u_for_delete.clone()));
+        s_delete.deleting_channel.set(Some(ch_for_delete.clone()));
         s_delete.modal_kind.set(ModalKind::DeleteConfirm);
     };
+
     rsx! {
-        tr { key: "{id_for_key}",
+        tr { key: "{id}",
             td {
                 span {
                     class: "ains-table__name-cell",
-                    title: "ID: {id_for_key}",
-                    "data-id": "{id_for_key}",
+                    title: "ID: {id}",
+                    "data-id": "{id}",
                     "{name}"
                 }
             }
             td {
                 span {
                     class: "ains-table__name-cell",
-                    title: "ID: {tenant_id}",
-                    "data-id": "{tenant_id}",
+                    title: "ID: {ch.tenant_id}",
+                    "data-id": "{ch.tenant_id}",
                     "{tenant_name}"
                 }
             }
-            td { "{email}" }
             td {
-                if role == "admin" {
-                    Badge { variant: BadgeVariant::Admin, "{t.users_badge_admin}" }
-                } else if role == "system" {
-                    Badge { variant: BadgeVariant::Admin, "{t.users_badge_system}" }
+                if protocol == "anthropic" {
+                    Badge { variant: BadgeVariant::Admin, "Anthropic" }
                 } else {
-                    Badge { variant: BadgeVariant::User, "{t.users_badge_user}" }
+                    Badge { variant: BadgeVariant::User, "OpenAI" }
                 }
             }
-            td { class: "ains-table__mono ains-table__align--right", "{format_balance(balance)}" }
+            td { class: "ains-table__mono ains-table__truncate",
+                span { title: "{base_url}", "{base_url}" }
+            }
+            td {
+                if is_active {
+                    Badge { variant: BadgeVariant::User, "{t.channels_badge_active}" }
+                } else {
+                    Badge { variant: BadgeVariant::Admin, "{t.channels_badge_inactive}" }
+                }
+            }
+            td { class: "ains-table__mono ains-table__align--right", "{weight}" }
+            td { class: "ains-table__mono ains-table__truncate",
+                span { title: "{capabilities_str}", "{capabilities_str}" }
+            }
             td { class: "ains-table__mono", "{format_dt(&created)}" }
             td {
-                if is_protected && !can_edit {
-                    div { class: "ains-table__row-actions",
-                        span {
-                            class: "ains-table__protected",
-                            title: if is_admin_role { "{t.users_protected_admin_label}" } else { "{t.users_system_editable}" },
-                            ShieldHalf {}
-                            "{t.users_protected_label}"
-                        }
-                    }
-                } else if !can_edit && !can_delete {
+                if !can_edit && !can_delete {
                     div { class: "ains-table__row-actions",
                         span { class: "ains-table__protected",
                             ShieldHalf {}
-                            "{t.users_no_permission}"
+                            "{t.channels_no_permission}"
                         }
                     }
                 } else {
@@ -577,7 +602,7 @@ fn row_element(
                         if can_edit {
                             button {
                                 class: "ains-table__action",
-                                title: "{t.users_edit_title}",
+                                title: "{t.channels_edit_title}",
                                 onclick: edit_handler,
                                 Pencil {}
                             }
@@ -585,7 +610,7 @@ fn row_element(
                         if can_delete {
                             button {
                                 class: "ains-table__action ains-table__action--danger",
-                                title: "{t.users_delete_title}",
+                                title: "{t.channels_delete_title}",
                                 onclick: delete_handler,
                                 Trash2 {}
                             }
@@ -597,22 +622,35 @@ fn row_element(
     }
 }
 
-fn close_all(mut signals: UsersSignals) {
+fn parse_capability_vec(val: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = val.as_array() {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect()
+    } else {
+        Vec::new()
+    }
+}
+
+fn close_all(mut signals: ChannelsSignals) {
     signals.modal_kind.set(ModalKind::None);
-    signals.editing_user.set(None);
-    signals.deleting_user.set(None);
+    signals.editing_channel.set(None);
+    signals.deleting_channel.set(None);
     signals.form_name.set(String::new());
-    signals.form_email.set(String::new());
-    signals.form_password.set(String::new());
-    signals.form_role.set("user".to_string());
-    signals.form_balance.set(String::new());
+    signals.form_protocol.set("openai".to_string());
+    signals.form_base_url.set(String::new());
+    signals.form_api_key.set(String::new());
+    signals.form_models.set(String::new());
+    signals.form_capabilities.set(Vec::new());
+    signals.form_weight.set("1".to_string());
+    signals.form_is_active.set(true);
     signals.form_tenant_id.set(String::new());
     signals.tenant_dropdown_open.set(false);
     signals.submitting.set(false);
     signals.form_error.set(None);
 }
 
-/// 截断租户 ID 仅展示前 8 位（超过 8 位附省略号），用于下拉选项与触发器。
+/// 仅保留租户 ID 前 8 位，超出部分以省略号收尾（如 `896297c7...`）。
 fn short_tenant_id(id: &str) -> String {
     if id.chars().count() > 8 {
         let head: String = id.chars().take(8).collect();
@@ -622,135 +660,21 @@ fn short_tenant_id(id: &str) -> String {
     }
 }
 
-/// Create a balance adjustment handler closure.
-///
-/// `multiplier` controls direction: `1` = increase, `-1` = decrease.
-struct AdjustHandlerParams {
-    signals: UsersSignals,
-    client: client_api::Client,
-    log_bus: LogBus,
-    auth: AuthState,
-    nav: Navigator,
-    multiplier: i64,
-    t: &'static Translations,
-    lang: Language,
-}
-
-fn make_adjust_handler(params: AdjustHandlerParams) -> impl FnMut(MouseEvent) + 'static {
-    let AdjustHandlerParams {
-        mut signals,
-        client,
-        log_bus,
-        auth,
-        nav,
-        multiplier,
-        t,
-        lang,
-    } = params;
-
-    move |_: MouseEvent| {
-        if *signals.submitting.read() {
-            return;
-        }
-        let Some(u) = signals.editing_user.cloned() else {
-            return;
-        };
-        let target_id = u.id.clone();
-        let text = signals.form_balance.cloned();
-        if text.trim().is_empty() {
-            signals
-                .form_error
-                .set(Some(t.users_adjust_empty.to_string()));
-            return;
-        }
-        let display: f64 = match text.parse() {
-            Ok(v) => v,
-            Err(_) => {
-                signals
-                    .form_error
-                    .set(Some(t.users_adjust_invalid.to_string()));
-                return;
-            }
-        };
-        if display <= 0.0 {
-            signals
-                .form_error
-                .set(Some(t.users_adjust_positive.to_string()));
-            return;
-        }
-        // Reject non-finite values (NaN, infinity) that can bypass the >0 check
-        if !display.is_finite() {
-            signals
-                .form_error
-                .set(Some(t.users_adjust_invalid.to_string()));
-            return;
-        }
-        // Protect against i64 overflow: display * BALANCE_SCALE must fit in i64
-        if display > 1_000_000.0 {
-            signals
-                .form_error
-                .set(Some(t.users_adjust_overflow.to_string()));
-            return;
-        }
-        let stored = (display * BALANCE_SCALE as f64).round() as i64 * multiplier;
-        signals.submitting.set(true);
-        signals.form_error.set(None);
-        let mut s_async = signals;
-        let c_async = client.clone();
-        let b_async = log_bus;
-        let a_async = auth.clone();
-        spawn(async move {
-            let res = c_async.adjust_balance(target_id.clone(), stored).await;
-            s_async.submitting.set(false);
-            match res {
-                Ok(resp) => {
-                    push_log_ok(
-                        b_async,
-                        HttpMethod::Post,
-                        &format!("/api/users/{}/balance/adjust", target_id),
-                    );
-                    if let Some(ref mut u) = *s_async.editing_user.write() {
-                        u.balance = resp.balance;
-                    }
-                    s_async.form_balance.set(String::new());
-                    s_async.list_version.with_mut(|v| *v += 1);
-                }
-                Err(err) => {
-                    if crate::api::handle_unauth(&err, a_async, nav, b_async).await {
-                        return;
-                    }
-                    push_log_err(
-                        b_async,
-                        HttpMethod::Post,
-                        &format!("/api/users/{}/balance/adjust", target_id),
-                        &err,
-                    );
-                    s_async.form_error.set(Some(humanize_error(
-                        &err,
-                        ErrorContext::UserManagement,
-                        lang,
-                    )));
-                }
-            }
-        });
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn render_modal(
     t: &'static Translations,
     kind: ModalKind,
     form_error: Option<String>,
     submitting: bool,
-    editing: Option<UserResponse>,
-    deleting: Option<UserResponse>,
-    signals: UsersSignals,
+    editing: Option<ChannelResponse>,
+    deleting: Option<ChannelResponse>,
+    signals: ChannelsSignals,
     client: client_api::Client,
     log_bus: LogBus,
     auth: AuthState,
     nav: Navigator,
-    current_role: String,
     actor_is_system: bool,
+    actor_tenant_id: String,
     available_tenants: Signal<Vec<TenantResponse>>,
 ) -> Element {
     if kind == ModalKind::None {
@@ -759,16 +683,7 @@ fn render_modal(
 
     if kind == ModalKind::DeleteConfirm {
         return render_delete_confirm(
-            t,
-            kind,
-            deleting,
-            submitting,
-            signals,
-            client,
-            log_bus,
-            auth,
-            nav,
-            current_role,
+            t, form_error, deleting, submitting, signals, client, log_bus, auth, nav,
         );
     }
 
@@ -783,8 +698,8 @@ fn render_modal(
         log_bus,
         auth,
         nav,
-        current_role,
         actor_is_system,
+        actor_tenant_id,
         available_tenants,
     )
 }
@@ -792,71 +707,58 @@ fn render_modal(
 #[allow(clippy::too_many_arguments)]
 fn render_delete_confirm(
     t: &'static Translations,
-    kind: ModalKind,
-    deleting: Option<UserResponse>,
+    form_error: Option<String>,
+    deleting: Option<ChannelResponse>,
     submitting: bool,
-    signals: UsersSignals,
+    signals: ChannelsSignals,
     client: client_api::Client,
     log_bus: LogBus,
     auth: AuthState,
     nav: Navigator,
-    current_role: String,
 ) -> Element {
-    let open = kind == ModalKind::DeleteConfirm;
     let message = deleting
         .as_ref()
-        .map(|u| {
+        .map(|c| {
             tf(
-                t.users_confirm_delete_msg,
-                &[("name", &u.name), ("id", &u.id)],
+                t.channels_confirm_delete_msg,
+                &[("name", &c.name), ("id", &c.id)],
             )
         })
-        .unwrap_or_else(|| t.users_no_target.to_string());
-    let confirm_delete_title = t.users_confirm_delete_title.to_string();
+        .unwrap_or_else(|| t.channels_no_target.to_string());
+    let confirm_title = t.channels_confirm_delete_title.to_string();
 
     let on_cancel = move |_: MouseEvent| close_all(signals);
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
     let a_async = auth;
-    let role = current_role;
     let on_confirm = move |_: MouseEvent| {
         if *s_async.submitting.read() {
             return;
         }
-        let Some(u) = s_async.deleting_user.cloned() else {
+        let Some(c) = s_async.deleting_channel.cloned() else {
             return;
         };
-        // 防御性检查：系统用户不可删除（后端同样保护）
-        if u.role == "system" {
-            return;
-        }
-        // 防御性检查：admin 不能删除 admin 或 system（后端同样保护）
-        if role == "admin" && u.role != "user" {
-            return;
-        }
-        let target_id = u.id.clone();
+        let target_id = c.id.clone();
         s_async.submitting.set(true);
         let client_async = c_async.clone();
         let bus_async = b_async;
         let mut s_inner = s_async;
         let auth_async = a_async.clone();
+        let lang = use_context::<I18nContext>().lang();
         spawn(async move {
-            let res = client_async.delete_user(target_id.clone()).await;
-            if res.is_ok() {
-                push_log_ok(
-                    bus_async,
-                    HttpMethod::Delete,
-                    &format!("/api/users/{target_id}"),
-                );
-            }
+            let res = client_async.delete_channel(&target_id).await;
             s_inner.submitting.set(false);
             match res {
                 Ok(_) => {
-                    // 仅当模态框仍为 DeleteConfirm 时才关闭，避免旧异步任务关闭新打开的模态框。
+                    push_log_ok(
+                        bus_async,
+                        HttpMethod::Delete,
+                        &format!("/api/channels/{target_id}"),
+                    );
                     if *s_inner.modal_kind.read() == ModalKind::DeleteConfirm {
                         s_inner.modal_kind.set(ModalKind::None);
-                        s_inner.deleting_user.set(None);
+                        s_inner.deleting_channel.set(None);
                         s_inner.form_error.set(None);
                     }
                     s_inner.list_version.with_mut(|v| *v += 1);
@@ -868,9 +770,14 @@ fn render_delete_confirm(
                     push_log_err(
                         bus_async,
                         HttpMethod::Delete,
-                        &format!("/api/users/{target_id}"),
+                        &format!("/api/channels/{target_id}"),
                         &err,
                     );
+                    s_inner.form_error.set(Some(humanize_error(
+                        &err,
+                        ErrorContext::ChannelManagement,
+                        lang,
+                    )));
                 }
             }
         });
@@ -878,15 +785,34 @@ fn render_delete_confirm(
 
     rsx! {
         ConfirmDialog {
-            open,
-            title: confirm_delete_title,
+            open: true,
+            title: confirm_title,
             message,
             danger: true,
             loading: submitting,
-            confirm_label: "确认删除".to_string(),
+            confirm_label: t.channels_confirm_delete_btn.to_string(),
             on_confirm,
             on_cancel,
         }
+        if let Some(err) = form_error.as_ref() {
+            p { class: "ains-form-error", "{err}" }
+        }
+    }
+}
+
+fn resolve_channel_tenant_id(
+    actor_is_system: bool,
+    actor_tenant_id: &str,
+    form_tenant_id: &str,
+) -> Option<String> {
+    if !actor_is_system {
+        return None;
+    }
+    let tid = form_tenant_id.trim();
+    if tid.is_empty() {
+        Some(actor_tenant_id.to_string())
+    } else {
+        Some(tid.to_string())
     }
 }
 
@@ -896,145 +822,199 @@ fn render_form_modal(
     kind: ModalKind,
     form_error: Option<String>,
     submitting: bool,
-    editing: Option<UserResponse>,
-    signals: UsersSignals,
+    editing: Option<ChannelResponse>,
+    mut signals: ChannelsSignals,
     client: client_api::Client,
     log_bus: LogBus,
     auth: AuthState,
     nav: Navigator,
-    current_role: String,
     actor_is_system: bool,
+    actor_tenant_id: String,
     available_tenants: Signal<Vec<TenantResponse>>,
 ) -> Element {
-    let title_str = if kind == ModalKind::Create {
-        t.users_modal_create_title
+    let is_create = kind == ModalKind::Create;
+    let title_str = if is_create {
+        t.channels_modal_create_title
     } else {
-        t.users_modal_edit_title
+        t.channels_modal_edit_title
     };
-    let password_required = kind == ModalKind::Create;
-    let submit_label = if kind == ModalKind::Create {
-        t.users_modal_create_submit
+    let submit_label = if is_create {
+        t.channels_modal_create_submit
     } else {
-        t.users_modal_edit_submit
-    };
-    let password_placeholder_str = if kind == ModalKind::Create {
-        t.users_form_password_placeholder_create
-    } else {
-        t.users_form_password_placeholder_edit
+        t.channels_modal_edit_submit
     };
 
-    // Extract all t.* values to owned strings before closures to avoid lifetime issues
-    let sys_editable = t.users_system_editable.to_string();
-    let name_empty = t.users_name_empty.to_string();
-    let email_empty = t.users_email_empty.to_string();
-    let password_empty = t.users_password_empty.to_string();
-    let no_target_id = t.users_modal_no_target_id.to_string();
-    let form_name_label = t.users_form_name_label.to_string();
-    let form_name_placeholder = t.users_form_name_placeholder.to_string();
-    let form_email_label = t.users_form_email_label.to_string();
-    let form_email_placeholder = t.users_form_email_placeholder.to_string();
-    let form_password_label = t.users_form_password_label.to_string();
-    let form_password_hint = t.users_form_password_hint.to_string();
-    let role_label = t.users_form_role_label.to_string();
-    let role_admin = t.users_form_role_admin.to_string();
-    let role_user = t.users_form_role_user.to_string();
-    let initial_role_label = t.users_form_initial_role_label.to_string();
-    let tenant_id_label = t.users_form_tenant_id_label.to_string();
-    let balance_section_label = t.users_balance_section_label.to_string();
-    let balance_current_label = t.users_balance_current_label.to_string();
-    let balance_input_label = t.users_balance_input_label.to_string();
-    let balance_input_placeholder = t.users_balance_input_placeholder.to_string();
-    let balance_increase = t.users_balance_increase_btn.to_string();
-    let balance_decrease = t.users_balance_decrease_btn.to_string();
+    // Pre-extract all translations to owned Strings
+    let name_empty = t.channels_name_empty.to_string();
+    let base_url_empty = t.channels_base_url_empty.to_string();
+    let api_key_empty = t.channels_api_key_empty.to_string();
+    let models_empty = t.channels_models_empty.to_string();
+    let capabilities_empty = t.channels_capabilities_empty.to_string();
+    let no_target_id = t.channels_modal_no_target_id.to_string();
+    let form_name_label = t.channels_form_name_label.to_string();
+    let form_name_placeholder = t.channels_form_name_placeholder.to_string();
+    let form_protocol_label = t.channels_form_protocol_label.to_string();
+    let form_protocol_openai = t.channels_form_protocol_openai.to_string();
+    let form_protocol_anthropic = t.channels_form_protocol_anthropic.to_string();
+    let form_base_url_label = t.channels_form_base_url_label.to_string();
+    let form_base_url_placeholder = t.channels_form_base_url_placeholder.to_string();
+    let form_api_key_label = t.channels_form_api_key_label.to_string();
+    let form_api_key_placeholder = t.channels_form_api_key_placeholder.to_string();
+    let form_models_label = t.channels_form_models_label.to_string();
+    let form_models_placeholder = t.channels_form_models_placeholder.to_string();
+    let form_capabilities_label = t.channels_form_capabilities_label.to_string();
+    let form_weight_label = t.channels_form_weight_label.to_string();
+    let weight_invalid = t.channels_weight_invalid.to_string();
+    let form_is_active_label = t.channels_form_is_active_label.to_string();
+    let form_tenant_id_label = t.channels_form_tenant_id_label.to_string();
+    let form_api_key_hint = if is_create {
+        t.channels_form_api_key_hint_create.to_string()
+    } else {
+        t.channels_form_api_key_hint_edit.to_string()
+    };
 
     let on_close = move |_: MouseEvent| close_all(signals);
-    let mut signals_for_role = signals;
-    let pick_admin = move |_: MouseEvent| signals_for_role.form_role.set("admin".to_string());
-    let pick_user = move |_: MouseEvent| signals_for_role.form_role.set("user".to_string());
+
+    // Protocol toggle
+    let mut sig_proto = signals;
+    let pick_openai = move |_: MouseEvent| sig_proto.form_protocol.set("openai".to_string());
+    let pick_anthropic = move |_: MouseEvent| sig_proto.form_protocol.set("anthropic".to_string());
 
     let editing_for_submit = editing.clone();
     let mut signals_for_submit = signals;
-    // Admin 不能修改 role，clone 一份供闭包使用（current_role 在之后 JSX 中还有引用）
-    let current_role_for_submit = current_role.clone();
-    // Clone auth and client before on_submit moves them; originals used by balance adjustment closures
     let auth_for_submit = auth.clone();
     let client_for_submit = client.clone();
-    let current_lang = use_context::<I18nContext>().lang();
+    let actor_tenant_id_for_submit = actor_tenant_id.clone();
     let on_submit = move |_: MouseEvent| {
-        // 防止快速双击触发两次 spawn
         if *signals_for_submit.submitting.read() {
             return;
         }
         let name = signals_for_submit.form_name.cloned();
-        let email = signals_for_submit.form_email.cloned().to_lowercase();
-        let password = signals_for_submit.form_password.cloned();
-        let role = signals_for_submit.form_role.cloned();
+        let protocol = signals_for_submit.form_protocol.cloned();
+        let base_url = signals_for_submit.form_base_url.cloned();
+        let api_key = signals_for_submit.form_api_key.cloned();
+        let models_str = signals_for_submit.form_models.cloned();
+        let capabilities = signals_for_submit.form_capabilities.cloned();
+        let weight_str = signals_for_submit.form_weight.cloned();
+        let is_active = *signals_for_submit.form_is_active.read();
         let tenant_id = signals_for_submit.form_tenant_id.cloned();
-        let editing_id = editing_for_submit.as_ref().map(|u| u.id.clone());
+        let editing_id = editing_for_submit.as_ref().map(|c| c.id.clone());
         let kind_now = kind;
-        // 防御性检查：系统用户不可编辑（后端同样保护，UI 按钮已隐藏）
-        if kind_now == ModalKind::Edit
-            && editing_for_submit
-                .as_ref()
-                .map(|u| u.role == "system")
-                .unwrap_or(false)
-        {
-            signals_for_submit
-                .form_error
-                .set(Some(sys_editable.clone()));
-            return;
-        }
-        // 同步校验：避免空字段浪费网络请求（Create 与 Edit 模式均需校验 name/email）
+
+        // Validation
         if name.trim().is_empty() {
             signals_for_submit.form_error.set(Some(name_empty.clone()));
             return;
         }
-        if email.trim().is_empty() {
-            signals_for_submit.form_error.set(Some(email_empty.clone()));
-            return;
-        }
-        if kind_now == ModalKind::Create && password.is_empty() {
+        if base_url.trim().is_empty() {
             signals_for_submit
                 .form_error
-                .set(Some(password_empty.clone()));
+                .set(Some(base_url_empty.clone()));
             return;
         }
+        if is_create && api_key.trim().is_empty() {
+            signals_for_submit
+                .form_error
+                .set(Some(api_key_empty.clone()));
+            return;
+        }
+        if models_str.trim().is_empty() {
+            signals_for_submit
+                .form_error
+                .set(Some(models_empty.clone()));
+            return;
+        }
+        if capabilities.is_empty() {
+            signals_for_submit
+                .form_error
+                .set(Some(capabilities_empty.clone()));
+            return;
+        }
+        let weight: i32 = match weight_str.parse() {
+            Ok(v) if v >= 1 => v,
+            Ok(_) => {
+                signals_for_submit.form_error.set(Some(format!(
+                    "{}: weight '{}' must be at least 1",
+                    weight_invalid, weight_str
+                )));
+                return;
+            }
+            Err(_) => {
+                let hint = if let Ok(v) = weight_str.trim().parse::<i64>() {
+                    if v < 0 {
+                        format!(
+                            "negative values are not allowed, got '{}'",
+                            weight_str.trim()
+                        )
+                    } else {
+                        format!(
+                            "value '{}' is too large (max {})",
+                            weight_str.trim(),
+                            i32::MAX
+                        )
+                    }
+                } else {
+                    format!("got '{}'", weight_str)
+                };
+                signals_for_submit
+                    .form_error
+                    .set(Some(format!("{}: {}", weight_invalid, hint)));
+                return;
+            }
+        };
+        let models: Vec<String> = {
+            let mut seen = std::collections::HashSet::new();
+            models_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty() && seen.insert(s.clone()))
+                .collect()
+        };
+
         let client_async = client_for_submit.clone();
         let bus_async = log_bus;
         let mut s_async = signals_for_submit;
         let auth_async = auth_for_submit.clone();
         let no_target_id_async = no_target_id.clone();
+        let lang = use_context::<I18nContext>().lang();
         signals_for_submit.submitting.set(true);
         signals_for_submit.form_error.set(None);
-        // Admin 不能修改 role，不发送该字段；仅 system 可以
-        // 在 spawn 外部计算布尔值以避免 String 被移入 async move 块
-        let actor_is_sys = current_role_for_submit == "system";
+        // Clone before spawn to avoid consuming actor_tenant_id_for_submit, which would
+        // make the outer on_submit closure FnOnce (disallowed by Button's FnMut onclick).
+        let tenant_id_for_spawn = actor_tenant_id_for_submit.clone();
         spawn(async move {
             let res = match kind_now {
                 ModalKind::Create => {
-                    let create_role = if actor_is_sys {
-                        Some(role.clone())
-                    } else {
-                        None
+                    let input = client_api::CreateChannelRequest {
+                        name,
+                        protocol_type: protocol,
+                        models,
+                        capabilities,
+                        api_key,
+                        base_url,
+                        weight,
+                        is_active,
+                        // 在异步闭包中重新读取 auth 状态，而非依赖外部捕获的 actor_is_system，
+                        // 以防角色在表单填写期间发生变化（防御深度）。
+                        tenant_id: {
+                            let is_still_system = auth_async
+                                .user
+                                .read()
+                                .as_ref()
+                                .map(|u| u.is_system())
+                                .unwrap_or(false);
+                            resolve_channel_tenant_id(
+                                is_still_system,
+                                &tenant_id_for_spawn,
+                                &tenant_id,
+                            )
+                        },
                     };
-                    // 租户仅对 system 生效；空串传 None，由服务端默认归入默认租户。
-                    let create_tenant_id = if actor_is_sys {
-                        let tid = tenant_id.trim();
-                        if tid.is_empty() {
-                            None
-                        } else {
-                            Some(tid.to_string())
-                        }
-                    } else {
-                        None
-                    };
-                    let r = client_async
-                        .create_user(&email, &password, &name, create_role, create_tenant_id)
-                        .await;
+                    let r = client_async.create_channel(input).await;
                     if r.is_ok() {
-                        push_log_ok(bus_async, HttpMethod::Post, "/api/users");
+                        push_log_ok(bus_async, HttpMethod::Post, "/api/channels");
                     }
-                    r.map(|_| ())
+                    r
                 }
                 ModalKind::Edit => {
                     let Some(ref id) = editing_id else {
@@ -1042,52 +1022,49 @@ fn render_form_modal(
                         s_async.submitting.set(false);
                         return;
                     };
-                    let edit_role = if actor_is_sys {
-                        Some(role.clone())
-                    } else {
-                        None
-                    };
-                    // 租户变更仅对 system 生效；空串传 None（不变更归属）。
-                    let edit_tenant_id = if actor_is_sys {
-                        let tid = tenant_id.trim();
-                        if tid.is_empty() {
+                    let input = client_api::UpdateChannelRequest {
+                        name: Some(name),
+                        protocol_type: Some(protocol),
+                        models: Some(models),
+                        capabilities: Some(capabilities),
+                        api_key: if api_key.trim().is_empty() {
                             None
                         } else {
-                            Some(tid.to_string())
-                        }
-                    } else {
-                        None
+                            Some(api_key)
+                        },
+                        base_url: Some(base_url),
+                        is_active: Some(is_active),
+                        weight: Some(weight),
+                        // 与 Create 路径保持一致：在异步闭包中重新读取 auth 状态，
+                        // 而非依赖外部捕获的 actor_is_system，以防角色在表单填写
+                        // 期间发生变化（防御深度）。
+                        tenant_id: {
+                            let is_still_system = auth_async
+                                .user
+                                .read()
+                                .as_ref()
+                                .map(|u| u.is_system())
+                                .unwrap_or(false);
+                            if is_still_system {
+                                Some(tenant_id)
+                            } else {
+                                None
+                            }
+                        },
                     };
-                    let r = client_async
-                        .update_user(
-                            id.clone(),
-                            Some(email.clone()),
-                            Some(name.clone()),
-                            edit_role,
-                            edit_tenant_id,
-                        )
-                        .await;
+                    let r = client_async.update_channel(id, input).await;
                     if r.is_ok() {
-                        push_log_ok(bus_async, HttpMethod::Put, &format!("/api/users/{}", id));
+                        push_log_ok(bus_async, HttpMethod::Put, &format!("/api/channels/{}", id));
                     }
-                    r.map(|_| ())
+                    r
                 }
                 _ => unreachable!(),
             };
             s_async.submitting.set(false);
             match res {
                 Ok(_) => {
-                    // 仅当模态框类型未变更时才关闭，避免旧异步任务关闭新打开的模态框。
                     if *s_async.modal_kind.read() == kind_now {
-                        s_async.modal_kind.set(ModalKind::None);
-                        s_async.editing_user.set(None);
-                        s_async.form_name.set(String::new());
-                        s_async.form_email.set(String::new());
-                        s_async.form_password.set(String::new());
-                        s_async.form_role.set("user".to_string());
-                        s_async.form_tenant_id.set(String::new());
-                        s_async.tenant_dropdown_open.set(false);
-                        s_async.form_error.set(None);
+                        close_all(s_async);
                     }
                     s_async.list_version.with_mut(|v| *v += 1);
                 }
@@ -1095,66 +1072,38 @@ fn render_form_modal(
                     if crate::api::handle_unauth(&err, auth_async, nav, bus_async).await {
                         return;
                     }
-                    // 根据操作类型重建日志路径，避免在 inner match 中提前写日志导致双 toast
                     let log_method = if kind_now == ModalKind::Create {
                         HttpMethod::Post
                     } else {
                         HttpMethod::Put
                     };
                     let log_path = if kind_now == ModalKind::Create {
-                        "/api/users".to_string()
+                        "/api/channels".to_string()
                     } else {
-                        format!("/api/users/{}", editing_id.unwrap_or_default())
+                        format!("/api/channels/{}", editing_id.unwrap_or_default())
                     };
                     push_log_err(bus_async, log_method, &log_path, &err);
                     s_async.form_error.set(Some(humanize_error(
                         &err,
-                        ErrorContext::UserManagement,
-                        current_lang,
+                        ErrorContext::ChannelManagement,
+                        lang,
                     )));
                 }
             }
         });
     };
 
-    let role_now = signals.form_role.cloned();
-
-    // Balance adjustment: visible in Edit mode when the actor has permission
-    let can_adjust = editing
-        .as_ref()
-        .map(|u| {
-            (current_role == "system" && u.role != "system")
-                || (current_role == "admin" && u.role == "user")
-        })
-        .unwrap_or(false);
-
-    let on_increase = make_adjust_handler(AdjustHandlerParams {
-        signals,
-        client: client.clone(),
-        log_bus,
-        auth: auth.clone(),
-        nav,
-        multiplier: 1,
-        t,
-        lang: current_lang,
-    });
-    let on_decrease = make_adjust_handler(AdjustHandlerParams {
-        signals,
-        client: client.clone(),
-        log_bus,
-        auth: auth.clone(),
-        nav,
-        multiplier: -1,
-        t,
-        lang: current_lang,
-    });
-
-    // 自定义租户下拉（仅 Create + system）：展开态与当前选中项标题。
+    let protocol_now = signals.form_protocol.cloned();
+    let capabilities_now = signals.form_capabilities.cloned();
+    let is_active_now = *signals.form_is_active.read();
     let tenants_snapshot = available_tenants.cloned();
     let active_tenants: Vec<&TenantResponse> = tenants_snapshot
         .iter()
         .filter(|t| t.status == "active")
         .collect();
+
+    // 自定义租户下拉的展开态与当前选中项标题（从全量租户中解析，
+    // 确保即使当前租户已禁用也能在触发器上显示名称）。
     let tenant_dropdown_open = *signals.tenant_dropdown_open.read();
     let selected_tenant_id = signals.form_tenant_id.read().clone();
     let selected_tenant_label = tenants_snapshot
@@ -1235,71 +1184,129 @@ fn render_form_modal(
                     disabled: submitting,
                     name: Some("name".to_string()),
                 }
+
+                // Protocol Type
+                div { class: "ains-form-field",
+                    label { class: "ains-form-label", "{form_protocol_label}" }
+                    div { class: "ains-form-pill-group",
+                        button {
+                            r#type: "button",
+                            class: if protocol_now == "openai" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
+                            onclick: pick_openai,
+                            "{form_protocol_openai}"
+                        }
+                        button {
+                            r#type: "button",
+                            class: if protocol_now == "anthropic" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
+                            onclick: pick_anthropic,
+                            "{form_protocol_anthropic}"
+                        }
+                    }
+                }
+
                 TextInput {
-                    label: form_email_label.clone(),
-                    placeholder: Some(form_email_placeholder.clone()),
-                    value: signals.form_email,
-                    input_type: InputType::Email,
+                    label: form_base_url_label.clone(),
+                    placeholder: Some(form_base_url_placeholder.clone()),
+                    value: signals.form_base_url,
                     required: true,
                     disabled: submitting,
-                    name: Some("email".to_string()),
+                    name: Some("base_url".to_string()),
                 }
-                if kind == ModalKind::Create {
-                    TextInput {
-                        label: form_password_label.clone(),
-                        placeholder: Some(password_placeholder_str.to_string()),
-                        value: signals.form_password,
-                        input_type: InputType::Password,
-                        required: password_required,
-                        disabled: submitting,
-                        name: Some("password".to_string()),
-                        hint: Some(form_password_hint.clone()),
-                    }
+
+                TextInput {
+                    label: form_api_key_label.clone(),
+                    placeholder: Some(form_api_key_placeholder.clone()),
+                    value: signals.form_api_key,
+                    input_type: InputType::Password,
+                    required: is_create,
+                    disabled: submitting,
+                    name: Some("api_key".to_string()),
+                    hint: Some(form_api_key_hint.clone()),
                 }
-                if kind == ModalKind::Edit && current_role == "system" {
-                    div { class: "ains-form-field",
-                        label { class: "ains-form-label", "{role_label}" }
-                        div { class: "ains-form-pill-group",
-                            button {
-                                r#type: "button",
-                                class: if role_now == "admin" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
-                                onclick: pick_admin,
-                                "{role_admin}"
-                            }
-                            button {
-                                r#type: "button",
-                                class: if role_now == "user" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
-                                onclick: pick_user,
-                                "{role_user}"
+
+                TextInput {
+                    label: form_models_label.clone(),
+                    placeholder: Some(form_models_placeholder.clone()),
+                    value: signals.form_models,
+                    required: true,
+                    disabled: submitting,
+                    name: Some("models".to_string()),
+                    hint: None,
+                }
+
+                // Capabilities multi-select
+                div { class: "ains-form-field",
+                    label { class: "ains-form-label", "{form_capabilities_label}" }
+                    div { class: "ains-form-pill-group",
+                        for (cap_value , cap_label) in ALL_CAPABILITIES.iter() {
+                            {
+                                let cap_val = cap_value.to_string();
+                                let is_selected =
+                                    capabilities_now.contains(&cap_val);
+                                let class = if is_selected {
+                                    "ains-form-pill ains-form-pill--active"
+                                } else {
+                                    "ains-form-pill"
+                                };
+                                let cap_for_toggle = cap_val.clone();
+                                let mut sig_toggle = signals;
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        class,
+                                        onclick: move |_: MouseEvent| {
+                                            let c = cap_for_toggle.clone();
+                                            sig_toggle
+                                                .form_capabilities
+                                                .with_mut(|caps| {
+                                                    if let Some(pos) = caps.iter().position(|x| x == &c) {
+                                                        caps.remove(pos);
+                                                    } else {
+                                                        caps.push(c);
+                                                    }
+                                                });
+                                        },
+                                        "{cap_label}"
+                                    }
+                                }
                             }
                         }
                     }
                 }
-                // 创建模式：仅 system 角色可设置初始角色
-                if kind == ModalKind::Create && current_role == "system" {
+
+                TextInput {
+                    label: form_weight_label.clone(),
+                    placeholder: Some("1".to_string()),
+                    value: signals.form_weight,
+                    input_type: InputType::Text,
+                    required: false,
+                    disabled: submitting,
+                    name: Some("weight".to_string()),
+                    hint: None,
+                }
+
+                // is_active checkbox (Edit only; Create defaults to true)
+                if !is_create {
                     div { class: "ains-form-field",
-                        label { class: "ains-form-label", "{initial_role_label}" }
-                        div { class: "ains-form-pill-group",
-                            button {
-                                r#type: "button",
-                                class: if role_now == "admin" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
-                                onclick: pick_admin,
-                                "{role_admin}"
+                        label { class: "ains-form-checkbox-label",
+                            input {
+                                r#type: "checkbox",
+                                checked: is_active_now,
+                                disabled: submitting,
+                                onchange: move |evt| {
+                                    signals.form_is_active.set(evt.checked());
+                                },
                             }
-                            button {
-                                r#type: "button",
-                                class: if role_now == "user" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
-                                onclick: pick_user,
-                                "{role_user}"
-                            }
+                            span { "{form_is_active_label}" }
                         }
                     }
                 }
-                // 仅 system 角色可选择/变更所属租户（创建与编辑均可）——自绘下拉，
-                // 触发器与弹层均与 Modal 内其它字段对齐；选项仅展示租户 ID 前 8 位。
+
+                // Tenant 下拉选择（system only）——自绘下拉，触发器与弹层均与
+                // Modal 内其它字段对齐；选项仅展示租户 ID 前 8 位。
                 if actor_is_system {
                     div { class: "ains-input",
-                        label { class: "ains-input__label", "{tenant_id_label}" }
+                        label { class: "ains-input__label", "{form_tenant_id_label}" }
                         div {
                             class: if tenant_dropdown_open { "ains-select ains-select--open" } else { "ains-select" },
                             // 阻止下拉内部（触发器/弹层/选项）的点击冒泡到外层关闭逻辑，
@@ -1352,6 +1359,7 @@ fn render_form_modal(
                         }
                     }
                 }
+
                 Button {
                     button_type: ButtonType::Submit,
                     full_width: true,
@@ -1360,43 +1368,6 @@ fn render_form_modal(
                     onclick: on_submit,
                     "{submit_label}"
                 }
-                // 余额调整：编辑模式且当前用户有权限时显示
-                if kind == ModalKind::Edit && can_adjust {
-                    if let Some(u) = editing.as_ref() {
-                        div { class: "ains-form-field",
-                            hr {}
-                            div { class: "ains-form-label", "{balance_section_label}" }
-                            p { class: "ains-form-description",
-                                "{balance_current_label}"
-                                strong { "{format_balance(u.balance)}" }
-                            }
-                            TextInput {
-                                label: balance_input_label.clone(),
-                                placeholder: Some(balance_input_placeholder.clone()),
-                                value: signals.form_balance,
-                                input_type: InputType::Text,
-                                required: false,
-                                disabled: submitting,
-                            }
-                            div { class: "ains-form-pill-group",
-                                button {
-                                    class: "ains-btn ains-btn--primary ains-btn--pill",
-                                    r#type: "button",
-                                    disabled: submitting,
-                                    onclick: on_increase,
-                                    "{balance_increase}"
-                                }
-                                button {
-                                    class: "ains-btn ains-btn--primary ains-btn--pill",
-                                    r#type: "button",
-                                    disabled: submitting,
-                                    onclick: on_decrease,
-                                    "{balance_decrease}"
-                                }
-                            }
-                        }
-                    }
-                }
             }
         }
     }
@@ -1404,24 +1375,72 @@ fn render_form_modal(
 
 fn build_columns(t: &'static Translations) -> Vec<Column> {
     vec![
-        Column::new(t.users_column_name).align(Align::Left),
-        Column::new(t.users_column_tenant)
+        Column::new(t.channels_column_name).align(Align::Left),
+        Column::new(t.channels_column_tenant)
             .width("w-40")
             .align(Align::Left),
-        Column::new(t.users_column_email).align(Align::Left),
-        Column::new(t.users_column_role).align(Align::Left),
-        Column::new(t.users_column_balance)
+        Column::new(t.channels_column_protocol)
             .width("w-24")
-            .align(Align::Right),
-        Column::new(t.users_column_created)
-            .width("w-40")
+            .align(Align::Center),
+        Column::new(t.channels_column_base_url)
+            .width("w-48")
             .align(Align::Left),
-        Column::new(t.users_column_actions)
-            .width("w-44")
+        Column::new(t.channels_column_status)
+            .width("w-20")
+            .align(Align::Center),
+        Column::new(t.channels_column_weight)
+            .width("w-16")
+            .align(Align::Right),
+        Column::new(t.channels_column_capabilities)
+            .width("w-48")
+            .align(Align::Left),
+        Column::new(t.channels_column_created)
+            .width("w-36")
+            .align(Align::Left),
+        Column::new(t.channels_column_actions)
+            .width("w-36")
             .align(Align::Center),
     ]
 }
 
 fn format_dt(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_tenant_id_non_system_returns_none() {
+        assert_eq!(
+            resolve_channel_tenant_id(false, "default", "tenant-x"),
+            None
+        );
+        assert_eq!(resolve_channel_tenant_id(false, "", ""), None);
+    }
+
+    #[test]
+    fn resolve_tenant_id_system_uses_form_value() {
+        assert_eq!(
+            resolve_channel_tenant_id(true, "system-tenant", "target-tenant"),
+            Some("target-tenant".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_tenant_id_system_empty_form_uses_actor_tenant() {
+        assert_eq!(
+            resolve_channel_tenant_id(true, "system-tenant", ""),
+            Some("system-tenant".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_tenant_id_trims_form_value() {
+        assert_eq!(
+            resolve_channel_tenant_id(true, "default", "  tenant-x  "),
+            Some("tenant-x".to_string())
+        );
+    }
 }

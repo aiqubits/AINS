@@ -31,14 +31,18 @@ pub fn AppShellLayout() -> Element {
 
     let route = use_route::<Route>();
     let active_nav = match route {
+        Route::PersonalCenter {} => NavKey::PersonalCenter,
         Route::Dashboard {} => NavKey::Dashboard,
         Route::Users {} => NavKey::Users,
-        // Settings 在本布局内但没有专用 NavKey，沿用 Dashboard 高亮。
-        Route::Settings {} => NavKey::Dashboard,
-        // 通配臂——此布局仅包裹 Dashboard / Settings / Users（见 main.rs 路由定义），
+        Route::Tenants {} => NavKey::Tenants,
+        Route::Channels {} => NavKey::Channels,
+        Route::Metering {} => NavKey::Metering,
+        // Settings 在本布局内但没有专用 NavKey，沿用个人中心高亮。
+        Route::Settings {} => NavKey::PersonalCenter,
+        // 通配臂——此布局仅包裹 PersonalCenter / Dashboard / Settings / Users / Tenants / Channels / Metering（见 main.rs 路由定义），
         // 其他 Route 变体不应到达本布局。若未来新增路由加入此布局，
         // 编译器不会警告，需手动在此处补充分支。
-        _ => NavKey::Dashboard,
+        _ => NavKey::PersonalCenter,
     };
 
     // 从 AuthState 派生展示用身份信息
@@ -67,8 +71,12 @@ pub fn AppShellLayout() -> Element {
                     show_admin_modules: is_admin,
                     on_select: move |key| {
                         let target = match key {
+                            NavKey::PersonalCenter => Route::PersonalCenter {},
                             NavKey::Dashboard => Route::Dashboard {},
                             NavKey::Users => Route::Users {},
+                            NavKey::Tenants => Route::Tenants {},
+                            NavKey::Channels => Route::Channels {},
+                            NavKey::Metering => Route::Metering {},
                         };
                         sidebar_open.set(false);
                         nav.push(target);

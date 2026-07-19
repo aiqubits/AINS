@@ -9,11 +9,11 @@ pub fn Badge(
     #[props(default = BadgeVariant::User)] variant: BadgeVariant,
 ) -> Element {
     let class = match variant {
-        BadgeVariant::Success => "ws-badge ws-badge--success",
-        BadgeVariant::Warning => "ws-badge ws-badge--warning",
-        BadgeVariant::Admin => "ws-badge ws-badge--admin",
-        BadgeVariant::User => "ws-badge ws-badge--user",
-        BadgeVariant::AmberCompact => "ws-badge ws-badge--amber-compact",
+        BadgeVariant::Success => "ains-badge ains-badge--success",
+        BadgeVariant::Warning => "ains-badge ains-badge--warning",
+        BadgeVariant::Admin => "ains-badge ains-badge--admin",
+        BadgeVariant::User => "ains-badge ains-badge--user",
+        BadgeVariant::AmberCompact => "ains-badge ains-badge--amber-compact",
     };
 
     rsx! {

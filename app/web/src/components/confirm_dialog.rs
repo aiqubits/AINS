@@ -63,9 +63,9 @@ pub fn ConfirmDialog(
     };
 
     let confirm_class = if danger {
-        "ws-btn ws-btn--danger"
+        "ains-btn ains-btn--danger"
     } else {
-        "ws-btn ws-btn--primary"
+        "ains-btn ains-btn--primary"
     };
 
     rsx! {
@@ -76,17 +76,17 @@ pub fn ConfirmDialog(
         }
 
         if open {
-            div { class: "ws-confirm-dialog",
+            div { class: "ains-confirm-dialog",
                 Modal {
                     title,
                     on_close: move |e| on_cancel.call(e),
                     disable_backdrop,
 
-                    p { class: "ws-confirm-dialog__msg", "{message}" }
+                    p { class: "ains-confirm-dialog__msg", "{message}" }
 
-                    div { class: "ws-confirm-dialog__actions",
+                    div { class: "ains-confirm-dialog__actions",
                         button {
-                            class: "ws-btn ws-btn--secondary",
+                            class: "ains-btn ains-btn--secondary",
                             r#type: "button",
                             onclick: move |e| on_cancel.call(e),
                             "{cancel_text}"
@@ -101,7 +101,7 @@ pub fn ConfirmDialog(
                                 }
                             },
                             if loading {
-                                LoaderCircle { class: "ws-btn__spinner" }
+                                LoaderCircle { class: "ains-btn__spinner" }
                             }
                             "{confirm_text}"
                         }

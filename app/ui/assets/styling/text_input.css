@@ -1,12 +1,12 @@
 /* TextInput —— 标准变体 + Modal 紧凑变体 */
-.ws-input {
+.ains-input {
   display: flex;
   flex-direction: column;
   width: 100%;
   position: relative;
 }
 
-.ws-input__label {
+.ains-input__label {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 700;
@@ -17,7 +17,7 @@
   margin-bottom: 6px;
 }
 
-.ws-input__field {
+.ains-input__field {
   font-family: var(--font-family);
   font-size: 12px;
   font-weight: 400;
@@ -32,40 +32,40 @@
   width: 100%;
 }
 
-.ws-input__field::placeholder {
+.ains-input__field::placeholder {
   color: var(--color-text-muted);
 }
 
-.ws-input__field:hover:not(:disabled) {
+.ains-input__field:hover:not(:disabled) {
   border-color: var(--color-text-muted-soft);
 }
 
-.ws-input__field:focus,
-.ws-input__field:focus-visible {
+.ains-input__field:focus,
+.ains-input__field:focus-visible {
   border-color: var(--color-brand-indigo-light);
   background: #ffffff;
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
 }
 
-.ws-input__field:disabled {
+.ains-input__field:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
 
 /* Modal 紧凑变体：白底 + 实色边框 + 紧凑内边距 */
-.ws-input__field--dense {
+.ains-input__field--dense {
   background: #ffffff;
   border: 1px solid var(--color-border-default);
   padding: 8px 12px;
 }
 
-.ws-input__field--dense:focus {
+.ains-input__field--dense:focus {
   background: #ffffff;
   border-color: var(--color-brand-indigo-light);
   box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
 }
 
-.ws-input__hint {
+.ains-input__hint {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 500;
@@ -74,7 +74,7 @@
   margin: 6px 0 0 0;
 }
 
-.ws-input__error {
+.ains-input__error {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 500;
@@ -85,29 +85,29 @@
 
 /* 移动端：增大输入框触控区域 */
 @media (max-width: 640px) {
-  .ws-input__field {
+  .ains-input__field {
     padding: 14px 16px;
     font-size: 16px;
   }
 
-  .ws-input__label {
+  .ains-input__label {
     font-size: 12px;
     margin-bottom: 8px;
   }
 }
 
 /* ── 密码可见性切换图标 ── */
-.ws-input__field-wrapper {
+.ains-input__field-wrapper {
   position: relative;
   display: flex;
   align-items: stretch;
 }
 
-.ws-input__field--pw {
+.ains-input__field--pw {
   padding-right: 42px;
 }
 
-.ws-input__toggle-pw {
+.ains-input__toggle-pw {
   position: absolute;
   right: 8px;
   top: 50%;
@@ -127,16 +127,16 @@
   z-index: 1;
 }
 
-.ws-input__toggle-pw:hover {
+.ains-input__toggle-pw:hover {
   color: var(--color-text-secondary);
   background: rgba(0, 0, 0, 0.04);
 }
 
-.ws-input__toggle-pw:active {
+.ains-input__toggle-pw:active {
   background: rgba(0, 0, 0, 0.08);
 }
 
-.ws-input__toggle-pw svg {
+.ains-input__toggle-pw svg {
   width: 18px;
   height: 18px;
 }

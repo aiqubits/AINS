@@ -1,5 +1,5 @@
 /* Sidebar —— 256px 玻璃侧边栏 */
-.ws-sidebar {
+.ains-sidebar {
   position: fixed;
   top: 0;
   left: 0;
@@ -16,19 +16,19 @@
   transform: translateX(-100%);
 }
 
-.ws-sidebar--open {
+.ains-sidebar--open {
   transform: translateX(0);
 }
 
 /* 桌面端常驻 */
 @media (min-width: 768px) {
-  .ws-sidebar {
+  .ains-sidebar {
     position: static;
     transform: translateX(0);
   }
 }
 
-.ws-sidebar-overlay {
+.ains-sidebar-overlay {
   position: fixed;
   inset: 0;
   background: var(--color-overlay-bg);
@@ -38,13 +38,13 @@
 }
 
 @media (min-width: 768px) {
-  .ws-sidebar-overlay {
+  .ains-sidebar-overlay {
     display: none;
   }
 }
 
 /* Logo 块 */
-.ws-sidebar__logo {
+.ains-sidebar__logo {
   height: 80px;
   padding: 0 24px;
   display: flex;
@@ -54,7 +54,7 @@
   flex-shrink: 0;
 }
 
-.ws-sidebar__logo-icon {
+.ains-sidebar__logo-icon {
   width: 36px;
   height: 36px;
   border-radius: 12px;
@@ -67,19 +67,19 @@
   flex-shrink: 0;
 }
 
-.ws-sidebar__logo-icon svg {
+.ains-sidebar__logo-icon svg {
   width: 16px;
   height: 16px;
 }
 
-.ws-sidebar__logo-text {
+.ains-sidebar__logo-text {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
 }
 
-.ws-sidebar__logo-title {
+.ains-sidebar__logo-title {
   font-family: var(--font-family);
   font-size: 16px;
   font-weight: 700;
@@ -91,7 +91,7 @@
   color: transparent;
 }
 
-.ws-sidebar__logo-subtitle {
+.ains-sidebar__logo-subtitle {
   font-family: var(--font-family);
   font-size: 10px;
   font-weight: 500;
@@ -101,7 +101,7 @@
   color: var(--color-text-muted);
 }
 
-.ws-sidebar__close {
+.ains-sidebar__close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -115,24 +115,24 @@
   flex-shrink: 0;
 }
 
-.ws-sidebar__close svg {
+.ains-sidebar__close svg {
   width: 16px;
   height: 16px;
 }
 
-.ws-sidebar__close:hover {
+.ains-sidebar__close:hover {
   background: var(--color-border-light);
   color: var(--color-text-primary);
 }
 
 @media (min-width: 768px) {
-  .ws-sidebar__close {
+  .ains-sidebar__close {
     display: none;
   }
 }
 
 /* 导航 */
-.ws-sidebar__nav {
+.ains-sidebar__nav {
   flex: 1;
   padding: 16px 12px;
   overflow-y: auto;
@@ -141,13 +141,13 @@
   gap: 16px;
 }
 
-.ws-sidebar__group {
+.ains-sidebar__group {
   display: flex;
   flex-direction: column;
   gap: 4px;
 }
 
-.ws-sidebar__group-caption {
+.ains-sidebar__group-caption {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 700;
@@ -159,12 +159,12 @@
   margin-bottom: 8px;
 }
 
-.ws-sidebar__group-caption-row > .ws-sidebar__group-caption {
+.ains-sidebar__group-caption-row > .ains-sidebar__group-caption {
   padding: 0;
   margin-bottom: 0;
 }
 
-.ws-sidebar__group-caption-row {
+.ains-sidebar__group-caption-row {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -174,7 +174,7 @@
 }
 
 
-.ws-sidebar__item {
+.ains-sidebar__item {
   display: flex;
   align-items: center;
   gap: 12px;
@@ -193,27 +193,27 @@
   transition: var(--ease-nav);
 }
 
-.ws-sidebar__item:hover {
+.ains-sidebar__item:hover {
   background: #f8fafc;
   color: var(--color-text-primary);
 }
 
-.ws-sidebar__item--active {
+.ains-sidebar__item--active {
   background: rgba(238, 242, 255, 0.6);
   color: var(--color-brand-indigo-deep);
 }
 
-.ws-sidebar__item--active:hover {
+.ains-sidebar__item--active:hover {
   background: rgba(238, 242, 255, 0.8);
 }
 
-.ws-sidebar__item svg {
+.ains-sidebar__item svg {
   width: 16px;
   height: 16px;
   flex-shrink: 0;
 }
 
-.ws-sidebar__item-label {
+.ains-sidebar__item-label {
   flex: 1;
   white-space: nowrap;
   overflow: hidden;
@@ -221,7 +221,7 @@
 }
 
 /* Footer */
-.ws-sidebar__footer {
+.ains-sidebar__footer {
   padding: 12px;
   border-top: 1px solid var(--color-border-light);
   display: flex;
@@ -230,7 +230,7 @@
   flex-shrink: 0;
 }
 
-.ws-sidebar__github-card {
+.ains-sidebar__github-card {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -244,24 +244,24 @@
   transition: var(--ease-nav);
 }
 
-.ws-sidebar__github-card:hover {
+.ains-sidebar__github-card:hover {
   border-color: var(--color-accent-indigo-soft-border);
 }
 
-.ws-sidebar__github-icon {
+.ains-sidebar__github-icon {
   width: 18px;
   height: 18px;
   color: var(--color-text-primary);
 }
 
-.ws-sidebar__github-text {
+.ains-sidebar__github-text {
   display: flex;
   flex-direction: column;
   flex: 1;
   min-width: 0;
 }
 
-.ws-sidebar__github-repo {
+.ains-sidebar__github-repo {
   font-family: var(--font-family);
   font-size: 12px;
   font-weight: 600;
@@ -269,7 +269,7 @@
   color: var(--color-text-primary);
 }
 
-.ws-sidebar__github-sub {
+.ains-sidebar__github-sub {
   font-family: var(--font-family);
   font-size: 10px;
   font-weight: 400;
@@ -277,13 +277,13 @@
   color: var(--color-text-muted);
 }
 
-.ws-sidebar__github-arrow {
+.ains-sidebar__github-arrow {
   width: 10px;
   height: 10px;
   color: var(--color-text-muted);
 }
 
-.ws-sidebar__copyright {
+.ains-sidebar__copyright {
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -293,4 +293,9 @@
   font-weight: 400;
   line-height: 14px;
   color: var(--color-text-muted);
+}
+
+/* copyright footer branding */
+.ains-sidebar__copyright div:last-child::after {
+  content: "\41\49\4e\53";
 }

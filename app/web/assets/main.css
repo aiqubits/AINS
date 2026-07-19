@@ -52,7 +52,7 @@ input, textarea, select {
 }
 
 /* Phase 1 view stub — 居中显示图标 + 标题 + 提示文字 */
-.ws-view-placeholder {
+.ains-view-placeholder {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -63,13 +63,13 @@ input, textarea, select {
   color: var(--color-text-tertiary);
 }
 
-.ws-view-placeholder svg {
+.ains-view-placeholder svg {
   width: 56px;
   height: 56px;
   stroke: var(--color-brand-indigo);
 }
 
-.ws-view-placeholder h1 {
+.ains-view-placeholder h1 {
   font-family: var(--font-family);
   font-size: 20px;
   font-weight: 700;
@@ -78,7 +78,7 @@ input, textarea, select {
   margin: 0;
 }
 
-.ws-view-placeholder p {
+.ains-view-placeholder p {
   font-family: var(--font-family);
   font-size: 12px;
   font-weight: 400;
@@ -88,7 +88,7 @@ input, textarea, select {
   margin: 0;
 }
 
-.ws-view-placeholder a {
+.ains-view-placeholder a {
   margin-top: 8px;
   font-family: var(--font-family);
   font-size: 12px;
@@ -97,12 +97,12 @@ input, textarea, select {
   text-decoration: none;
 }
 
-.ws-view-placeholder a:hover {
+.ains-view-placeholder a:hover {
   text-decoration: underline;
 }
 
 /* Auth 视图 —— 让 AuthForm 卡片居中 */
-.ws-auth-view {
+.ains-auth-view {
   flex: 1;
   display: flex;
   align-items: center;
@@ -112,14 +112,14 @@ input, textarea, select {
 }
 
 /* ─── Users 视图 ─────────────────────────────────── */
-.ws-users {
+.ains-users {
   display: flex;
   flex-direction: column;
   gap: 20px;
   width: 100%;
 }
 
-.ws-users__header {
+.ains-users__header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -127,7 +127,7 @@ input, textarea, select {
   flex-wrap: wrap;
 }
 
-.ws-users__title {
+.ains-users__title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 22px;
@@ -137,7 +137,7 @@ input, textarea, select {
   letter-spacing: -0.02em;
 }
 
-.ws-users__subtitle {
+.ains-users__subtitle {
   margin: 4px 0 0;
   font-family: var(--font-family);
   font-size: 12px;
@@ -146,14 +146,14 @@ input, textarea, select {
   color: var(--color-text-muted);
 }
 
-.ws-users__header-actions {
+.ains-users__header-actions {
   display: flex;
   align-items: center;
   gap: 12px;
   flex-wrap: wrap;
 }
 
-.ws-users__guard-pill {
+.ains-users__guard-pill {
   display: inline-flex;
   align-items: center;
   gap: 6px;
@@ -168,7 +168,7 @@ input, textarea, select {
   line-height: 14px;
 }
 
-.ws-users__status {
+.ains-users__status {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -184,14 +184,14 @@ input, textarea, select {
   font-weight: 500;
 }
 
-.ws-users__status--error {
+.ains-users__status--error {
   color: #b91c1c;
   background: rgba(254, 226, 226, 0.5);
   border-color: rgba(252, 165, 165, 0.5);
 }
 
 /* ─── 表格包装器（包含表 + 分页） ──────────── */
-.ws-users__table-wrapper {
+.ains-users__table-wrapper {
   display: flex;
   flex-direction: column;
   overflow-x: auto;
@@ -199,7 +199,7 @@ input, textarea, select {
 }
 
 /* 表格嵌入包装器时：恢复 overflow:hidden 以裁切圆角，由 wrapper 提供滚动 */
-.ws-users__table-wrapper .ws-table {
+.ains-users__table-wrapper .ains-table {
   overflow: hidden;
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
@@ -207,7 +207,7 @@ input, textarea, select {
 }
 
 /* 用户名单元格 —— 悬停显示 Snowflake ID tooltip */
-.ws-table__name-cell {
+.ains-table__name-cell {
   cursor: help;
   text-decoration: underline dotted rgba(148, 163, 184, 0.5) 1px;
   text-underline-offset: 3px;
@@ -220,19 +220,19 @@ input, textarea, select {
   vertical-align: middle;
 }
 
-.ws-table__name-cell:hover {
+.ains-table__name-cell:hover {
   text-decoration-color: var(--color-text-secondary);
 }
 
 /* 移动端：触屏设备无法触发 title tooltip，通过 CSS 显示 Snowflake ID */
 @media (hover: none) and (pointer: coarse) {
-  .ws-table__name-cell {
+  .ains-table__name-cell {
     cursor: default;
     text-decoration: none;
     max-width: 8rem;
   }
 
-  .ws-table__name-cell::after {
+  .ains-table__name-cell::after {
     content: attr(data-id);
     display: block;
     font-family: var(--font-mono);
@@ -246,7 +246,7 @@ input, textarea, select {
 }
 
 /* ─── 分页控件 ──────────────────────────────── */
-.ws-pagination {
+.ains-pagination {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -263,19 +263,19 @@ input, textarea, select {
   color: var(--color-text-muted);
 }
 
-.ws-pagination__info {
+.ains-pagination__info {
   font-weight: 500;
   font-variant-numeric: tabular-nums;
 }
 
-.ws-pagination__controls {
+.ains-pagination__controls {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
 }
 
-.ws-pagination__btn {
+.ains-pagination__btn {
   display: inline-flex;
   align-items: center;
   padding: 5px 12px;
@@ -290,22 +290,22 @@ input, textarea, select {
   transition: all 140ms ease;
 }
 
-.ws-pagination__btn:hover:not(:disabled) {
+.ains-pagination__btn:hover:not(:disabled) {
   background: rgba(99, 102, 241, 0.08);
   border-color: rgba(99, 102, 241, 0.3);
   color: var(--color-text-primary);
 }
 
-.ws-pagination__btn:active:not(:disabled) {
+.ains-pagination__btn:active:not(:disabled) {
   transform: scale(0.97);
 }
 
-.ws-pagination__btn:disabled {
+.ains-pagination__btn:disabled {
   opacity: 0.38;
   cursor: not-allowed;
 }
 
-.ws-pagination__per-page {
+.ains-pagination__per-page {
   display: flex;
   align-items: center;
   gap: 6px;
@@ -314,7 +314,7 @@ input, textarea, select {
   color: var(--color-text-muted);
 }
 
-.ws-pagination__select {
+.ains-pagination__select {
   appearance: none;
   background: rgba(255, 255, 255, 0.8);
   border: 1px solid var(--color-border-subtle);
@@ -331,23 +331,171 @@ input, textarea, select {
   background-position: right 6px center;
 }
 
-.ws-pagination__select:hover {
+.ains-pagination__select:hover {
   border-color: rgba(99, 102, 241, 0.4);
 }
 
-.ws-pagination__select:focus {
+.ains-pagination__select:focus {
   outline: 2px solid rgba(99, 102, 241, 0.4);
   outline-offset: 1px;
 }
 
+/* ─── Modal 内表单下拉框，对齐 ains-input__field--dense ── */
+.ains-form-select {
+  appearance: none;
+  width: 100%;
+  font-family: var(--font-family);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--color-text-primary);
+  background: #ffffff;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  padding: 8px 36px 8px 12px;
+  cursor: pointer;
+  outline: none;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath fill='%2394a3b8' d='M1 2l5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+
+.ains-form-select:hover:not(:disabled) {
+  border-color: var(--color-text-muted-soft);
+}
+
+.ains-form-select:focus,
+.ains-form-select:focus-visible {
+  border-color: var(--color-brand-indigo-light);
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.ains-form-select:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+/* ─── 自定义下拉（Modal 内，替代原生 select 的弹层，样式与 Modal 完全对齐）─ */
+.ains-select {
+  position: relative;
+  width: 100%;
+}
+
+/* 触发器：与 ains-form-select / ains-input__field--dense 像素对齐 */
+.ains-select__trigger {
+  appearance: none;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--font-family);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--color-text-primary);
+  background: #ffffff;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  padding: 8px 12px;
+  cursor: pointer;
+  outline: none;
+  text-align: left;
+  transition: border-color 0.15s ease, background-color 0.15s ease;
+}
+
+.ains-select__trigger:hover:not(:disabled) {
+  border-color: var(--color-text-muted-soft);
+}
+
+.ains-select__trigger:focus-visible,
+.ains-select--open .ains-select__trigger {
+  border-color: var(--color-brand-indigo-light);
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.ains-select__trigger:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ains-select__value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ains-select__chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+  color: var(--color-text-muted);
+  transition: transform 0.15s ease;
+}
+
+.ains-select--open .ains-select__chevron {
+  transform: rotate(180deg);
+}
+
+/* 弹层：向上展开（drop-up）——绝对定位于触发器上方，
+   白底圆角 + 柔和阴影（阴影朝上），长列表内部滚动 */
+.ains-select__panel {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: #ffffff;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  box-shadow:
+    0 -12px 24px -8px rgba(15, 23, 42, 0.18),
+    0 -4px 8px -4px rgba(15, 23, 42, 0.08);
+  padding: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.ains-select__option {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-family: var(--font-family);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--color-text-primary);
+  background: transparent;
+  border: none;
+  border-radius: 10px;
+  padding: 8px 12px;
+  cursor: pointer;
+  transition: background-color 0.12s ease, color 0.12s ease;
+}
+
+.ains-select__option:hover {
+  background: #f1f5f9;
+}
+
+.ains-select__option--active {
+  background: rgba(99, 102, 241, 0.1);
+  color: var(--color-brand-indigo-light);
+  font-weight: 600;
+}
+
 /* ─── 表单堆叠（Modal 内） ────────────────────── */
-.ws-form-stack {
+.ains-form-stack {
   display: flex;
   flex-direction: column;
   gap: 14px;
 }
 
-.ws-form-error {
+.ains-form-error {
   margin: 0;
   padding: 10px 12px;
   background: rgba(254, 226, 226, 0.6);
@@ -360,13 +508,13 @@ input, textarea, select {
   line-height: 1.5;
 }
 
-.ws-form-field {
+.ains-form-field {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
 
-.ws-form-label {
+.ains-form-label {
   font-family: var(--font-family);
   font-size: 11px;
   font-weight: 700;
@@ -376,13 +524,13 @@ input, textarea, select {
   text-transform: uppercase;
 }
 
-.ws-form-pill-group {
+.ains-form-pill-group {
   display: flex;
   gap: 8px;
   flex-wrap: wrap;
 }
 
-.ws-form-pill {
+.ains-form-pill {
   flex: 1;
   min-width: 100px;
   padding: 8px 12px;
@@ -397,19 +545,19 @@ input, textarea, select {
   transition: all 150ms ease;
 }
 
-.ws-form-pill:hover {
+.ains-form-pill:hover {
   border-color: rgba(99, 102, 241, 0.3);
   color: var(--color-text-primary);
 }
 
-.ws-form-pill--active {
+.ains-form-pill--active {
   background: rgba(99, 102, 241, 0.08);
   border-color: rgba(99, 102, 241, 0.4);
   color: #4f46e5;
 }
 
 /* ─── Dashboard 视图 ─────────────────────── */
-.ws-dashboard {
+.ains-dashboard {
   display: flex;
   flex-direction: column;
   gap: 24px;
@@ -418,7 +566,7 @@ input, textarea, select {
   margin: 0 auto;
 }
 
-.ws-hero {
+.ains-hero {
   position: relative;
   overflow: hidden;
   padding: 24px;
@@ -430,7 +578,7 @@ input, textarea, select {
   box-shadow: 0 1px 2px 0 rgba(199, 210, 254, 0.6);
 }
 
-.ws-hero__orb {
+.ains-hero__orb {
   position: absolute;
   width: 160px;
   height: 160px;
@@ -439,19 +587,19 @@ input, textarea, select {
   pointer-events: none;
 }
 
-.ws-hero__orb--indigo {
+.ains-hero__orb--indigo {
   top: -40px;
   right: -40px;
   background: rgba(165, 180, 252, 0.35);
 }
 
-.ws-hero__orb--pink {
+.ains-hero__orb--pink {
   bottom: -40px;
   left: -40px;
   background: rgba(251, 207, 232, 0.35);
 }
 
-.ws-hero__body {
+.ains-hero__body {
   position: relative;
   display: flex;
   flex-wrap: wrap;
@@ -460,14 +608,14 @@ input, textarea, select {
   justify-content: space-between;
 }
 
-.ws-hero__text {
+.ains-hero__text {
   display: flex;
   flex-direction: column;
   gap: 6px;
   max-width: 720px;
 }
 
-.ws-hero__title {
+.ains-hero__title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 20px;
@@ -476,7 +624,7 @@ input, textarea, select {
   color: var(--color-text-primary);
 }
 
-.ws-hero__subtitle {
+.ains-hero__subtitle {
   margin: 0;
   font-family: var(--font-family);
   font-size: 12px;
@@ -485,45 +633,45 @@ input, textarea, select {
   color: var(--color-text-tertiary);
 }
 
-.ws-hero__cta {
+.ains-hero__cta {
   flex-shrink: 0;
 }
 
-.ws-hero__cta-icon {
+.ains-hero__cta-icon {
   margin-right: 6px;
 }
 
-.ws-stats-grid {
+.ains-stats-grid {
   display: grid;
   grid-template-columns: repeat(1, minmax(0, 1fr));
   gap: 16px;
 }
 
 @media (min-width: 640px) {
-  .ws-stats-grid {
+  .ains-stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
 @media (min-width: 1024px) {
-  .ws-stats-grid {
+  .ains-stats-grid {
     grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
-.ws-dashboard__split {
+.ains-dashboard__split {
   display: grid;
   grid-template-columns: 1fr;
   gap: 16px;
 }
 
 @media (min-width: 1024px) {
-  .ws-dashboard__split {
+  .ains-dashboard__split {
     grid-template-columns: 2fr 1fr;
   }
 }
 
-.ws-panel {
+.ains-panel {
   background: var(--glass-panel-bg);
   -webkit-backdrop-filter: var(--glass-panel-blur);
   backdrop-filter: var(--glass-panel-blur);
@@ -536,21 +684,21 @@ input, textarea, select {
   flex-direction: column;
 }
 
-.ws-panel--console {
+.ains-panel--console {
   padding: 20px;
 }
 
-.ws-panel--routes {
+.ains-panel--routes {
   gap: 12px;
 }
 
-.ws-routes__header {
+.ains-routes__header {
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 
-.ws-routes__title {
+.ains-routes__title {
   margin: 0;
   font-family: var(--font-family);
   font-size: 14px;
@@ -558,7 +706,7 @@ input, textarea, select {
   color: var(--color-text-primary);
 }
 
-.ws-routes__subtitle {
+.ains-routes__subtitle {
   margin: 0;
   font-family: var(--font-family);
   font-size: 11px;
@@ -566,7 +714,7 @@ input, textarea, select {
   color: var(--color-text-muted);
 }
 
-.ws-routes__list {
+.ains-routes__list {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -575,7 +723,7 @@ input, textarea, select {
   min-height: 0;
 }
 
-.ws-routes__empty {
+.ains-routes__empty {
   margin: 0;
   font-family: var(--font-family);
   font-size: 12px;

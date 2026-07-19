@@ -1,7 +1,7 @@
 //! RequireAdmin —— admin 路由守卫。
 //!
 //! 用作 `Route` 枚举的 `#[layout(...)]` —— 只包裹 admin 专属路由（`/users`）。
-//! 若用户未登录则跳 `/auth`；若已登录但非 admin 则跳 `/`。
+//! 若用户未登录则跳 `/auth`；若已登录但非 admin 则跳个人中心 `/personal`。
 //!
 //! 守卫分两层：
 //! 1. **渲染时检查**：非 admin 用户不渲染 `Outlet`，杜绝首次渲染的闪烁。
@@ -28,7 +28,7 @@ pub fn RequireAdmin() -> Element {
                 let _ = nav.replace(Route::LoginLanding {});
             }
             Some(u) if !u.is_admin() => {
-                let _ = nav.replace(Route::Dashboard {});
+                let _ = nav.replace(Route::PersonalCenter {});
             }
             _ => {}
         }

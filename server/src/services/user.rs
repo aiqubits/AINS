@@ -15,6 +15,7 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, PaginatorTrait,
     QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
+use serde::Serialize;
 
 /// Balance scale factor: 1 display unit = 10^10 stored units (1 × 10^10).
 pub const BALANCE_SCALE: i64 = 10_000_000_000;
@@ -123,8 +124,13 @@ impl Default for PaginationParams {
 }
 
 /// Paginated response
-#[derive(Debug)]
-pub struct PaginatedResponse<T> {
+///
+/// NOTE: `T` must implement `Serialize` because this struct derives `Serialize`
+/// (required for JSON responses via `ains_runtime::Response::json`). Adding
+/// a new paginated endpoint whose item type does not impl `Serialize` will
+/// cause a compile error here — make the item type serializable first.
+#[derive(Debug, Serialize)]
+pub struct PaginatedResponse<T: Serialize> {
     pub items: Vec<T>,
     pub total: u64,
     pub page: u64,
@@ -405,6 +411,7 @@ impl UserService {
         }
 
         let old_role = user.role.clone();
+        let old_tenant_id = user.tenant_id.clone();
         let mut active_model: ActiveModel = user.into();
 
         if let Some(email) = input.email {
@@ -412,6 +419,19 @@ impl UserService {
         }
         if let Some(name) = input.name {
             active_model.name = Set(name);
+        }
+
+        // Tenant reassignment: only system may move a user across tenants.
+        // The handler forces `tenant_id` to None for non-system actors, so this
+        // check is defense-in-depth. Target tenant existence/active state is
+        // validated at the handler layer (mirrors create_user).
+        let mut new_tenant_id: Option<String> = None;
+        if actor_role == "system"
+            && let Some(ref tid) = input.tenant_id
+            && *tid != old_tenant_id
+        {
+            active_model.tenant_id = Set(tid.clone());
+            new_tenant_id = Some(tid.clone());
         }
 
         // Always exclude token_version from the ActiveModel update to avoid
@@ -422,6 +442,7 @@ impl UserService {
 
         let mut token_version_stmt: Option<Statement> = None;
         let mut role_changed = false;
+        let tenant_changed = new_tenant_id.is_some();
 
         if let Some(ref new_role) = input.role {
             // Defense-in-depth: validate role value is one of the allowed values.
@@ -443,26 +464,35 @@ impl UserService {
 
             if *new_role != old_role {
                 role_changed = true;
-                token_version_stmt = Some(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    "UPDATE users SET token_version = token_version + 1 WHERE id = $1",
-                    [id.into()],
-                ));
             }
+        }
+
+        // A role change OR a cross-tenant move must invalidate all existing JWTs:
+        // the token embeds both `role` and `tenant_id` as claims, and the auth
+        // layer trusts those claims (it only re-verifies `token_version` against
+        // the DB). Without this atomic increment, a moved user would retain valid
+        // access to their OLD tenant's resources via a stale JWT until expiry.
+        // The increment runs in the SAME transaction as the field update below.
+        if role_changed || tenant_changed {
+            token_version_stmt = Some(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE users SET token_version = token_version + 1 WHERE id = $1",
+                [id.into()],
+            ));
         }
 
         active_model.updated_at = Set(Utc::now());
 
-        // When the role changed, wrap the token_version increment and the field
-        // update in a single transaction so that a partial failure (e.g. email
-        // conflict) does not leave token_version incremented while the requested
-        // changes are rolled back.
+        // When the role or tenant changed, wrap the token_version increment and
+        // the field update in a single transaction so that a partial failure
+        // (e.g. email conflict) does not leave token_version incremented while
+        // the requested changes are rolled back.
         let result = if let Some(stmt) = token_version_stmt {
             let txn = self
                 .db
                 .begin()
                 .await
-                .context("Failed to begin transaction for role change")?;
+                .context("Failed to begin transaction for token_version change")?;
             txn.execute(stmt)
                 .await
                 .context("Failed to atomically increment token_version")?;
@@ -480,7 +510,7 @@ impl UserService {
             })?;
             txn.commit()
                 .await
-                .context("Failed to commit role-change transaction")?;
+                .context("Failed to commit token_version-change transaction")?;
             // Re-query to obtain the atomically-incremented token_version
             // (ActiveModel::update returns the model with the old token_version
             //  because it was set to NotSet in the SET clause).
@@ -508,8 +538,9 @@ impl UserService {
         if let Err(e) = self.cache.invalidate(&Self::user_cache_key(id)).await {
             tracing::warn!("Failed to invalidate cache for user {}: {:?}", id, e);
         }
-        // Invalidate token_version cache when role changed.
-        if role_changed {
+        // Invalidate token_version cache when role or tenant changed (both
+        // atomically increment token_version above).
+        if role_changed || tenant_changed {
             let token_cache_key = format!("user:token_version:{}", id);
             if let Err(e) = self.cache.invalidate(&token_cache_key).await {
                 tracing::warn!(
@@ -518,6 +549,26 @@ impl UserService {
                     e
                 );
             }
+        }
+
+        // When the user was moved to a different tenant, invalidate the user-count
+        // caches for BOTH the source and destination tenants (admin + user views)
+        // plus the system-wide count, so paginated listings stay accurate.
+        if let Some(ref new_tid) = new_tenant_id {
+            for tid in [old_tenant_id.as_str(), new_tid.as_str()] {
+                let _ = self
+                    .cache
+                    .invalidate(&Self::user_count_cache_key("admin", Some(tid)))
+                    .await;
+                let _ = self
+                    .cache
+                    .invalidate(&Self::user_count_cache_key("user", Some(tid)))
+                    .await;
+            }
+            let _ = self
+                .cache
+                .invalidate(&Self::user_count_cache_key("system", None))
+                .await;
         }
 
         Ok(UserResponse::from(result))
@@ -1111,6 +1162,7 @@ mod tests {
             balance: 0,
             wx_openid: None,
             tenant_id: "default".to_string(),
+            tenant_name: None,
         };
 
         let response = PaginatedResponse {
