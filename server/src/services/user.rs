@@ -288,7 +288,7 @@ impl UserService {
         //     of storing the marker in the first place.
         if self
             .cache
-            .exists(&format!("{}:null", &cache_key))
+            .exists(&format!("{}:null", cache_key))
             .await
             .unwrap_or(false)
         {
