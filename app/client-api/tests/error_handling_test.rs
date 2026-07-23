@@ -306,7 +306,8 @@ async fn test_retry_503_then_200_succeeds() {
     let mock_server = wiremock::MockServer::start().await;
     let config = ClientConfig::new(mock_server.uri())
         .with_max_retries(2)
-        .with_timeout(10);
+        .with_timeout(10)
+        .with_no_proxy(true);
     let client = client_api::Client::new(config).unwrap();
 
     Mock::given(method("GET"))
@@ -341,7 +342,8 @@ async fn test_retry_503_exhausted() {
     let mock_server = wiremock::MockServer::start().await;
     let config = ClientConfig::new(mock_server.uri())
         .with_max_retries(2)
-        .with_timeout(10);
+        .with_timeout(10)
+        .with_no_proxy(true);
     let client = client_api::Client::new(config).unwrap();
 
     // 全部 3 次请求（1 初始 + 2 重试）均返回 503
@@ -369,7 +371,8 @@ async fn test_retry_mixed_errors_then_success() {
     let mock_server = wiremock::MockServer::start().await;
     let config = ClientConfig::new(mock_server.uri())
         .with_max_retries(3)
-        .with_timeout(10);
+        .with_timeout(10)
+        .with_no_proxy(true);
     let client = client_api::Client::new(config).unwrap();
 
     Mock::given(method("GET"))
@@ -403,7 +406,8 @@ async fn test_no_retry_on_4xx() {
     let mock_server = wiremock::MockServer::start().await;
     let config = ClientConfig::new(mock_server.uri())
         .with_max_retries(3)
-        .with_timeout(10);
+        .with_timeout(10)
+        .with_no_proxy(true);
     let client = client_api::Client::new(config).unwrap();
 
     // 返回 404 — 不应重试，mock 期望仅命中 1 次

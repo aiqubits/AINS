@@ -8,7 +8,7 @@ mod runtime;
 mod signal;
 
 pub use auth::{AuthUser, JwtClaims, validate_jwt};
-pub use error::HttpError;
+pub use error::{HttpError, ai_response_error_body};
 pub use middleware::{MiddlewareState, validate_token};
 pub use rate_limit::RateLimitGuard;
 pub use request::RequestContext;

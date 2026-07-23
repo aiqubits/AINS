@@ -720,10 +720,10 @@ async fn test_move_user_tenant_invalidates_old_jwt() {
     assert_eq!(body["tenant_id"], target_tenant_id, "user should be moved");
 
     // Old JWT should now be invalid (token_version mismatch)
-    // Use the AI chat endpoint as a simple auth-required check
+    // Use the unified AI response endpoint as a simple auth-required check.
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -766,7 +766,7 @@ async fn test_move_user_tenant_invalidates_old_jwt() {
     // New JWT should be accepted
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&new_token),
         Some(&json!({
             "input": "hello"

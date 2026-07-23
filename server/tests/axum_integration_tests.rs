@@ -3343,11 +3343,11 @@ async fn test_list_users_multi_tenant_isolation() {
     let items_a = body["items"].as_array().unwrap();
     let emails_a: Vec<&str> = items_a.iter().filter_map(|u| u["email"].as_str()).collect();
     assert!(
-        emails_a.contains(&&email_user_a.to_lowercase().as_str()),
+        emails_a.contains(&email_user_a.to_lowercase().as_str()),
         "tenant_a admin should see user in their tenant"
     );
     assert!(
-        !emails_a.contains(&&email_user_b.to_lowercase().as_str()),
+        !emails_a.contains(&email_user_b.to_lowercase().as_str()),
         "tenant_a admin must NOT see tenant_b user"
     );
 
@@ -3408,11 +3408,11 @@ async fn test_list_users_multi_tenant_isolation() {
         .filter_map(|u| u["email"].as_str())
         .collect();
     assert!(
-        emails_sys.contains(&&email_user_a.to_lowercase().as_str()),
+        emails_sys.contains(&email_user_a.to_lowercase().as_str()),
         "system should see user from tenant_a"
     );
     assert!(
-        emails_sys.contains(&&email_user_b.to_lowercase().as_str()),
+        emails_sys.contains(&email_user_b.to_lowercase().as_str()),
         "system should see user from tenant_b"
     );
 }

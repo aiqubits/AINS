@@ -28,6 +28,31 @@ async fn test_health_check() {
     assert_eq!(body["status"], "ok");
 }
 
+// ── Unified AI response route ────────────────────────────────────
+
+#[tokio::test]
+async fn test_unified_ai_response_route_requires_authentication() {
+    let server = create_server().await;
+    let payload = serde_json::json!({"input": "Hello"});
+
+    let (status, body) = salvo::post(&server, "/api/ai/response", None, Some(&payload)).await;
+
+    assert_eq!(status, reqwest::StatusCode::UNAUTHORIZED);
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["code"], "unauthorized");
+}
+
+#[tokio::test]
+async fn test_old_ai_chat_route_is_not_registered() {
+    let server = create_server().await;
+    let payload = serde_json::json!({"input": "Hello"});
+
+    let (status, _) = salvo::post(&server, "/api/ai/chat", None, Some(&payload)).await;
+
+    assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
 // ── 用户注册 ──────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -1475,19 +1500,25 @@ async fn test_count_cache_populated_on_list_users() {
     let _guard = count_cache_lock().lock().await;
     use ains_server::repositories::user::CreateUserInput;
     use ains_server::services::UserService;
+    use ains_server::services::tenant::TenantService;
     use ains_server::services::user::PaginationParams;
 
     let state = salvo::create_test_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
-    let role = "admin";
-    let count_key = format!("user:count:{}:default", role);
 
-    // 清除可能来自其他测试的残留缓存
-    let _ = state.cache.invalidate(&count_key).await;
+    // Dedicated tenant → unique `user:count:admin:{tenant}` key, immune to
+    // sibling tests that mutate the shared `default` tenant's user count.
+    let tenant = TenantService::new(state.db.clone())
+        .create(common::unique_table_name("cnt_pop_tenant"))
+        .await
+        .expect("create tenant failed");
+    let tenant_id = tenant.id;
+    let role = "admin";
+    let count_key = format!("user:count:{}:{}", role, tenant_id);
 
     let email = common::unique_email("salvo_cnt_cache");
     let _user = svc
-        .create_user(
+        .create_user_for_tenant(
             CreateUserInput {
                 email: email.clone(),
                 password: "Password123!".to_string(),
@@ -1495,20 +1526,21 @@ async fn test_count_cache_populated_on_list_users() {
                 role: None,
             },
             "system",
+            &tenant_id,
         )
         .await
         .expect("create_user failed");
 
     // First list_users: count cache miss → populate
     let page1 = svc
-        .list_users(PaginationParams::default(), role, "default")
+        .list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
     assert!(page1.total > 0, "should have at least one user");
 
     // Second list_users: should hit cache (same count expected)
     let page2 = svc
-        .list_users(PaginationParams::default(), role, "default")
+        .list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
     assert_eq!(
@@ -1517,7 +1549,6 @@ async fn test_count_cache_populated_on_list_users() {
     );
 
     // Clean up
-    let count_key = format!("user:count:{}:default", role);
     let _ = state.cache.invalidate(&count_key).await;
 }
 
@@ -1526,20 +1557,31 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
     let _guard = count_cache_lock().lock().await;
     use ains_server::repositories::user::CreateUserInput;
     use ains_server::services::UserService;
+    use ains_server::services::tenant::TenantService;
     use ains_server::services::user::PaginationParams;
 
     let state = salvo::create_test_state().await;
     let svc = UserService::new(state.db.clone(), state.cache.clone());
-    let role = "admin";
-    let count_key = format!("user:count:{}:default", role);
 
-    // 清除可能来自其他测试的残留缓存
-    let _ = state.cache.invalidate(&count_key).await;
+    // Use a dedicated tenant so the admin count-cache key
+    // (`user:count:admin:{tenant}`) is unique to this test. Many sibling tests
+    // list/create admin-scoped users in the shared `default` tenant, which would
+    // repopulate or mutate `user:count:admin:default` between our invalidate and
+    // assert, making the `is_none()` checks flaky. The `count_cache_lock` is
+    // still held because create/delete also invalidate the global
+    // `user:count:system` key observed by the system-role test.
+    let tenant = TenantService::new(state.db.clone())
+        .create(common::unique_table_name("cnt_cd_tenant"))
+        .await
+        .expect("create tenant failed");
+    let tenant_id = tenant.id;
+    let role = "admin";
+    let count_key = format!("user:count:{}:{}", role, tenant_id);
 
     // Create an initial user so list_users works
     let email1 = common::unique_email("salvo_cnt_cd1");
     let user1 = svc
-        .create_user(
+        .create_user_for_tenant(
             CreateUserInput {
                 email: email1.clone(),
                 password: "Password123!".to_string(),
@@ -1547,23 +1589,22 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
                 role: None,
             },
             "system",
+            &tenant_id,
         )
         .await
         .expect("create_user failed");
 
     // Populate count cache via list_users
-    svc.list_users(PaginationParams::default(), role, "default")
+    svc.list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
-    // Verify cache is populated by calling list_users again (should return same total)
-    // This is more robust than checking Redis directly due to cross-test cache interference.
     let page1 = svc
-        .list_users(PaginationParams::default(), role, "default")
+        .list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
     assert!(page1.total > 0, "should have at least one user");
     let page2 = svc
-        .list_users(PaginationParams::default(), role, "default")
+        .list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
     assert_eq!(
@@ -1574,7 +1615,7 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
     // Create another user → count cache invalidated
     let email2 = common::unique_email("salvo_cnt_cd2");
     let _user2 = svc
-        .create_user(
+        .create_user_for_tenant(
             CreateUserInput {
                 email: email2.clone(),
                 password: "Password123!".to_string(),
@@ -1582,6 +1623,7 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
                 role: None,
             },
             "system",
+            &tenant_id,
         )
         .await
         .expect("create_user failed");
@@ -1594,12 +1636,12 @@ async fn test_count_cache_invalidated_after_create_and_delete() {
 
     // Re-populate
     let _page = svc
-        .list_users(PaginationParams::default(), role, "default")
+        .list_users(PaginationParams::default(), role, &tenant_id)
         .await
         .expect("list_users failed");
 
     // Delete user1 → count cache invalidated again
-    svc.delete_user(user1.id.as_i64(), "system", 0, "default")
+    svc.delete_user(user1.id.as_i64(), "system", 0, &tenant_id)
         .await
         .expect("delete_user failed");
 

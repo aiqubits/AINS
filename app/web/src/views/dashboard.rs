@@ -177,6 +177,11 @@ pub fn Dashboard() -> Element {
             "/api/users/me/password",
             "修改当前用户密码",
         ),
+        (
+            RouteMethod::Post,
+            "/api/ai/response",
+            "统一 AI 请求入口（chat / embedding / vision / stt / tts）",
+        ),
         // ── 管理端点（require_admin）──
         (RouteMethod::Get, "/api/users", "分页列出用户"),
         (RouteMethod::Post, "/api/users", "创建新用户"),

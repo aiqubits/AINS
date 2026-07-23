@@ -7,7 +7,7 @@
 //! - Streaming event translation: upstream SSE → Responses SSE events
 //!
 //! Architecture: "protocol translation mode" — the AINS server accepts
-//! Responses API format on `/api/ai/chat` and translates to/from upstream
+//! Responses API format on `/api/ai/response` and translates to/from upstream
 //! Chat Completions / Anthropic Messages protocols.
 
 use serde::{Deserialize, Serialize};
@@ -19,8 +19,9 @@ use uuid::Uuid;
 //  Request Types
 // ═══════════════════════════════════════════════════════════════════
 
-/// Top-level request for POST /api/ai/chat (Responses API format).
+/// Top-level request for POST /api/ai/response (Responses API format).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponsesRequest {
     /// Model identifier (e.g. "gpt-4o", "claude-3-opus").
     /// When unspecified, the server selects from available channels.
@@ -44,6 +45,10 @@ pub struct ResponsesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<u32>,
 
+    /// Sampling temperature to use for generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
     /// Whether to stream the response using SSE.
     #[serde(default)]
     pub stream: Option<bool>,
@@ -52,12 +57,13 @@ pub struct ResponsesRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<Vec<ToolConfig>>,
 
-    /// Whether to store the response. Defaults to true.
-    /// Set to false for stateless/ZDR compliance.
+    /// Whether to store the response. The AINS gateway is currently stateless,
+    /// so only false (or omission) is accepted by the handler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
 
-    /// ID of a previous response to continue from (multi-turn).
+    /// ID of a previous response to continue from. Rejected until server-side
+    /// response storage is implemented.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
 
@@ -180,10 +186,18 @@ pub struct ResponsesResponse {
     pub created_at: i64,
     /// Model used to generate the response.
     pub model: String,
+    /// AINS capability used to fulfill this response.
+    pub capability: String,
+    /// Terminal status for non-streaming responses.
+    pub status: String,
+    /// Why generation stopped before a normal completion.
+    pub incomplete_details: Option<Value>,
     /// Array of output items (messages, tool calls, etc.).
     pub output: Vec<OutputItem>,
     /// Token usage information.
     pub usage: Option<UsageResponse>,
+    /// Error information. Successful responses always serialize this as null.
+    pub error: Option<Value>,
 }
 
 /// A single output item in the response.
@@ -214,6 +228,11 @@ pub enum OutputContent {
         /// Annotations (citations, etc.).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         annotations: Vec<Annotation>,
+    },
+    /// A model safety refusal.
+    Refusal {
+        /// Human-readable refusal returned by the provider.
+        refusal: String,
     },
     /// Audio output (from TTS).
     #[serde(rename = "audio")]
@@ -321,6 +340,11 @@ pub fn translate_request(req: &ResponsesRequest) -> Result<Value, String> {
         upstream["max_tokens"] = serde_json::json!(max_tokens);
     }
 
+    // Sampling temperature
+    if let Some(temperature) = req.temperature {
+        upstream["temperature"] = serde_json::json!(temperature);
+    }
+
     // Streaming
     if req.stream.unwrap_or(false) {
         upstream["stream"] = serde_json::json!(true);
@@ -376,18 +400,13 @@ fn translate_content_part(part: &ContentPart, _role: &str) -> Result<Value, Stri
             // Return a placeholder that signals the handler to run STT.
             Err("Audio content must be pre-processed via STT before proxying".to_string())
         }
-        ContentPart::InputFile {
-            file_data,
-            filename,
-        } => {
-            // File/PDF input requires text extraction before proxying.
-            // This content part should be pre-processed by the handler.
-            Ok(serde_json::json!({
-                "type": "text",
-                "text": format!("[File attachment: {}. File data (base64, {} bytes) available for processing.]",
-                    filename,
-                    file_data.len())
-            }))
+        ContentPart::InputFile { .. } => {
+            // File/PDF input requires text extraction or a provider file upload
+            // before proxying. Neither is implemented yet, so the file contents
+            // never reach the model. Fabricating a "file available" placeholder
+            // let the model invent answers about a file it never saw; reject the
+            // request instead until real preprocessing exists.
+            Err("input_file is not supported by this AI response endpoint".to_string())
         }
     }
 }
@@ -445,6 +464,40 @@ fn translate_tool(tool: &ToolConfig) -> Value {
 //  Response Translation: Chat Completions → Responses
 // ═══════════════════════════════════════════════════════════════════
 
+/// Validate the text/refusal subset of a non-streaming Chat Completions result
+/// that the unified Responses translator can represent.
+pub fn is_valid_chat_completions_response(response: &Value) -> bool {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|choices| choices.first())
+        .is_some_and(|choice| {
+            let Some(message) = choice.get("message").and_then(Value::as_object) else {
+                return false;
+            };
+            if message.get("role").and_then(Value::as_str) != Some("assistant") {
+                return false;
+            }
+            let refusal = message
+                .get("refusal")
+                .and_then(Value::as_str)
+                .is_some_and(|refusal| !refusal.is_empty());
+            let has_text = message.get("content").and_then(Value::as_str).is_some();
+            // Validity is about whether the translator can *represent* the
+            // message — assistant text or a refusal. The `finish_reason` only
+            // maps to the downstream status/incomplete_details; it must not gate
+            // validity. Otherwise a provider that returns perfectly good content
+            // with an unusual or absent finish_reason (e.g. Anthropic omitting
+            // `stop_reason`, or a "tool_calls"/vendor-specific reason) would be
+            // rejected as a 503 *and* trip the channel circuit breaker, taking a
+            // healthy shared channel offline. `content_filter` may legitimately
+            // carry null content (a fully blocked turn).
+            has_text
+                || refusal
+                || choice.get("finish_reason").and_then(Value::as_str) == Some("content_filter")
+        })
+}
+
 /// Translate an upstream Chat Completions response into Responses API format.
 pub fn translate_response(upstream: &Value, model: &str) -> ResponsesResponse {
     let now = std::time::SystemTime::now()
@@ -455,7 +508,7 @@ pub fn translate_response(upstream: &Value, model: &str) -> ResponsesResponse {
     let response_id = format!("resp_{}", Uuid::new_v4().to_string().replace('-', ""));
 
     // Extract the message from choices[0]
-    let (output_text, output_role, finish_reason) = extract_choice_info(upstream);
+    let (output_text, refusal, output_role, finish_reason) = extract_choice_info(upstream);
 
     // Build output items
     let mut output = Vec::new();
@@ -467,12 +520,31 @@ pub fn translate_response(upstream: &Value, model: &str) -> ResponsesResponse {
             text: output_text,
             annotations: Vec::new(),
         });
+    } else if let Some(refusal) = refusal {
+        content_items.push(OutputContent::Refusal { refusal });
     }
 
     let msg_id = format!("msg_{}", Uuid::new_v4().to_string().replace('-', ""));
+    // Status mirrors the streaming `StreamTerminationState` contract: a response
+    // that reached this translator already passed `validate_provider_response`
+    // (it carries representable content), so only genuine truncation (`length`)
+    // or filtering (`content_filter`) is `incomplete`. A missing/unknown or
+    // vendor-specific finish_reason (e.g. Anthropic `tool_use` → `tool_calls`,
+    // or an omitted `stop_reason` → `unknown`) must be reported as `completed`
+    // rather than `failed`, otherwise valid content is silently discarded by
+    // clients that key on `status`.
+    let response_status = match finish_reason.as_str() {
+        "length" | "content_filter" => "incomplete",
+        _ => "completed",
+    };
+    let incomplete_details = match finish_reason.as_str() {
+        "length" => Some(serde_json::json!({"reason": "max_output_tokens"})),
+        "content_filter" => Some(serde_json::json!({"reason": "content_filter"})),
+        _ => None,
+    };
     output.push(OutputItem::Message {
         id: msg_id,
-        status: if finish_reason == "stop" || finish_reason == "length" {
+        status: if response_status == "completed" {
             "completed".to_string()
         } else {
             "incomplete".to_string()
@@ -489,13 +561,22 @@ pub fn translate_response(upstream: &Value, model: &str) -> ResponsesResponse {
         object: "response".to_string(),
         created_at: now,
         model: model.to_string(),
+        capability: "chat".to_string(),
+        status: response_status.to_string(),
+        incomplete_details,
         output,
         usage,
+        error: (response_status == "failed").then(|| {
+            serde_json::json!({
+                "code": "server_error",
+                "message": "AI provider returned an invalid response"
+            })
+        }),
     }
 }
 
 /// Extract choice information from an upstream response.
-fn extract_choice_info(upstream: &Value) -> (String, String, String) {
+fn extract_choice_info(upstream: &Value) -> (String, Option<String>, String, String) {
     let default_msg = serde_json::json!({"role": "assistant", "content": ""});
     let choice = upstream
         .get("choices")
@@ -509,6 +590,11 @@ fn extract_choice_info(upstream: &Value) -> (String, String, String) {
         .and_then(|c| c.as_str())
         .unwrap_or("")
         .to_string();
+    let refusal = message
+        .get("refusal")
+        .and_then(Value::as_str)
+        .filter(|refusal| !refusal.is_empty())
+        .map(str::to_string);
     let role = message
         .get("role")
         .and_then(|r| r.as_str())
@@ -520,7 +606,7 @@ fn extract_choice_info(upstream: &Value) -> (String, String, String) {
         .unwrap_or("stop")
         .to_string();
 
-    (text, role, finish_reason)
+    (text, refusal, role, finish_reason)
 }
 
 /// Extract token usage from an upstream response.
@@ -559,28 +645,60 @@ pub mod sse_events {
     use super::*;
 
     /// Build a `response.output_text.delta` event payload.
-    pub fn output_text_delta(delta: &str, index: usize) -> Value {
+    pub fn output_text_delta(delta: &str, item_id: &str, sequence_number: u64) -> Value {
         serde_json::json!({
             "type": "response.output_text.delta",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
             "delta": delta,
-            "index": index
+            "sequence_number": sequence_number
+        })
+    }
+
+    /// Build a `response.refusal.delta` event payload. A streamed safety refusal
+    /// arrives on `choices[].delta.refusal` (distinct from ordinary content) and
+    /// must be surfaced to the client rather than silently dropped.
+    pub fn refusal_delta(delta: &str, item_id: &str, sequence_number: u64) -> Value {
+        serde_json::json!({
+            "type": "response.refusal.delta",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": delta,
+            "sequence_number": sequence_number
+        })
+    }
+
+    /// Build a `response.refusal.done` event payload carrying the full refusal.
+    pub fn refusal_done(refusal: &str, item_id: &str, sequence_number: u64) -> Value {
+        serde_json::json!({
+            "type": "response.refusal.done",
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "refusal": refusal,
+            "sequence_number": sequence_number
         })
     }
 
     /// Build a `response.completed` event payload with the full response.
-    pub fn response_completed(response: &ResponsesResponse) -> Value {
+    pub fn response_completed(response: &ResponsesResponse, sequence_number: u64) -> Value {
         serde_json::json!({
             "type": "response.completed",
-            "response": response
+            "response": response,
+            "sequence_number": sequence_number
         })
     }
 
     /// Build an `error` event payload.
-    pub fn error_event(code: &str, message: &str) -> Value {
+    pub fn error_event(code: &str, message: &str, sequence_number: u64) -> Value {
         serde_json::json!({
             "type": "error",
             "code": code,
-            "message": message
+            "message": message,
+            "param": Value::Null,
+            "sequence_number": sequence_number
         })
     }
 
@@ -607,6 +725,22 @@ pub fn extract_upstream_delta(chunk: &Value) -> Option<String> {
     }
 }
 
+/// Extracts a safety-refusal delta from an upstream streaming chunk.
+///
+/// OpenAI Chat Completions streams a refusal on `choices[].delta.refusal`,
+/// parallel to `delta.content`. It is a successful (non-error) completion that
+/// carries no ordinary text, so it must be captured separately rather than lost.
+pub fn extract_upstream_refusal(chunk: &Value) -> Option<String> {
+    let choices = chunk.get("choices")?.as_array()?;
+    let choice = choices.first()?;
+    let refusal = choice.get("delta")?.get("refusal")?.as_str()?;
+    if refusal.is_empty() {
+        None
+    } else {
+        Some(refusal.to_string())
+    }
+}
+
 /// Checks if an upstream chunk is the final [DONE] signal.
 pub fn is_upstream_done(chunk: &Value) -> bool {
     chunk.as_str() == Some("[DONE]")
@@ -621,6 +755,8 @@ pub fn translate_streaming_chunk(
     model_name: &mut Option<String>,
     usage_input: &mut u64,
     usage_output: &mut u64,
+    item_id: &str,
+    sequence_number: u64,
 ) -> Option<(String, String)> {
     // Check for [DONE] signal
     if is_upstream_done(chunk) {
@@ -650,7 +786,7 @@ pub fn translate_streaming_chunk(
         accumulated_text.push_str(&delta);
 
         // Build delta event — index is always 0 for single text output
-        let event_data = sse_events::output_text_delta(&delta, 0);
+        let event_data = sse_events::output_text_delta(&delta, item_id, sequence_number);
         let sse_str = sse_events::format_sse_event("response.output_text.delta", &event_data);
         return Some((sse_str, delta));
     }
@@ -677,10 +813,15 @@ pub fn estimate_tokens_from_text(text: &str) -> u64 {
 pub fn chat_completions_to_anthropic(body: &Value) -> Value {
     let mut anthropic = serde_json::json!({});
 
-    // Copy top-level fields that are shared
-    if let Some(max_tokens) = body.get("max_tokens") {
-        anthropic["max_tokens"] = max_tokens.clone();
+    // Anthropic requires both fields. GatewayService selects/injects `model`
+    // before dispatch, so the protocol adapter must preserve it.
+    if let Some(model) = body.get("model") {
+        anthropic["model"] = model.clone();
     }
+    anthropic["max_tokens"] = body
+        .get("max_tokens")
+        .cloned()
+        .unwrap_or_else(|| Value::from(4096));
     if body
         .get("stream")
         .and_then(|v| v.as_bool())
@@ -745,7 +886,7 @@ pub fn chat_completions_to_anthropic(body: &Value) -> Value {
                 _ => {
                     messages.push(serde_json::json!({
                         "role": role,
-                        "content": content
+                        "content": chat_content_to_anthropic(content)
                     }));
                 }
             }
@@ -761,6 +902,69 @@ pub fn chat_completions_to_anthropic(body: &Value) -> Value {
     anthropic
 }
 
+/// Convert OpenAI message content blocks into Anthropic content blocks.
+fn chat_content_to_anthropic(content: Value) -> Value {
+    let Value::Array(parts) = content else {
+        return content;
+    };
+
+    Value::Array(
+        parts
+            .into_iter()
+            .map(|part| openai_image_part_to_anthropic(&part).unwrap_or(part))
+            .collect(),
+    )
+}
+
+/// Convert an OpenAI `image_url` content block into an Anthropic image block.
+fn openai_image_part_to_anthropic(part: &Value) -> Option<Value> {
+    if part.get("type").and_then(Value::as_str) != Some("image_url") {
+        return None;
+    }
+
+    let image_url = part.get("image_url")?;
+    let url = image_url
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| image_url.as_str())?;
+
+    let source = if let Some((media_type, data)) = parse_base64_data_uri(url) {
+        serde_json::json!({
+            "type": "base64",
+            "media_type": media_type,
+            "data": data
+        })
+    } else if url.starts_with("https://") || url.starts_with("http://") {
+        serde_json::json!({
+            "type": "url",
+            "url": url
+        })
+    } else {
+        tracing::warn!("Unsupported image URL for Anthropic content block");
+        return None;
+    };
+
+    Some(serde_json::json!({
+        "type": "image",
+        "source": source
+    }))
+}
+
+/// Parse an RFC 2397-style base64 data URI into its media type and payload.
+fn parse_base64_data_uri(uri: &str) -> Option<(&str, &str)> {
+    let value = uri.strip_prefix("data:")?;
+    let (metadata, data) = value.split_once(',')?;
+    let mut metadata_parts = metadata.split(';');
+    let media_type = metadata_parts.next()?;
+    let is_base64 = metadata_parts.any(|part| part.eq_ignore_ascii_case("base64"));
+
+    if media_type.is_empty() || !media_type.starts_with("image/") || !is_base64 {
+        return None;
+    }
+
+    Some((media_type, data))
+}
+
 /// Convert an Anthropic Messages format response into Chat Completions format.
 /// This allows the existing `translate_response()` pipeline to work unchanged.
 pub fn anthropic_response_to_chat_completions(response: &Value) -> Value {
@@ -773,16 +977,12 @@ pub fn anthropic_response_to_chat_completions(response: &Value) -> Value {
     let content_text = response
         .get("content")
         .and_then(|c| c.as_array())
-        .and_then(|arr| {
-            arr.iter().find_map(|item| {
-                if item.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    item.get("text")
-                        .and_then(|t| t.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<String>()
         })
         .unwrap_or_default();
 
@@ -795,7 +995,8 @@ pub fn anthropic_response_to_chat_completions(response: &Value) -> Value {
     let finish_reason = match stop_reason {
         Some("end_turn" | "stop_sequence") => "stop",
         Some("max_tokens") => "length",
-        _ => "stop",
+        Some("tool_use") => "tool_calls",
+        _ => "unknown",
     };
 
     let model = response
@@ -946,6 +1147,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -970,6 +1172,7 @@ mod tests {
             instructions: Some("You are a helpful Rust expert.".into()),
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -993,6 +1196,7 @@ mod tests {
             instructions: Some("You are an assistant.".into()),
             developer_instructions: Some("Always respond in JSON.".into()),
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1017,6 +1221,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: Some(2048),
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1029,6 +1234,19 @@ mod tests {
     }
 
     #[test]
+    fn translate_temperature() {
+        let req: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hi",
+            "temperature": 0.25
+        }))
+        .unwrap();
+
+        let upstream = translate_request(&req).unwrap();
+        assert_eq!(upstream["temperature"], 0.25);
+    }
+
+    #[test]
     fn translate_stream_true() {
         let req = ResponsesRequest {
             model: None,
@@ -1036,6 +1254,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: Some(true),
             tools: None,
             store: None,
@@ -1068,6 +1287,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1103,6 +1323,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1131,6 +1352,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: Some(vec![ToolConfig::WebSearch {
                 query: None,
@@ -1177,6 +1399,9 @@ mod tests {
         assert!(resp.id.starts_with("resp_"));
         assert_eq!(resp.model, "gpt-4o");
         assert_eq!(resp.output.len(), 1);
+        assert!(resp.error.is_none());
+        let serialized = serde_json::to_value(&resp).unwrap();
+        assert_eq!(serialized.get("error"), Some(&Value::Null));
 
         match &resp.output[0] {
             OutputItem::Message {
@@ -1230,12 +1455,70 @@ mod tests {
         let resp = translate_response(&upstream, "gpt-4o");
         match &resp.output[0] {
             OutputItem::Message { status, .. } => {
-                assert_eq!(
-                    status, "completed",
-                    "length finish is still 'completed' in Responses"
-                );
+                assert_eq!(status, "incomplete");
             }
         }
+        assert_eq!(resp.status, "incomplete");
+        assert_eq!(
+            resp.incomplete_details,
+            Some(serde_json::json!({"reason": "max_output_tokens"}))
+        );
+    }
+
+    #[test]
+    fn translate_response_preserves_refusal_and_content_filter() {
+        let refusal = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "refusal": "I cannot help with that."
+                },
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&refusal));
+        let response = translate_response(&refusal, "gpt-4o");
+        match &response.output[0] {
+            OutputItem::Message { content, .. } => match &content[0] {
+                OutputContent::Refusal { refusal } => {
+                    assert_eq!(refusal, "I cannot help with that.");
+                }
+                _ => panic!("expected refusal output"),
+            },
+        }
+
+        let filtered = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": null},
+                "finish_reason": "content_filter"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&filtered));
+        let response = translate_response(&filtered, "gpt-4o");
+        assert_eq!(response.status, "incomplete");
+        assert_eq!(
+            response.incomplete_details,
+            Some(serde_json::json!({"reason": "content_filter"}))
+        );
+    }
+
+    #[test]
+    fn translate_response_never_emits_nonstandard_incomplete_reasons() {
+        // A vendor/unknown finish_reason (e.g. Anthropic `tool_use` → `tool_calls`)
+        // that carries valid content must be reported as `completed` — matching
+        // the streaming path — never `failed`, and never with a nonstandard
+        // `incomplete_details` reason.
+        let upstream = serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "tool"},
+                "finish_reason": "tool_calls"
+            }]
+        });
+        let response = translate_response(&upstream, "gpt-4o");
+        assert_eq!(response.status, "completed");
+        assert_eq!(response.incomplete_details, None);
+        assert!(response.error.is_none());
     }
 
     // ── Streaming Event Tests ─────────────────────────────────────
@@ -1262,6 +1545,107 @@ mod tests {
             }]
         });
         assert_eq!(extract_upstream_delta(&chunk), None);
+    }
+
+    #[test]
+    fn extract_upstream_refusal_returns_text_and_ignores_empty() {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "index": 0,
+                "delta": { "refusal": "I can't help with that" },
+                "finish_reason": null
+            }]
+        });
+        assert_eq!(
+            extract_upstream_refusal(&chunk),
+            Some("I can't help with that".to_string())
+        );
+
+        let empty = serde_json::json!({
+            "choices": [{ "delta": { "refusal": "" } }]
+        });
+        assert_eq!(extract_upstream_refusal(&empty), None);
+
+        let content_only = serde_json::json!({
+            "choices": [{ "delta": { "content": "hi" } }]
+        });
+        assert_eq!(extract_upstream_refusal(&content_only), None);
+    }
+
+    #[test]
+    fn refusal_events_use_refusal_shape() {
+        let delta = sse_events::refusal_delta("no", "msg_1", 4);
+        assert_eq!(delta["type"], "response.refusal.delta");
+        assert_eq!(delta["delta"], "no");
+        assert_eq!(delta["item_id"], "msg_1");
+        assert_eq!(delta["sequence_number"], 4);
+
+        let done = sse_events::refusal_done("no way", "msg_1", 5);
+        assert_eq!(done["type"], "response.refusal.done");
+        assert_eq!(done["refusal"], "no way");
+        assert_eq!(done["sequence_number"], 5);
+    }
+
+    #[test]
+    fn valid_response_accepts_unknown_finish_reason_with_content() {
+        // A healthy provider response (e.g. Anthropic omitting stop_reason,
+        // mapped to finish_reason "unknown") must remain valid so it is not
+        // rejected as a 503 and does not trip the circuit breaker.
+        let response = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "hello" },
+                "finish_reason": "unknown"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&response));
+
+        // tool_calls finish_reason with content is still representable.
+        let tool = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "content": "partial" },
+                "finish_reason": "tool_calls"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&tool));
+    }
+
+    #[test]
+    fn valid_response_accepts_refusal_and_rejects_empty() {
+        let refusal = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant", "refusal": "nope" },
+                "finish_reason": "stop"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&refusal));
+
+        // No text, no refusal, no content_filter — nothing to represent.
+        let empty = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant" },
+                "finish_reason": "unknown"
+            }]
+        });
+        assert!(!is_valid_chat_completions_response(&empty));
+
+        // content_filter may legitimately carry null content.
+        let filtered = serde_json::json!({
+            "choices": [{
+                "message": { "role": "assistant" },
+                "finish_reason": "content_filter"
+            }]
+        });
+        assert!(is_valid_chat_completions_response(&filtered));
+    }
+
+    #[test]
+    fn streaming_error_event_uses_responses_error_shape() {
+        let event = sse_events::error_event("provider_stream_error", "failed", 3);
+        assert_eq!(event["type"], "error");
+        assert_eq!(event["code"], "provider_stream_error");
+        assert_eq!(event["message"], "failed");
+        assert_eq!(event["param"], Value::Null);
+        assert_eq!(event["sequence_number"], 3);
     }
 
     #[test]
@@ -1292,6 +1676,8 @@ mod tests {
             &mut model_name,
             &mut usage_input,
             &mut usage_output,
+            "msg_test",
+            3,
         );
 
         assert!(result.is_some());
@@ -1300,7 +1686,10 @@ mod tests {
         assert_eq!(text, "World");
         assert!(sse_str.contains("response.output_text.delta"));
         assert!(sse_str.contains("World"));
-        assert!(sse_str.contains("\"index\":0"));
+        assert!(sse_str.contains("\"item_id\":\"msg_test\""));
+        assert!(sse_str.contains("\"output_index\":0"));
+        assert!(sse_str.contains("\"content_index\":0"));
+        assert!(sse_str.contains("\"sequence_number\":3"));
     }
 
     #[test]
@@ -1322,6 +1711,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1347,6 +1737,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: None,
             store: None,
@@ -1366,6 +1757,7 @@ mod tests {
             instructions: None,
             developer_instructions: None,
             max_output_tokens: None,
+            temperature: None,
             stream: None,
             tools: Some(vec![ToolConfig::WebSearch {
                 query: None,
@@ -1385,6 +1777,7 @@ mod tests {
     #[test]
     fn chat_completions_to_anthropic_basic() {
         let cc = serde_json::json!({
+            "model": "claude-3-opus-20240229",
             "messages": [
                 {"role": "user", "content": "Hello"}
             ],
@@ -1392,6 +1785,7 @@ mod tests {
             "stream": true
         });
         let anthropic = chat_completions_to_anthropic(&cc);
+        assert_eq!(anthropic["model"], "claude-3-opus-20240229");
         assert_eq!(anthropic["max_tokens"], 4096);
         assert_eq!(anthropic["stream"], true);
         assert!(
@@ -1402,6 +1796,19 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0]["role"], "user");
         assert_eq!(msgs[0]["content"], "Hello");
+    }
+
+    #[test]
+    fn chat_completions_to_anthropic_supplies_required_default_max_tokens() {
+        let cc = serde_json::json!({
+            "model": "claude-3-5-sonnet",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        let anthropic = chat_completions_to_anthropic(&cc);
+
+        assert_eq!(anthropic["model"], "claude-3-5-sonnet");
+        assert_eq!(anthropic["max_tokens"], 4096);
     }
 
     #[test]
@@ -1478,6 +1885,84 @@ mod tests {
     }
 
     #[test]
+    fn chat_completions_to_anthropic_converts_base64_image_and_preserves_text() {
+        let cc = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Describe this image"},
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }]
+        });
+
+        let anthropic = chat_completions_to_anthropic(&cc);
+        let content = anthropic["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type": "text", "text": "Describe this image"})
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgoAAAANSUhEUg=="
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn chat_completions_to_anthropic_converts_http_and_https_image_urls() {
+        let cc = serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "http://example.com/photo.jpg"}
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "https://example.com/photo.jpg"}
+                    }
+                ]
+            }]
+        });
+
+        let anthropic = chat_completions_to_anthropic(&cc);
+        assert_eq!(
+            anthropic["messages"][0]["content"][0],
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "http://example.com/photo.jpg"
+                }
+            })
+        );
+        assert_eq!(
+            anthropic["messages"][0]["content"][1],
+            serde_json::json!({
+                "type": "image",
+                "source": {
+                    "type": "url",
+                    "url": "https://example.com/photo.jpg"
+                }
+            })
+        );
+    }
+
+    #[test]
     fn anthropic_response_to_chat_completions_basic() {
         let anthropic_resp = serde_json::json!({
             "id": "msg_abc123",
@@ -1506,6 +1991,27 @@ mod tests {
         assert_eq!(cc["usage"]["prompt_tokens"], 10);
         assert_eq!(cc["usage"]["completion_tokens"], 25);
         assert_eq!(cc["usage"]["total_tokens"], 35);
+    }
+
+    #[test]
+    fn anthropic_response_preserves_all_text_blocks() {
+        let response = serde_json::json!({
+            "id": "msg_123",
+            "model": "claude-3-5-sonnet",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Hello "},
+                {"type": "text", "text": "world"}
+            ],
+            "stop_reason": "end_turn"
+        });
+
+        let translated = anthropic_response_to_chat_completions(&response);
+
+        assert_eq!(
+            translated["choices"][0]["message"]["content"],
+            "Hello world"
+        );
     }
 
     #[test]

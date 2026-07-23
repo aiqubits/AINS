@@ -1,6 +1,6 @@
 #![cfg(not(feature = "ains-salvo"))]
 
-//! Integration tests for the Responses API (`/api/ai/chat`).
+//! Integration tests for the Responses API (`/api/ai/response`).
 //!
 //! These tests require running PostgreSQL and Redis instances.
 //! Start services before running:
@@ -19,7 +19,15 @@ use common::axum as axum_helpers;
 
 async fn body_to_json(response: ains_axum::Response) -> Value {
     let bytes = response.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    parse_body_json(&bytes)
+}
+
+fn parse_body_json(bytes: &[u8]) -> Value {
+    if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(bytes).expect("non-empty response body must contain valid JSON")
+    }
 }
 
 async fn post(
@@ -46,9 +54,68 @@ async fn post(
 
 fn error_message(body: &Value) -> String {
     body.get("message")
+        .or_else(|| body.get("error").and_then(|error| error.get("message")))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase()
+}
+
+#[test]
+fn body_json_parser_only_maps_an_empty_body_to_null() {
+    assert_eq!(parse_body_json(&[]), Value::Null);
+    assert_eq!(parse_body_json(br#"{"ok":true}"#), json!({"ok": true}));
+}
+
+#[test]
+#[should_panic(expected = "non-empty response body must contain valid JSON")]
+fn body_json_parser_does_not_hide_malformed_json() {
+    let _ = parse_body_json(b"not-json");
+}
+
+#[tokio::test]
+async fn test_old_ai_chat_route_is_not_registered() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let (status, _) = post(&app, "/api/ai/chat", None, Some(&json!({"input": "Hello"}))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_direct_capabilities_reach_unified_route() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_direct").await;
+    let cases = [
+        json!({
+            "capability": "embedding",
+            "model": "embed-model",
+            "input": "hello",
+            "store": false,
+            "tools": []
+        }),
+        json!({
+            "capability": "stt",
+            "model": "stt-model",
+            "input": {"data": "YWJj", "format": "wav"},
+            "store": false,
+            "tools": []
+        }),
+        json!({
+            "capability": "tts",
+            "model": "tts-model",
+            "input": "hello",
+            "audio": {"voice": "alloy", "format": "mp3", "speed": 1.0},
+            "store": false,
+            "tools": []
+        }),
+    ];
+
+    for body in cases {
+        let (status, response) = post(&app, "/api/ai/response", Some(&token), Some(&body)).await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "direct capability should pass validation and reach channel selection: {response}"
+        );
+    }
 }
 
 // ── Responses API: Non-streaming ────────────────────────────────
@@ -56,13 +123,12 @@ fn error_message(body: &Value) -> String {
 #[tokio::test]
 async fn test_responses_text_input_returns_response_format() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_text");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_text").await;
 
     // Simple text input using Responses API format
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "Hello!"
@@ -70,20 +136,18 @@ async fn test_responses_text_input_returns_response_format() {
     )
     .await;
 
-    // No usable channel exists for this tenant, so should get 503.
-    // (Leftover channels from other tests may exist but won't be reachable.)
+    // The isolated tenant has no channels, so channel selection returns 503.
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]
 async fn test_responses_with_instructions() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_instr");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_instr").await;
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "What is Rust?",
@@ -98,12 +162,11 @@ async fn test_responses_with_instructions() {
 #[tokio::test]
 async fn test_responses_with_developer_instructions() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_dev");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_dev").await;
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "Hello",
@@ -119,12 +182,11 @@ async fn test_responses_with_developer_instructions() {
 #[tokio::test]
 async fn test_responses_max_output_tokens() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_max");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_max").await;
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "Hi",
@@ -140,9 +202,9 @@ async fn test_responses_max_output_tokens() {
 async fn test_responses_returns_401_without_auth() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
 
-    let (status, _body) = post(
+    let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         None,
         Some(&json!({
             "input": "Hello"
@@ -155,6 +217,9 @@ async fn test_responses_returns_401_without_auth() {
         StatusCode::UNAUTHORIZED,
         "Responses endpoint should require authentication"
     );
+    assert_eq!(body["object"], "response");
+    assert_eq!(body["status"], "failed");
+    assert_eq!(body["error"]["code"], "unauthorized");
 }
 
 #[tokio::test]
@@ -166,7 +231,7 @@ async fn test_responses_rejects_invalid_format() {
     // Missing 'input' field should be rejected
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "model": "gpt-4o"
@@ -189,7 +254,7 @@ async fn test_responses_multi_turn_messages() {
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": [
@@ -212,7 +277,7 @@ async fn test_responses_with_image_input() {
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": [{
@@ -235,9 +300,9 @@ async fn test_responses_web_search_tool() {
     let email = common::unique_email("resp_web");
     let token = axum_helpers::register_and_login(&app, &email).await;
 
-    let (status, _body) = post(
+    let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "Who is the current president of France?",
@@ -246,7 +311,8 @@ async fn test_responses_web_search_tool() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(error_message(&body).contains("tools are not supported"));
 }
 
 // ── Responses API: Streaming ────────────────────────────────────
@@ -255,52 +321,10 @@ async fn test_responses_web_search_tool() {
 async fn test_responses_streaming_returns_sse() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
 
-    // Create an isolated tenant with no channels to guarantee 503 response
-    let sys_email = common::unique_email("str_iso_sys");
-    let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
-    let tenant_name = common::unique_table_name("str_tenant");
-    let (status, body) = post(
-        &app,
-        "/api/tenants",
-        Some(&sys_token),
-        Some(&json!({
-            "name": tenant_name,
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let isolated_tenant_id = body["id"].as_str().unwrap().to_string();
+    // Isolated tenant with no channels guarantees the 503-without-SSE response.
+    let token = axum_helpers::register_isolated_tenant_user(&app, "str_iso").await;
 
-    // Create a user in the isolated tenant
-    let user_email = common::unique_email("str_iso_user");
-    let (status, _) = post(
-        &app,
-        "/api/users",
-        Some(&sys_token),
-        Some(&json!({
-            "email": user_email,
-            "password": "Password123!",
-            "name": "Isolated Streaming User",
-            "tenant_id": isolated_tenant_id,
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let (status, body) = post(
-        &app,
-        "/api/public/auth/login",
-        None,
-        Some(&json!({
-            "email": user_email,
-            "password": "Password123!",
-        })),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    let token = body["token"].as_str().unwrap().to_string();
-
-    let uri = "/api/ai/chat";
+    let uri = "/api/ai/response";
     let body_str = serde_json::to_string(&json!({
         "input": "Hello",
         "stream": true
@@ -399,7 +423,7 @@ async fn test_responses_disabled_tenant_returns_403() {
     // User from disabled tenant should get 403
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "Hello"

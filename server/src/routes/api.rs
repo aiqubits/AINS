@@ -7,7 +7,7 @@ use crate::handlers::api::{
 };
 use crate::handlers::gateway::{create_channel, delete_channel, list_channels, update_channel};
 use crate::handlers::metering::{get_token_usage_stats, list_token_usage};
-use crate::handlers::responses::responses_chat;
+use crate::handlers::responses::ai_response;
 use crate::handlers::tenant::{
     create_tenant, delete_tenant, list_tenants, move_user_tenant, update_tenant,
 };
@@ -45,7 +45,7 @@ pub fn api_routes() -> AppRouter {
 
     AppRouter::new()
         .route("/health", get(health_check))
-        .route("/ai/chat", post(responses_chat))
+        .route("/ai/response", post(ai_response))
         .merge(self_routes)
         .merge(admin_routes)
 }

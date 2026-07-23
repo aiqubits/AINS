@@ -132,7 +132,8 @@ fn build_router(state: ains_server::AppState) -> Router {
     // Use the production build_app_router, but we replicate the key parts here
     // so the test is self-contained. The critical thing is that the WeChat
     // callback routes are conditionally registered based on state.wechat.
-    let router = Router::new()
+
+    Router::new()
         .nest(
             "/api",
             ains_server::routes::api_routes().layer(from_fn_with_state(
@@ -159,9 +160,7 @@ fn build_router(state: ains_server::AppState) -> Router {
         .layer(from_fn(ains_server::middlewares::panic_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(cors)
-        .with_state(state);
-
-    router
+        .with_state(state)
 }
 
 /// Build a simple test router WITHOUT WeChat components (wechat: None).
@@ -638,7 +637,7 @@ async fn test_wx_login_success() {
 
     let body = body_to_json(response).await;
     assert!(
-        body["token"].as_str().unwrap_or("").len() > 0,
+        !body["token"].as_str().unwrap_or("").is_empty(),
         "JWT must be issued"
     );
     assert_eq!(body["token_type"], "Bearer");
@@ -1195,7 +1194,7 @@ async fn test_login_with_captcha_mismatched_email() {
 
     let body = body_to_json(response).await;
     assert!(
-        body["token"].as_str().map_or(false, |t| !t.is_empty()),
+        body["token"].as_str().is_some_and(|t| !t.is_empty()),
         "JWT must be issued on successful captcha-bound login"
     );
 }
@@ -1275,7 +1274,7 @@ async fn test_login_valid_captcha_wrong_password() {
     assert!(
         body["message"]
             .as_str()
-            .map_or(false, |m| m.contains("Invalid email or password")),
+            .is_some_and(|m| m.contains("Invalid email or password")),
         "must return generic auth error, got: {:?}",
         body
     );

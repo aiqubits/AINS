@@ -27,6 +27,7 @@ pub async fn auth_middleware<S: MiddlewareState + 'static>(
     next: Next,
 ) -> Response {
     let path = request.uri().path();
+    let uses_ai_response_envelope = is_ai_response_path(path);
 
     // Skip authentication for public health endpoint.
     // Check both with and without the /api prefix to make the middleware
@@ -44,7 +45,12 @@ pub async fn auth_middleware<S: MiddlewareState + 'static>(
         Some(token) => token,
         None => match extract_jwt_cookie(&request) {
             Some(token) => token,
-            None => return unauthorized_response("Missing or invalid Authorization header"),
+            None => {
+                return unauthorized_response_for_request(
+                    "Missing or invalid Authorization header",
+                    uses_ai_response_envelope,
+                );
+            }
         },
     };
 
@@ -55,7 +61,10 @@ pub async fn auth_middleware<S: MiddlewareState + 'static>(
                 Ok(id) => id,
                 Err(_) => {
                     tracing::warn!("Invalid user ID format in token: {}", claims.sub);
-                    return unauthorized_response("Invalid or expired token");
+                    return unauthorized_response_for_request(
+                        "Invalid or expired token",
+                        uses_ai_response_envelope,
+                    );
                 }
             };
 
@@ -70,13 +79,16 @@ pub async fn auth_middleware<S: MiddlewareState + 'static>(
                 }
                 Err(e) => {
                     tracing::warn!("Token version validation failed: {}", e);
-                    unauthorized_response("Invalid or expired token")
+                    unauthorized_response_for_request(
+                        "Invalid or expired token",
+                        uses_ai_response_envelope,
+                    )
                 }
             }
         }
         Err(e) => {
             tracing::warn!("Token validation failed: {}", e);
-            unauthorized_response("Invalid or expired token")
+            unauthorized_response_for_request("Invalid or expired token", uses_ai_response_envelope)
         }
     }
 }
@@ -305,6 +317,25 @@ fn unauthorized_response(message: &str) -> Response {
         .into_response()
 }
 
+fn is_ai_response_path(path: &str) -> bool {
+    matches!(path, "/ai/response" | "/api/ai/response")
+}
+
+fn unauthorized_response_for_request(message: &str, uses_ai_response_envelope: bool) -> Response {
+    if uses_ai_response_envelope {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(ains_runtime::ai_response_error_body(
+                "unauthorized",
+                message,
+            )),
+        )
+            .into_response()
+    } else {
+        unauthorized_response(message)
+    }
+}
+
 fn forbidden_response(message: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
@@ -383,6 +414,19 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert!(extract_bearer_token(&req).is_none());
+    }
+
+    #[tokio::test]
+    async fn ai_response_auth_errors_use_the_failed_envelope() {
+        assert!(is_ai_response_path("/ai/response"));
+        assert!(is_ai_response_path("/api/ai/response"));
+        let response = unauthorized_response_for_request("Authentication required", true);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "unauthorized");
     }
 
     // ── extract_jwt_cookie tests ─────────────────────────────

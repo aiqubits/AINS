@@ -142,7 +142,10 @@ impl QuotaService {
     }
 
     /// Check whether a channel's circuit breaker is currently tripped.
-    async fn is_circuit_broken(&self, channel_id: &str) -> Result<bool, QuotaError> {
+    ///
+    /// Exposed so the gateway can filter open channels out of weighted
+    /// selection instead of randomly picking one and failing the request.
+    pub async fn is_circuit_broken(&self, channel_id: &str) -> Result<bool, QuotaError> {
         let key = format!("cb:channel:{}:tripped", channel_id);
         Ok(self.cache.exists(&key).await.unwrap_or(false))
     }

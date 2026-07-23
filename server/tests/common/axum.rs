@@ -247,6 +247,73 @@ pub async fn create_system_and_login(app: &Router, email: &str) -> String {
     login_body["token"].as_str().unwrap().to_string()
 }
 
+/// Send an authenticated JSON POST and return `(status, parsed_body)`.
+async fn auth_json_post(app: &Router, uri: &str, token: &str, body: &Value) -> (StatusCode, Value) {
+    let auth = format!("Bearer {token}");
+    let resp = send_request(
+        app,
+        Method::POST,
+        uri,
+        vec![
+            ("content-type", "application/json"),
+            ("authorization", &auth),
+        ],
+        Body::from(serde_json::to_string(body).unwrap()),
+    )
+    .await;
+    let status = resp.status();
+    (status, body_to_json(resp).await)
+}
+
+/// Create an isolated tenant that has no channels, create a user inside it, and
+/// return that user's JWT token.
+///
+/// Self-registered users all land in the shared `default` tenant, where sibling
+/// tests concurrently create AI channels. Any test that needs a hermetic
+/// "no active channel" premise must therefore use a dedicated tenant — otherwise
+/// the request may pick up an unrelated channel and fail with an upstream error
+/// (a flaky 4xx/5xx instead of the expected 503 `NoChannel`).
+pub async fn register_isolated_tenant_user(app: &Router, label: &str) -> String {
+    let sys_email = common::unique_email(&format!("{label}_sys"));
+    let sys_token = create_system_and_login(app, &sys_email).await;
+
+    let tenant_name = common::unique_table_name(label);
+    let (status, body) = auth_json_post(
+        app,
+        "/api/tenants",
+        &sys_token,
+        &serde_json::json!({ "name": tenant_name }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "isolated tenant creation should succeed"
+    );
+    let tenant_id = body["id"].as_str().expect("tenant id").to_string();
+
+    let email = common::unique_email(label);
+    let (status, _) = auth_json_post(
+        app,
+        "/api/users",
+        &sys_token,
+        &serde_json::json!({
+            "email": email,
+            "password": DEFAULT_TEST_PASSWORD,
+            "name": "Isolated Tenant User",
+            "tenant_id": tenant_id,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "isolated tenant user creation should succeed"
+    );
+
+    login(app, &email).await
+}
+
 /// Create an admin user in the database and return the JWT token.
 pub async fn create_admin_and_login(app: &Router, email: &str) -> String {
     use ains_runtime::auth::JwtClaims;
@@ -346,7 +413,6 @@ pub async fn create_app_with_quota(quota_config: QuotaConfig) -> Router {
     let limiter = RedisRateLimiter::disabled(distributed_ratelimit::RateLimitConfig::default());
     let router =
         ains_server::bootstrap::axum::build_app_router(state.clone(), "development", limiter);
-    let router = router.with_state(state.clone());
 
-    router
+    router.with_state(state.clone())
 }

@@ -76,6 +76,11 @@ data:
         keepalive 32;
     }
 
+    # limit_req_zone is valid only in the http context (outside server).
+    limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
+    limit_req_zone $binary_remote_addr zone=api_limit:10m rate=60r/m;
+    limit_req_status 429;
+
     server {
         listen 80;
         server_name _;
@@ -101,16 +106,32 @@ data:
             application/wasm
             image/svg+xml;
 
-        # Serve .wasm files with correct MIME type (required by some browsers)
-        types {
-            application/wasm wasm;
+        # WASM files — set MIME type without replacing the inherited MIME table.
+        location ~* \.wasm$ {
+            add_header Content-Type application/wasm;
+            expires 7d;
+            add_header Cache-Control "public, immutable";
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'" always;
+            access_log off;
+            try_files $uri =404;
         }
 
-        # Rate limiting — protect login endpoint from brute force
-        limit_req_zone $binary_remote_addr zone=login_limit:10m rate=5r/m;
-        # General API rate limit — prevent resource exhaustion (60 req/min per IP)
-        limit_req_zone $binary_remote_addr zone=api_limit:10m rate=60r/m;
-        limit_req_status 429;
+        # Other static assets — preserve the default MIME mappings.
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
+            expires 7d;
+            add_header Cache-Control "public, immutable";
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            add_header X-Frame-Options "SAMEORIGIN" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'" always;
+            access_log off;
+            try_files $uri =404;
+        }
 
         # Security headers
         # NOTE: HSTS is included here so it's ready when HTTPS is enabled.
@@ -119,7 +140,28 @@ data:
         add_header X-Frame-Options "SAMEORIGIN" always;
         add_header X-Content-Type-Options "nosniff" always;
         add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'" always;
+
+        # Unified AI endpoint — supports both JSON and long-lived SSE responses.
+        location = /api/ai/response {
+            limit_req zone=api_limit burst=10 nodelay;
+
+            proxy_pass http://backend;
+            proxy_http_version 1.1;
+
+            proxy_set_header Host              $host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header Connection        "";
+
+            proxy_connect_timeout 60s;
+            proxy_send_timeout    300s;
+            proxy_read_timeout    300s;
+
+            proxy_buffering off;
+            proxy_cache off;
+        }
 
         # Auth endpoints — stricter rate limiting
         location /api/public/auth/ {
@@ -169,19 +211,6 @@ data:
             proxy_buffering on;
             proxy_buffer_size 4k;
             proxy_buffers 8 4k;
-        }
-
-        # Static assets - cache in browser
-        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot|wasm)$ {
-            expires 7d;
-            add_header Cache-Control "public, immutable";
-            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-            add_header X-Frame-Options "SAMEORIGIN" always;
-            add_header X-Content-Type-Options "nosniff" always;
-            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
-            add_header Content-Security-Policy "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self'" always;
-            access_log off;
-            try_files $uri =404;
         }
 
         # SPA fallback

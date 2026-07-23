@@ -51,6 +51,17 @@ pub fn handle_gateway_error(e: GatewayError) -> HttpError {
         }
         GatewayError::NotFound => HttpError::not_found("Channel not found"),
         GatewayError::InvalidInput(s) => HttpError::bad_request(s),
+        GatewayError::RateLimited(s) => HttpError::too_many_requests(s),
+        GatewayError::UpstreamClient { status } => {
+            // The provider rejected the caller's request (4xx). Preserve the
+            // upstream status so the AINS Client can distinguish a bad request
+            // from a throttled (429) or unavailable (503) channel.
+            HttpError::with_status(
+                status,
+                "upstream_rejected",
+                format!("AI provider rejected the request (HTTP {status})"),
+            )
+        }
         GatewayError::HasUsage { id, usage_count } => {
             let msg = format!(
                 "Channel \"{id}\" has {usage_count} token usage record(s). \
@@ -126,6 +137,22 @@ mod tests {
         let http = handle_gateway_error(err);
         assert_eq!(http.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(http.message.contains("provider"));
+    }
+
+    #[test]
+    fn handle_gateway_error_rate_limited_maps_to_429() {
+        let err = GatewayError::RateLimited("Channel rate limit exceeded (TPM)".into());
+        let http = handle_gateway_error(err);
+        assert_eq!(http.status, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn handle_gateway_error_upstream_client_preserves_status() {
+        for code in [400u16, 413, 422] {
+            let http = handle_gateway_error(GatewayError::UpstreamClient { status: code });
+            assert_eq!(http.status.as_u16(), code);
+            assert!(http.message.contains("provider rejected"));
+        }
     }
 
     #[test]

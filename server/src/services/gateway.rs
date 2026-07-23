@@ -3,7 +3,10 @@ use aes_gcm::{
     aead::{Aead, OsRng, rand_core::RngCore},
 };
 use anyhow::Context;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+};
 use chrono::Utc;
 use hkdf::Hkdf;
 use rand::Rng;
@@ -30,7 +33,46 @@ use crate::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
+
+/// Maximum number of raw upstream chunks queued per streaming request.
+/// A full queue applies backpressure to the upstream HTTP body.
+const STREAM_CHANNEL_CAPACITY: usize = 32;
+
+/// Overall deadline for a non-streaming upstream request. Aligned with the
+/// reverse proxy's 300s route timeout so long AI operations (STT/TTS, large
+/// completions) are not cut off prematurely.
+const NON_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Per-read idle timeout applied to both the non-streaming and streaming
+/// clients. Bounds a provider that accepts the connection but then stops
+/// sending data, so a stalled upstream cannot hold request resources open
+/// until the overall/route timeout.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamOutcome {
+    Completed,
+    Incomplete,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitOutcome {
+    Success,
+    Failure,
+}
+
+fn stream_circuit_outcome(result: &Result<StreamOutcome, GatewayError>) -> Option<CircuitOutcome> {
+    match result {
+        Ok(StreamOutcome::Completed) => Some(CircuitOutcome::Success),
+        Ok(StreamOutcome::Incomplete) => Some(CircuitOutcome::Failure),
+        Ok(StreamOutcome::Cancelled) => None,
+        // A client-attributable provider 4xx says nothing about channel health.
+        Err(e) if e.is_channel_health_failure() => Some(CircuitOutcome::Failure),
+        Err(_) => None,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayError {
@@ -40,12 +82,45 @@ pub enum GatewayError {
     NotFound,
     #[error("Invalid channel input: {0}")]
     InvalidInput(String),
+    #[error("Rate limit exceeded: {0}")]
+    RateLimited(String),
+    /// Client-attributable upstream failure (provider returned 4xx other than
+    /// 429). These do NOT reflect channel health and must not trip the circuit
+    /// breaker — a malformed client request should never disable a shared
+    /// channel for other tenants.
+    #[error("Upstream AI provider rejected the request: HTTP {status}")]
+    UpstreamClient { status: u16 },
     #[error("Upstream AI provider failed: {0}")]
     Upstream(String),
     #[error("Channel {id} has {usage_count} token usage record(s); cannot delete")]
     HasUsage { id: String, usage_count: u64 },
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
+}
+
+impl GatewayError {
+    /// Whether this error reflects a channel-health failure that should count
+    /// toward the circuit breaker.
+    ///
+    /// Only network errors, provider 5xx, provider 429, and invalid provider
+    /// responses degrade channel health. Client-attributable 4xx responses
+    /// (400/413/422 …) are the caller's fault and are treated as neutral so a
+    /// stream of bad requests cannot open a tenant-shared channel.
+    fn is_channel_health_failure(&self) -> bool {
+        matches!(self, GatewayError::Upstream(_))
+    }
+}
+
+/// Classify a non-success upstream HTTP status into the appropriate error
+/// variant. Client errors (4xx except 429) become [`GatewayError::UpstreamClient`];
+/// everything else (429, 5xx) is a channel-health [`GatewayError::Upstream`].
+fn upstream_status_error(status: reqwest::StatusCode) -> GatewayError {
+    let code = status.as_u16();
+    if status.is_client_error() && code != 429 {
+        GatewayError::UpstreamClient { status: code }
+    } else {
+        GatewayError::Upstream(format!("HTTP {code}"))
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -132,17 +207,27 @@ impl GatewayService {
         metering: Option<MeteringService>,
         no_proxy: bool,
     ) -> Self {
-        // Client for non-streaming API calls (30s total timeout).
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(30));
+        // Client for non-streaming API calls. Long AI operations (large chat
+        // completions, STT transcription, TTS synthesis) can legitimately run
+        // well past 30s, so the overall deadline is aligned with the reverse
+        // proxy's 300s route timeout. A shorter per-read (idle) timeout still
+        // fails fast when a provider accepts the connection but then stops
+        // sending data, instead of holding the request open for the full 300s.
+        let mut builder = reqwest::Client::builder()
+            .timeout(NON_STREAM_REQUEST_TIMEOUT)
+            .read_timeout(UPSTREAM_IDLE_TIMEOUT);
         if no_proxy {
             builder = builder.no_proxy();
         }
         let client = builder.build().expect("valid reqwest client");
 
-        // Client for SSE streaming (connect_timeout only, no total timeout)
-        // so that long-lived connections (>30s) are not prematurely terminated.
+        // Client for SSE streaming: no blanket request timeout (connections are
+        // long-lived), but a per-read idle timeout bounds a provider that opens
+        // the stream and then stalls, so a hung upstream cannot pin the request
+        // and its resources indefinitely.
         let mut stream_builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(30))
+            .read_timeout(UPSTREAM_IDLE_TIMEOUT)
             .pool_max_idle_per_host(0); // SSE connections are long-lived; don't pool
         if no_proxy {
             stream_builder = stream_builder.no_proxy();
@@ -195,14 +280,7 @@ impl GatewayService {
         input: CreateChannelInput,
         tenant_id: &str,
     ) -> Result<ChannelResponse, GatewayError> {
-        self.validate(
-            &input.name,
-            &input.base_url,
-            input.weight,
-            &input.models,
-            &input.capabilities,
-            &input.api_key,
-        )?;
+        self.validate(&input)?;
         let now = Utc::now();
         let model = ActiveModel {
             id: Set(Uuid::new_v4()),
@@ -243,6 +321,7 @@ impl GatewayService {
             .await
             .context("load channel")?
             .ok_or(GatewayError::NotFound)?;
+        let protocol_type = found.protocol_type.clone();
         let mut active: ActiveModel = found.into();
         if let Some(v) = input.name {
             if v.trim().is_empty() {
@@ -260,6 +339,7 @@ impl GatewayService {
                     "at least one capability is required".into(),
                 ));
             }
+            validate_protocol_capabilities(&protocol_type, &v)?;
             active.capabilities = Set(serde_json::to_value(v).map_err(|e| {
                 GatewayError::Internal(anyhow::anyhow!("serialize capabilities: {}", e))
             })?);
@@ -345,29 +425,37 @@ impl GatewayService {
         tenant_id: &str,
         user_id: &str,
         capability: ModelCapability,
-        body: Value,
+        required_capabilities: &[ModelCapability],
+        mut body: Value,
     ) -> Result<Value, GatewayError> {
-        let channel = self.select_channel(tenant_id, &capability).await?;
+        let requested_model = dispatch::extract_model(&body);
+        let channel = self
+            .select_channel(tenant_id, required_capabilities, requested_model.as_deref())
+            .await?;
+        ensure_request_model(&mut body, &channel)?;
+
+        // Estimate input tokens once from the outbound body — reused for the
+        // quota pre-check and, for audio capabilities that omit provider usage,
+        // as the synthesized billable input size for metering.
+        let input_token_estimate = estimate_tokens(&body);
 
         // Check quotas before proxying (circuit breaker + rate limits).
-        if let Some(ref quota) = self.quota {
-            let estimated = estimate_tokens(&body);
-            if let Err(e) = quota
+        if let Some(ref quota) = self.quota
+            && let Err(e) = quota
                 .check_all(
                     &channel.id.to_string(),
                     tenant_id,
                     capability.as_str(),
-                    estimated,
+                    input_token_estimate,
                 )
                 .await
-            {
-                use crate::services::quota::QuotaError;
-                match e {
-                    QuotaError::CircuitBroken => return Err(GatewayError::NoChannel),
-                    QuotaError::Unavailable => { /* fail-open: allow request */ }
-                    other => {
-                        return Err(GatewayError::InvalidInput(other.to_string()));
-                    }
+        {
+            use crate::services::quota::QuotaError;
+            match e {
+                QuotaError::CircuitBroken => return Err(GatewayError::NoChannel),
+                QuotaError::Unavailable => { /* fail-open: allow request */ }
+                other => {
+                    return Err(GatewayError::RateLimited(other.to_string()));
                 }
             }
         }
@@ -391,7 +479,7 @@ impl GatewayService {
             }
         });
 
-        let result = match action {
+        let mut result = match action {
             DispatchAction::JsonPost { url, body } => {
                 if channel.protocol_type == "anthropic" {
                     self.send_anthropic(&url, &api_key, &body).await
@@ -405,13 +493,29 @@ impl GatewayService {
             }
         };
 
+        if let Ok(response) = &mut result
+            && response.get("model").is_none()
+            && let Some(model) = &model_name
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("model".into(), Value::String(model.clone()));
+        }
+        if let Ok(response) = &result
+            && let Err(error) = validate_provider_response(&capability, response)
+        {
+            result = Err(error);
+        }
+
         // Record success/failure for circuit breaker and metering.
+        // Client-attributable upstream 4xx responses are neutral: they neither
+        // reset nor trip the breaker, so a bad request cannot disable a channel.
         if let Some(ref quota) = self.quota {
             match &result {
                 Ok(_) => quota.record_success(&channel.id.to_string()).await,
-                Err(_) => {
+                Err(e) if e.is_channel_health_failure() => {
                     quota.record_failure(&channel.id.to_string()).await;
                 }
+                Err(_) => { /* client error: neutral for breaker */ }
             }
         }
 
@@ -433,9 +537,16 @@ impl GatewayService {
             });
             let req_type = capability.as_str().to_string();
             let mdl = model_name.unwrap_or_else(|| "unknown".to_string());
+            // Audio responses (TTS/STT) carry no `usage` field, which the
+            // metering layer treats as "nothing to record". Synthesize a usage
+            // object so the request is still billed; text capabilities always
+            // report real usage and are passed through unchanged.
+            let synthesized =
+                synthesized_usage_for_metering(&capability, input_token_estimate, response);
+            let metered = synthesized.as_ref().unwrap_or(response);
             // Best-effort: ignore recording errors (non-fatal).
             let _ = metering
-                .record_usage(uid, tenant_id, channel.id, &mdl, &req_type, response)
+                .record_usage(uid, tenant_id, channel.id, &mdl, &req_type, metered)
                 .await;
         }
 
@@ -449,8 +560,12 @@ impl GatewayService {
     /// (handler layer) is responsible for translating these bytes into the
     /// Responses API SSE format.
     ///
-    /// Returns `(receiver, channel_id)` so the caller can record metering
-    /// against the selected channel after the stream completes.
+    /// Returns `(receiver, channel_id, selected_model, input_token_estimate)`
+    /// so the caller can record metering against the selected channel and
+    /// actual model after the stream completes. `input_token_estimate` is the
+    /// character-based estimate of the outbound prompt, used as a fallback when
+    /// the upstream stream never reports prompt usage (e.g. a stream aborted
+    /// before any usage frame, or a provider that omits `stream_options`).
     ///
     /// Quota check is performed upfront before streaming starts.
     /// Token metering is NOT performed by this method — the handler should
@@ -461,34 +576,49 @@ impl GatewayService {
         tenant_id: &str,
         _user_id: &str,
         capability: ModelCapability,
-        body: Value,
+        required_capabilities: &[ModelCapability],
+        mut body: Value,
     ) -> Result<
         (
-            tokio::sync::mpsc::UnboundedReceiver<Result<Bytes, String>>,
+            tokio::sync::mpsc::Receiver<Result<Bytes, String>>,
             Uuid,
+            String,
+            u64,
         ),
         GatewayError,
     > {
-        let channel = self.select_channel(tenant_id, &capability).await?;
+        let requested_model = dispatch::extract_model(&body);
+        let channel = self
+            .select_channel(tenant_id, required_capabilities, requested_model.as_deref())
+            .await?;
+        ensure_request_model(&mut body, &channel)?;
+        if channel.protocol_type == "openai" {
+            enable_stream_usage(&mut body)?;
+        }
+        let selected_model = dispatch::extract_model(&body)
+            .ok_or_else(|| GatewayError::InvalidInput("AI request model is required".into()))?;
+
+        // Estimate input tokens once — reused for the quota pre-check and
+        // returned to the caller as a metering fallback when the upstream
+        // stream never reports prompt usage.
+        let input_token_estimate = estimate_tokens(&body);
 
         // Check quotas before proxying (same as proxy()).
-        if let Some(ref quota) = self.quota {
-            let estimated = estimate_tokens(&body);
-            if let Err(e) = quota
+        if let Some(ref quota) = self.quota
+            && let Err(e) = quota
                 .check_all(
                     &channel.id.to_string(),
                     tenant_id,
                     capability.as_str(),
-                    estimated,
+                    input_token_estimate,
                 )
                 .await
-            {
-                use crate::services::quota::QuotaError;
-                match e {
-                    QuotaError::CircuitBroken => return Err(GatewayError::NoChannel),
-                    QuotaError::Unavailable => { /* fail-open */ }
-                    other => return Err(GatewayError::InvalidInput(other.to_string())),
-                }
+        {
+            use crate::services::quota::QuotaError;
+            match e {
+                QuotaError::CircuitBroken => return Err(GatewayError::NoChannel),
+                QuotaError::Unavailable => { /* fail-open */ }
+                other => return Err(GatewayError::RateLimited(other.to_string())),
             }
         }
 
@@ -496,7 +626,7 @@ impl GatewayService {
         let action =
             dispatch::dispatch_proxy(&capability, &channel.protocol_type, &channel.base_url, body)?;
 
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let client = self.stream_client.clone();
         let channel_id = channel.id;
         let quota = self.quota.clone();
@@ -512,10 +642,16 @@ impl GatewayService {
 
                     // Record success/failure for circuit breaker.
                     if let Some(ref q) = quota {
-                        match &result {
-                            Ok(_) => q.record_success(&channel_id.to_string()).await,
-                            Err(_) => {
+                        match stream_circuit_outcome(&result) {
+                            Some(CircuitOutcome::Success) => {
+                                q.record_success(&channel_id.to_string()).await
+                            }
+                            Some(CircuitOutcome::Failure) => {
                                 q.record_failure(&channel_id.to_string()).await;
+                            }
+                            None => {
+                                // A downstream disconnect says nothing about the
+                                // provider's health; preserve breaker state.
                             }
                         }
                     }
@@ -523,12 +659,12 @@ impl GatewayService {
             }
             DispatchAction::TtsBinary { .. } | DispatchAction::SttMultipart { .. } => {
                 return Err(GatewayError::InvalidInput(
-                    "Streaming is only supported for chat/embedding endpoints".into(),
+                    "Streaming is not supported for STT or TTS capabilities".into(),
                 ));
             }
         }
 
-        Ok((rx, channel_id))
+        Ok((rx, channel_id, selected_model, input_token_estimate))
     }
 
     /// Handle STT and record metering (STT has a different flow: multipart upload
@@ -539,25 +675,46 @@ impl GatewayService {
         action: &DispatchAction,
         model: &str,
     ) -> Result<Value, GatewayError> {
-        let result = match action {
+        let mut result = match action {
             DispatchAction::SttMultipart {
                 url,
                 audio_bytes,
                 filename,
+                form_fields,
                 ..
             } => {
-                self.send_stt(url, ctx.api_key, audio_bytes.clone(), filename, model)
-                    .await
+                self.send_stt(
+                    url,
+                    ctx.api_key,
+                    audio_bytes.clone(),
+                    filename,
+                    model,
+                    form_fields,
+                )
+                .await
             }
             _ => unreachable!(),
         };
 
+        if let Ok(response) = &mut result
+            && response.get("model").is_none()
+            && let Some(object) = response.as_object_mut()
+        {
+            object.insert("model".into(), Value::String(model.to_string()));
+        }
+        if let Ok(response) = &result
+            && let Err(error) = validate_provider_response(&ModelCapability::Stt, response)
+        {
+            result = Err(error);
+        }
+
         if let Some(ref quota) = self.quota {
             match &result {
                 Ok(_) => quota.record_success(&ctx.channel.id.to_string()).await,
-                Err(_) => {
+                Err(e) if e.is_channel_health_failure() => {
                     quota.record_failure(&ctx.channel.id.to_string()).await;
                 }
+                Err(_) => { /* client error: neutral for breaker */ }
             }
         }
 
@@ -575,6 +732,11 @@ impl GatewayService {
                 );
                 0
             });
+            // STT responses carry no `usage` field; synthesize one from the
+            // transcription size so the metering layer records the request
+            // rather than silently skipping it. Input is audio (no tokens).
+            let synthesized = synthesized_usage_for_metering(&ModelCapability::Stt, 0, response);
+            let metered = synthesized.as_ref().unwrap_or(response);
             let _ = metering
                 .record_usage(
                     uid,
@@ -582,7 +744,7 @@ impl GatewayService {
                     ctx.channel.id,
                     model,
                     ctx.req_type,
-                    response,
+                    metered,
                 )
                 .await;
         }
@@ -653,6 +815,7 @@ impl GatewayService {
         audio_bytes: Vec<u8>,
         filename: &str,
         model: &str,
+        form_fields: &[(String, String)],
     ) -> Result<Value, GatewayError> {
         let mime = audio_mime_from_filename(filename);
         let part = reqwest::multipart::Part::bytes(audio_bytes)
@@ -660,9 +823,12 @@ impl GatewayService {
             .mime_str(mime)
             .map_err(|e| GatewayError::Internal(anyhow::anyhow!("mime: {}", e)))?;
 
-        let form = reqwest::multipart::Form::new()
+        let mut form = reqwest::multipart::Form::new()
             .part("file", part)
             .text("model", model.to_string());
+        for (name, value) in form_fields {
+            form = form.text(name.clone(), value.clone());
+        }
 
         let response = self
             .client
@@ -672,7 +838,28 @@ impl GatewayService {
             .send()
             .await
             .map_err(|e| GatewayError::Upstream(e.to_string()))?;
-        Self::parse_json_response(response).await
+        let response_format = form_fields
+            .iter()
+            .find_map(|(name, value)| (name == "response_format").then_some(value.as_str()))
+            .unwrap_or("json");
+        if matches!(response_format, "text" | "srt" | "vtt") {
+            let status = response.status();
+            let text = response
+                .text()
+                .await
+                .map_err(|error| GatewayError::Upstream(error.to_string()))?;
+            if !status.is_success() {
+                tracing::warn!(
+                    upstream_status = %status.as_u16(),
+                    upstream_body = %text,
+                    "STT upstream returned error"
+                );
+                return Err(upstream_status_error(status));
+            }
+            Ok(serde_json::json!({"text": text}))
+        } else {
+            Self::parse_json_response(response).await
+        }
     }
 
     /// TTS: JSON POST, binary audio response.
@@ -682,6 +869,11 @@ impl GatewayService {
         api_key: &str,
         body: &Value,
     ) -> Result<Value, GatewayError> {
+        let requested_format = body
+            .get("response_format")
+            .and_then(Value::as_str)
+            .unwrap_or("mp3");
+        let fallback_content_type = tts_format_content_type(requested_format)?;
         let response = self
             .client
             .post(url)
@@ -699,8 +891,10 @@ impl GatewayService {
                 upstream_body = %body_text,
                 "TTS upstream returned error"
             );
-            return Err(GatewayError::Upstream(format!("HTTP {}", status.as_u16())));
+            return Err(upstream_status_error(status));
         }
+
+        let content_type = tts_content_type(response.headers(), fallback_content_type)?;
 
         let bytes = response
             .bytes()
@@ -710,10 +904,12 @@ impl GatewayService {
         // Return the binary audio as a base64-encoded JSON response so the
         // client can decode it. For a streaming response, a future upgrade
         // could return raw bytes directly.
-        let encoded = URL_SAFE_NO_PAD.encode(&bytes);
+        // Audio payloads use RFC 4648 standard base64. URL-safe/no-padding is
+        // reserved for the gateway's internal encrypted-key representation.
+        let encoded = encode_audio_base64(&bytes);
         Ok(serde_json::json!({
             "audio": encoded,
-            "content_type": "audio/mpeg"
+            "content_type": content_type
         }))
     }
 
@@ -727,7 +923,7 @@ impl GatewayService {
                 upstream_body = %body_text,
                 "Upstream AI provider returned error"
             );
-            return Err(GatewayError::Upstream(format!("HTTP {}", status.as_u16())));
+            return Err(upstream_status_error(status));
         }
         response
             .json::<Value>()
@@ -738,79 +934,336 @@ impl GatewayService {
     async fn select_channel(
         &self,
         tenant_id: &str,
-        capability: &ModelCapability,
+        required_capabilities: &[ModelCapability],
+        model: Option<&str>,
     ) -> Result<Model, GatewayError> {
-        let channels = Entity::find()
-            .filter(Column::TenantId.eq(tenant_id))
-            .filter(Column::IsActive.eq(true))
-            .filter(Expr::cust_with_values(
-                "capabilities ? CAST($1 AS text)",
-                vec![sea_orm::Value::from(capability.as_str())],
-            ))
+        let channels = candidate_channel_query(tenant_id, required_capabilities, model)
             .all(&*self.db)
             .await
             .context("load candidate channels")?;
         if channels.is_empty() {
             return Err(GatewayError::NoChannel);
         }
+        // Filter out channels whose circuit breaker is open BEFORE weighted
+        // selection. Otherwise an open channel could be randomly chosen and the
+        // request would fail with NoChannel even though other healthy channels
+        // exist. If every candidate is open we surface NoChannel.
+        let channels = self.retain_healthy_channels(channels).await;
         weighted_select(&channels)
             .cloned()
             .ok_or(GatewayError::NoChannel)
     }
+
+    /// Drop candidates whose circuit breaker is currently open. When no quota
+    /// service is configured (e.g. Redis unavailable / tests) all candidates
+    /// are considered healthy.
+    async fn retain_healthy_channels(&self, channels: Vec<Model>) -> Vec<Model> {
+        let Some(ref quota) = self.quota else {
+            return channels;
+        };
+        let mut healthy = Vec::with_capacity(channels.len());
+        for channel in channels {
+            let broken = quota
+                .is_circuit_broken(&channel.id.to_string())
+                .await
+                .unwrap_or(false);
+            if !broken {
+                healthy.push(channel);
+            }
+        }
+        healthy
+    }
+}
+
+fn tts_content_type(
+    headers: &reqwest::header::HeaderMap,
+    inferred: &'static str,
+) -> Result<&'static str, GatewayError> {
+    let Some(value) = headers.get(reqwest::header::CONTENT_TYPE) else {
+        return Ok(inferred);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| GatewayError::Upstream("Invalid TTS Content-Type header".into()))?
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim();
+    match value {
+        "audio/mpeg" => Ok("audio/mpeg"),
+        "audio/ogg" | "audio/opus" => Ok("audio/ogg"),
+        "audio/aac" => Ok("audio/aac"),
+        "audio/flac" => Ok("audio/flac"),
+        "audio/wav" | "audio/x-wav" => Ok("audio/wav"),
+        "audio/pcm" | "audio/L16" => Ok("audio/pcm"),
+        "application/octet-stream" | "" => Ok(inferred),
+        other => Err(GatewayError::Upstream(format!(
+            "Unsupported TTS Content-Type: {other}"
+        ))),
+    }
+}
+
+fn encode_audio_base64(bytes: &[u8]) -> String {
+    STANDARD.encode(bytes)
+}
+
+fn tts_format_content_type(requested_format: &str) -> Result<&'static str, GatewayError> {
+    let content_type = match requested_format.to_ascii_lowercase().as_str() {
+        "mp3" => "audio/mpeg",
+        "opus" => "audio/ogg",
+        "aac" => "audio/aac",
+        "flac" => "audio/flac",
+        "wav" => "audio/wav",
+        "pcm" => "audio/pcm",
+        other => {
+            return Err(GatewayError::InvalidInput(format!(
+                "Unsupported TTS response_format: {other}"
+            )));
+        }
+    };
+    Ok(content_type)
+}
+
+fn candidate_channel_query(
+    tenant_id: &str,
+    required_capabilities: &[ModelCapability],
+    model: Option<&str>,
+) -> sea_orm::Select<Entity> {
+    let mut query = Entity::find()
+        .filter(Column::TenantId.eq(tenant_id))
+        .filter(Column::IsActive.eq(true));
+    for capability in required_capabilities {
+        query = query.filter(Expr::cust_with_values(
+            "capabilities ? CAST($1 AS text)",
+            vec![sea_orm::Value::from(capability.as_str())],
+        ));
+    }
+    if required_capabilities.iter().any(|capability| {
+        matches!(
+            capability,
+            ModelCapability::Embedding | ModelCapability::Stt | ModelCapability::Tts
+        )
+    }) {
+        // These upstream APIs are OpenAI-specific. Filtering before weighted
+        // selection avoids randomly choosing an unusable legacy channel.
+        query = query.filter(Column::ProtocolType.eq("openai"));
+    }
+    if let Some(model) = model.filter(|model| !model.trim().is_empty()) {
+        query = query.filter(Expr::cust_with_values(
+            "models ? CAST($1 AS text)",
+            vec![sea_orm::Value::from(model)],
+        ));
+    }
+    query
+}
+
+fn ensure_request_model(body: &mut Value, channel: &Model) -> Result<(), GatewayError> {
+    if body.get("model").and_then(Value::as_str).is_some() {
+        return Ok(());
+    }
+    let model = channel
+        .models
+        .as_array()
+        .and_then(|models| models.first())
+        .and_then(Value::as_str)
+        .ok_or_else(|| GatewayError::InvalidInput("Selected channel has no usable model".into()))?;
+    body.as_object_mut()
+        .ok_or_else(|| GatewayError::InvalidInput("AI request body must be an object".into()))?
+        .insert("model".into(), Value::String(model.to_string()));
+    Ok(())
+}
+
+fn enable_stream_usage(body: &mut Value) -> Result<(), GatewayError> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| GatewayError::InvalidInput("AI request body must be an object".into()))?;
+    let options = object
+        .entry("stream_options")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| GatewayError::InvalidInput("stream_options must be an object".into()))?;
+    options.insert("include_usage".into(), Value::Bool(true));
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════
 //  Streaming proxy helpers
 // ═══════════════════════════════════════════════════════════════════
 
+async fn await_stream_or_closed<T>(
+    tx: &Sender<Result<Bytes, String>>,
+    future: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        _ = tx.closed() => None,
+        output = future => Some(output),
+    }
+}
+
+const DOWNSTREAM_STREAM_ERROR: &str = "AI provider stream failed";
+
+async fn send_downstream_stream_error(tx: &Sender<Result<Bytes, String>>) {
+    // Error notification is best-effort. It must never delay circuit-breaker
+    // failure recording when a slow consumer has filled the bounded queue.
+    let _ = tx.try_send(Err(DOWNSTREAM_STREAM_ERROR.into()));
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenAiSseEventKind {
+    Forward,
+    Done,
+}
+
+fn decode_sse_event(event: &[u8]) -> Result<&str, &'static str> {
+    std::str::from_utf8(event).map_err(|_| "SSE event is not valid UTF-8")
+}
+
+fn sse_field_value<'a>(event_block: &'a str, field: &str) -> Option<&'a str> {
+    event_block.lines().find_map(|line| {
+        let value = line.strip_prefix(field)?.strip_prefix(':')?;
+        Some(value.strip_prefix(' ').unwrap_or(value))
+    })
+}
+
+fn sse_data_payload(event_block: &str) -> Option<String> {
+    let mut found = false;
+    let mut payload = String::new();
+    for line in event_block.lines() {
+        let Some(value) = line.strip_prefix("data:") else {
+            continue;
+        };
+        if found {
+            payload.push('\n');
+        }
+        payload.push_str(value.strip_prefix(' ').unwrap_or(value));
+        found = true;
+    }
+    found.then_some(payload)
+}
+
+fn inspect_openai_sse_event(event: &[u8]) -> Result<OpenAiSseEventKind, &'static str> {
+    let event = decode_sse_event(event)?;
+    let event_type = sse_field_value(event, "event").unwrap_or("message");
+    if event_type == "error" {
+        return Err("OpenAI SSE error event");
+    }
+
+    let Some(data) = sse_data_payload(event) else {
+        return Ok(OpenAiSseEventKind::Forward);
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return Ok(OpenAiSseEventKind::Done);
+    }
+    if data.is_empty() || matches!(event_type, "ping" | "keepalive") {
+        return Ok(OpenAiSseEventKind::Forward);
+    }
+
+    let payload: Value =
+        serde_json::from_str(data).map_err(|_| "OpenAI SSE event contains invalid JSON")?;
+    let is_error = payload.get("error").is_some_and(|error| !error.is_null())
+        || payload.get("type").and_then(Value::as_str) == Some("error")
+        || payload.get("object").and_then(Value::as_str) == Some("error");
+    if is_error {
+        Err("OpenAI SSE error payload")
+    } else {
+        Ok(OpenAiSseEventKind::Forward)
+    }
+}
+
+async fn forward_validated_openai_sse_event(
+    event: Vec<u8>,
+    event_data_len: usize,
+    tx: &Sender<Result<Bytes, String>>,
+) -> Result<Option<StreamOutcome>, GatewayError> {
+    let event_kind = match inspect_openai_sse_event(&event[..event_data_len]) {
+        Ok(kind) => kind,
+        Err(reason) => {
+            tracing::error!(reason, "Invalid OpenAI SSE event");
+            send_downstream_stream_error(tx).await;
+            return Err(GatewayError::Upstream(reason.into()));
+        }
+    };
+    if tx.send(Ok(Bytes::from(event))).await.is_err() {
+        return Ok(Some(StreamOutcome::Cancelled));
+    }
+    if event_kind == OpenAiSseEventKind::Done {
+        Ok(Some(StreamOutcome::Completed))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Send a streaming JSON POST request (OpenAI-compatible) and forward raw
-/// SSE bytes through the channel. Returns Ok(()) on successful stream
-/// completion, or Err on connection/HTTP-level failure.
+/// SSE bytes through the channel. A downstream disconnect is distinguished
+/// from provider success so it does not reset circuit-breaker state.
 async fn send_json_stream(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
     body: &Value,
-    tx: UnboundedSender<Result<Bytes, String>>,
-) -> Result<(), GatewayError> {
-    let response = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+    tx: Sender<Result<Bytes, String>>,
+) -> Result<StreamOutcome, GatewayError> {
+    let request = client.post(url).bearer_auth(api_key).json(body);
+    let Some(response) = await_stream_or_closed(&tx, request.send()).await else {
+        return Ok(StreamOutcome::Cancelled);
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(error = %error, "OpenAI streaming request failed");
+            send_downstream_stream_error(&tx).await;
+            return Err(GatewayError::Upstream(error.to_string()));
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
         tracing::warn!(
             upstream_status = %status.as_u16(),
-            upstream_body = %body_text,
             "Upstream streaming request returned error"
         );
-        let _ = tx.send(Err(format!("HTTP {}", status.as_u16())));
-        return Err(GatewayError::Upstream(format!("HTTP {}", status.as_u16())));
+        send_downstream_stream_error(&tx).await;
+        return Err(upstream_status_error(status));
     }
 
+    const MAX_SSE_BUFFER: usize = 1_048_576;
+    let mut event_buffer = Vec::new();
     let mut byte_stream = response.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
+    loop {
+        let Some(chunk) = await_stream_or_closed(&tx, byte_stream.next()).await else {
+            return Ok(StreamOutcome::Cancelled);
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         match chunk {
             Ok(bytes) => {
-                if tx.send(Ok(bytes)).is_err() {
-                    // Receiver dropped (client disconnected)
-                    break;
+                if event_buffer.len().saturating_add(bytes.len()) > MAX_SSE_BUFFER {
+                    tracing::error!("OpenAI SSE buffer overflow");
+                    send_downstream_stream_error(&tx).await;
+                    return Err(GatewayError::Upstream("stream buffer overflow".into()));
+                }
+                event_buffer.extend_from_slice(&bytes);
+                while let Some((pos, delimiter_len)) = find_sse_delimiter(&event_buffer) {
+                    let remaining = event_buffer.split_off(pos + delimiter_len);
+                    let event = std::mem::replace(&mut event_buffer, remaining);
+                    if let Some(outcome) =
+                        forward_validated_openai_sse_event(event, pos, &tx).await?
+                    {
+                        return Ok(outcome);
+                    }
                 }
             }
             Err(e) => {
                 tracing::error!("Streaming read error: {}", e);
-                let _ = tx.send(Err(format!("Stream error: {}", e)));
+                send_downstream_stream_error(&tx).await;
                 return Err(GatewayError::Upstream(e.to_string()));
             }
         }
     }
 
-    Ok(())
+    Ok(StreamOutcome::Incomplete)
 }
 
 /// Send a streaming request to Anthropic (x-api-key header auth) and forward
@@ -820,8 +1273,8 @@ async fn send_anthropic_stream(
     url: &str,
     api_key: &str,
     body: &Value,
-    tx: UnboundedSender<Result<Bytes, String>>,
-) -> Result<(), GatewayError> {
+    tx: Sender<Result<Bytes, String>>,
+) -> Result<StreamOutcome, GatewayError> {
     use http::HeaderValue;
 
     // Translate request from Chat Completions → Anthropic Messages
@@ -837,109 +1290,189 @@ async fn send_anthropic_stream(
     );
     headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
 
-    let response = client
-        .post(url)
-        .headers(headers)
-        .json(&req_body)
-        .send()
-        .await
-        .map_err(|e| GatewayError::Upstream(e.to_string()))?;
+    let request = client.post(url).headers(headers).json(&req_body);
+    let Some(response) = await_stream_or_closed(&tx, request.send()).await else {
+        return Ok(StreamOutcome::Cancelled);
+    };
+    let response = match response {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(error = %error, "Anthropic streaming request failed");
+            send_downstream_stream_error(&tx).await;
+            return Err(GatewayError::Upstream(error.to_string()));
+        }
+    };
 
     let status = response.status();
     if !status.is_success() {
-        let body_text = response.text().await.unwrap_or_default();
         tracing::warn!(
             upstream_status = %status.as_u16(),
-            upstream_body = %body_text,
             "Anthropic streaming request returned error"
         );
-        let _ = tx.send(Err(format!("HTTP {}", status.as_u16())));
-        return Err(GatewayError::Upstream(format!("HTTP {}", status.as_u16())));
+        send_downstream_stream_error(&tx).await;
+        return Err(upstream_status_error(status));
     }
 
     // Buffer for accumulating SSE events across chunks
     // Safety limit to prevent unbounded growth on malformed upstream data.
     const MAX_SSE_BUFFER: usize = 1_048_576; // 1 MB
-    let mut buffer = String::new();
+    let mut buffer = Vec::new();
 
     let mut byte_stream = response.bytes_stream();
-    while let Some(chunk) = byte_stream.next().await {
+    loop {
+        let Some(chunk) = await_stream_or_closed(&tx, byte_stream.next()).await else {
+            return Ok(StreamOutcome::Cancelled);
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         match chunk {
             Ok(bytes) => {
-                if let Ok(text) = String::from_utf8(bytes.to_vec()) {
-                    // Safety guard: prevent unbounded buffer growth when upstream
-                    // sends data without \n\n event terminators.
-                    if buffer.len() + text.len() > MAX_SSE_BUFFER {
-                        tracing::error!(
-                            buffer_bytes = buffer.len() + text.len(),
-                            max = MAX_SSE_BUFFER,
-                            "Anthropic SSE buffer overflow — terminating stream"
-                        );
-                        let _ = tx.send(Err("Internal error: stream buffer overflow".into()));
-                        return Ok(());
-                    }
-                    buffer.push_str(&text);
-                    // Process complete SSE events — use split_off to avoid
-                    // allocating both event_block AND replacement buffer.
-                    while let Some(pos) = buffer.find("\n\n") {
-                        let remaining = buffer.split_off(pos + 2);
-                        let event_block = std::mem::replace(&mut buffer, remaining);
-                        // event_block now holds "...\n\n" — strip the trailing "\n\n"
-                        let event_str = &event_block[..event_block.len() - 2];
-                        if let Some(converted) = translate_anthropic_sse_event(event_str)
-                            && tx.send(Ok(Bytes::from(converted))).is_err()
-                        {
-                            return Ok(());
-                        }
-                    }
-                } else {
-                    // Non-UTF-8 bytes from Anthropic upstream are unexpected but
-                    // not fatal — log a warning and continue processing the next chunk.
-                    // The offending bytes are discarded; previously buffered valid
-                    // SSE events are unaffected.
-                    tracing::warn!(
-                        "Anthropic stream produced non-UTF-8 bytes ({:?}) — dropping {} bytes and continuing",
-                        bytes.as_ref(),
-                        bytes.len(),
+                // HTTP chunks may split a multi-byte UTF-8 code point. Buffer
+                // bytes until a complete SSE event exists, then decode it.
+                if buffer.len().saturating_add(bytes.len()) > MAX_SSE_BUFFER {
+                    tracing::error!(
+                        buffer_bytes = buffer.len().saturating_add(bytes.len()),
+                        max = MAX_SSE_BUFFER,
+                        "Anthropic SSE buffer overflow — terminating stream"
                     );
+                    send_downstream_stream_error(&tx).await;
+                    return Err(GatewayError::Upstream("stream buffer overflow".into()));
+                }
+                buffer.extend_from_slice(&bytes);
+                while let Some((pos, delimiter_len)) = find_sse_delimiter(&buffer) {
+                    let remaining = buffer.split_off(pos + delimiter_len);
+                    let event_block = std::mem::replace(&mut buffer, remaining);
+                    let event_bytes = &event_block[..pos];
+                    let event_str = match decode_sse_event(event_bytes) {
+                        Ok(event) => event,
+                        Err(reason) => {
+                            tracing::error!(
+                                event_bytes = event_bytes.len(),
+                                "Anthropic stream produced an invalid UTF-8 SSE event"
+                            );
+                            send_downstream_stream_error(&tx).await;
+                            return Err(GatewayError::Upstream(reason.into()));
+                        }
+                    };
+                    let event_kind = match inspect_anthropic_sse_event(event_str) {
+                        Ok(kind) => kind,
+                        Err(reason) => {
+                            tracing::error!(
+                                event_bytes = event_str.len(),
+                                reason,
+                                "Invalid Anthropic SSE event"
+                            );
+                            send_downstream_stream_error(&tx).await;
+                            return Err(GatewayError::Upstream(reason.into()));
+                        }
+                    };
+                    match event_kind {
+                        AnthropicSseEventKind::Error => {
+                            tracing::error!("Anthropic SSE error event");
+                            send_downstream_stream_error(&tx).await;
+                            return Err(GatewayError::Upstream("Anthropic SSE error event".into()));
+                        }
+                        AnthropicSseEventKind::MessageStop => {
+                            if tx.send(Ok(Bytes::from("data: [DONE]\n\n"))).await.is_err() {
+                                return Ok(StreamOutcome::Cancelled);
+                            }
+                            return Ok(StreamOutcome::Completed);
+                        }
+                        AnthropicSseEventKind::Forward => {}
+                    }
+                    if let Some(converted) = translate_anthropic_sse_event(event_str)
+                        && tx.send(Ok(Bytes::from(converted))).await.is_err()
+                    {
+                        return Ok(StreamOutcome::Cancelled);
+                    }
                 }
             }
             Err(e) => {
                 tracing::error!("Anthropic streaming read error: {}", e);
-                let _ = tx.send(Err(format!("Stream error: {}", e)));
+                send_downstream_stream_error(&tx).await;
                 return Err(GatewayError::Upstream(e.to_string()));
             }
         }
     }
 
-    // Send [DONE] signal
-    let _ = tx.send(Ok(Bytes::from("data: [DONE]\n\n")));
+    if !buffer.is_empty() {
+        tracing::warn!(
+            buffered_bytes = buffer.len(),
+            "Anthropic stream ended with an incomplete SSE event"
+        );
+    }
 
-    Ok(())
+    Ok(StreamOutcome::Incomplete)
+}
+
+fn find_sse_delimiter(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf <= crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnthropicSseEventKind {
+    Forward,
+    Error,
+    MessageStop,
+}
+
+fn anthropic_sse_event_type(event_block: &str) -> &str {
+    sse_field_value(event_block, "event").unwrap_or("")
+}
+
+fn is_known_anthropic_sse_event(event_type: &str) -> bool {
+    matches!(
+        event_type,
+        "message_start"
+            | "content_block_start"
+            | "content_block_delta"
+            | "content_block_stop"
+            | "message_delta"
+            | "message_stop"
+            | "ping"
+            | "error"
+    )
+}
+
+fn inspect_anthropic_sse_event(event_block: &str) -> Result<AnthropicSseEventKind, &'static str> {
+    let event_type = anthropic_sse_event_type(event_block);
+    if !is_known_anthropic_sse_event(event_type) {
+        return Ok(AnthropicSseEventKind::Forward);
+    }
+
+    let data = sse_data_payload(event_block).ok_or("Anthropic SSE event is missing data")?;
+    let payload: Value =
+        serde_json::from_str(&data).map_err(|_| "Anthropic SSE event contains invalid JSON")?;
+    if event_type == "error" || payload.get("type").and_then(Value::as_str) == Some("error") {
+        Ok(AnthropicSseEventKind::Error)
+    } else if event_type == "message_stop" {
+        Ok(AnthropicSseEventKind::MessageStop)
+    } else {
+        Ok(AnthropicSseEventKind::Forward)
+    }
 }
 
 /// Translate an Anthropic SSE event block into OpenAI-compatible SSE format.
 /// Returns None for events that should be filtered (no content change).
 fn translate_anthropic_sse_event(event_block: &str) -> Option<String> {
     // Extract event type from "event: xxx" line
-    let event_type = event_block
-        .lines()
-        .find(|l| l.starts_with("event: "))
-        .and_then(|l| l.strip_prefix("event: "))
-        .unwrap_or("");
+    let event_type = anthropic_sse_event_type(event_block);
 
-    // Extract data from "data: {...}" line
-    let data_str = event_block
-        .lines()
-        .find(|l| l.starts_with("data: "))
-        .and_then(|l| l.strip_prefix("data: "))
-        .unwrap_or("");
-
+    let data_str = sse_data_payload(event_block)?;
     if data_str.is_empty() {
         return None;
     }
 
-    let data: &serde_json::Value = &serde_json::from_str(data_str).ok()?;
+    let data: &serde_json::Value = &serde_json::from_str(&data_str).ok()?;
 
     match event_type {
         "content_block_delta" => {
@@ -967,7 +1500,7 @@ fn translate_anthropic_sse_event(event_block: &str) -> Option<String> {
                 .and_then(|m| m.get("model"))
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown");
-            let openai_chunk = serde_json::json!({
+            let mut openai_chunk = serde_json::json!({
                 "model": model,
                 "choices": [{
                     "index": 0,
@@ -975,6 +1508,13 @@ fn translate_anthropic_sse_event(event_block: &str) -> Option<String> {
                     "finish_reason": null
                 }]
             });
+            if let Some(usage) = data
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .and_then(openai_usage_from_anthropic)
+            {
+                openai_chunk["usage"] = usage;
+            }
             Some(format!(
                 "data: {}\n\n",
                 serde_json::to_string(&openai_chunk).unwrap_or_default()
@@ -987,17 +1527,20 @@ fn translate_anthropic_sse_event(event_block: &str) -> Option<String> {
                 .and_then(|d| d.get("stop_reason"))
                 .and_then(|r| r.as_str());
             let finish = match stop_reason {
-                Some("end_turn" | "stop_sequence") => "stop",
-                Some("max_tokens") => "length",
-                _ => "stop",
+                Some("end_turn" | "stop_sequence") => Value::String("stop".into()),
+                Some("max_tokens") => Value::String("length".into()),
+                _ => Value::Null,
             };
-            let openai_chunk = serde_json::json!({
+            let mut openai_chunk = serde_json::json!({
                 "choices": [{
                     "index": 0,
                     "delta": {},
                     "finish_reason": finish
                 }]
             });
+            if let Some(usage) = data.get("usage").and_then(openai_usage_from_anthropic) {
+                openai_chunk["usage"] = usage;
+            }
             Some(format!(
                 "data: {}\n\n",
                 serde_json::to_string(&openai_chunk).unwrap_or_default()
@@ -1030,6 +1573,27 @@ fn translate_anthropic_sse_event(event_block: &str) -> Option<String> {
     }
 }
 
+fn openai_usage_from_anthropic(usage: &Value) -> Option<Value> {
+    let mut converted = serde_json::Map::new();
+    let input = usage.get("input_tokens").and_then(Value::as_u64);
+    let output = usage.get("output_tokens").and_then(Value::as_u64);
+    if let Some(input) = input {
+        converted.insert("prompt_tokens".into(), Value::from(input));
+    }
+    if let Some(output) = output {
+        converted.insert("completion_tokens".into(), Value::from(output));
+    }
+    if input.is_some() || output.is_some() {
+        converted.insert(
+            "total_tokens".into(),
+            Value::from(input.unwrap_or(0) + output.unwrap_or(0)),
+        );
+        Some(Value::Object(converted))
+    } else {
+        None
+    }
+}
+
 /// Shared context carrying proxy-request metadata through the STT pipeline,
 /// avoiding per-field parameter repetition.
 struct SttCtx<'a> {
@@ -1041,19 +1605,94 @@ struct SttCtx<'a> {
 }
 
 /// Roughly estimate token count from a request body for TPM quota checking.
+///
+/// Binary media (base64-encoded audio/image/file payloads) is deliberately
+/// excluded: a 60s WAV is ~2.5 MB of base64 which, counted as text, would
+/// estimate at hundreds of thousands of "tokens" and exhaust the text TPM
+/// window before the request ever reaches the provider. Media capacity is
+/// governed by request-level (RPM) limits, not text-token accounting.
 fn estimate_tokens(body: &Value) -> u64 {
     // Simple estimation: count characters in string values (rough: ~4 chars per token).
     let text_len = estimate_text_length(body);
     (text_len / 4).max(1)
 }
 
+/// Object keys whose values carry base64-encoded binary media rather than
+/// natural-language text. Their contents must not count toward text TPM.
+fn is_binary_media_key(key: &str) -> bool {
+    matches!(
+        key,
+        "file" | "file_data" | "data" | "b64_json" | "input_audio"
+    )
+}
+
+/// A bare `data:<mime>;base64,…` URI embedded as a plain string value
+/// (e.g. an inline image_url). Counting its length as text would grossly
+/// over-estimate the token cost of an ordinary image request.
+fn is_data_uri(value: &str) -> bool {
+    value.starts_with("data:") && value.contains(";base64,")
+}
+
 fn estimate_text_length(value: &Value) -> u64 {
     match value {
-        Value::String(s) => s.len() as u64,
+        Value::String(s) => {
+            if is_data_uri(s) {
+                0
+            } else {
+                s.len() as u64
+            }
+        }
         Value::Array(arr) => arr.iter().map(estimate_text_length).sum(),
-        Value::Object(obj) => obj.values().map(estimate_text_length).sum(),
+        Value::Object(obj) => obj
+            .iter()
+            .filter(|(key, _)| !is_binary_media_key(key))
+            .map(|(_, value)| estimate_text_length(value))
+            .sum(),
         _ => 0,
     }
+}
+
+/// Synthesize a `usage` object for audio capabilities whose upstream responses
+/// carry no token counts, so the request is still metered instead of silently
+/// dropped by the metering layer (which skips responses without a `usage`
+/// field). Returns `None` when no synthesis is needed — either the provider
+/// already reported usage, or the capability is text-based (chat/embedding),
+/// whose responses always include real usage.
+///
+/// - TTS is billed against its input text size (the audio output has no tokens).
+/// - STT is billed against the transcription size (the audio input has none).
+fn synthesized_usage_for_metering(
+    capability: &ModelCapability,
+    input_token_estimate: u64,
+    response: &Value,
+) -> Option<Value> {
+    if response.get("usage").is_some() {
+        return None;
+    }
+    let usage = match capability {
+        ModelCapability::Tts => serde_json::json!({
+            "prompt_tokens": input_token_estimate,
+            "completion_tokens": 0,
+            "total_tokens": input_token_estimate
+        }),
+        ModelCapability::Stt => {
+            let text_len = response
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::len)
+                .unwrap_or(0) as u64;
+            let completion = text_len / 4;
+            serde_json::json!({
+                "prompt_tokens": 0,
+                "completion_tokens": completion,
+                "total_tokens": completion
+            })
+        }
+        _ => return None,
+    };
+    let mut augmented = response.clone();
+    augmented.as_object_mut()?.insert("usage".into(), usage);
+    Some(augmented)
 }
 
 /// Derive a 32-byte AES key from a secret string via HKDF-SHA256.
@@ -1075,12 +1714,71 @@ fn audio_mime_from_filename(filename: &str) -> &'static str {
         .to_lowercase()
         .as_str()
     {
-        "mp3" => "audio/mpeg",
-        "m4a" => "audio/mp4",
+        "mp3" | "mpeg" | "mpga" => "audio/mpeg",
+        "mp4" | "m4a" => "audio/mp4",
         "flac" => "audio/flac",
         "ogg" => "audio/ogg",
         "webm" => "audio/webm",
-        _ => "audio/wav",
+        "wav" => "audio/wav",
+        _ => "application/octet-stream",
+    }
+}
+
+fn validate_provider_response(
+    capability: &ModelCapability,
+    response: &Value,
+) -> Result<(), GatewayError> {
+    let valid = match capability {
+        ModelCapability::Chat | ModelCapability::Vision | ModelCapability::WebSearch => {
+            crate::services::responses::is_valid_chat_completions_response(response)
+        }
+        ModelCapability::Embedding => response
+            .get("data")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .is_some_and(|items| {
+                items.iter().all(|item| {
+                    item.get("embedding").is_some_and(|embedding| {
+                        embedding.as_array().is_some_and(|values| {
+                            !values.is_empty() && values.iter().all(Value::is_number)
+                        }) || embedding.as_str().is_some_and(|encoded| {
+                            STANDARD.decode(encoded).is_ok_and(|bytes| {
+                                !bytes.is_empty()
+                                    && bytes.len() % std::mem::size_of::<f32>() == 0
+                                    && bytes.chunks_exact(4).all(|chunk| {
+                                        f32::from_le_bytes(
+                                            chunk.try_into().expect("four-byte chunk"),
+                                        )
+                                        .is_finite()
+                                    })
+                            })
+                        })
+                    })
+                })
+            }),
+        ModelCapability::Stt => response.get("text").and_then(Value::as_str).is_some(),
+        ModelCapability::Tts => {
+            response
+                .get("audio")
+                .and_then(Value::as_str)
+                .is_some_and(|audio| !audio.is_empty())
+                && response
+                    .get("content_type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content_type| !content_type.is_empty())
+        }
+    };
+
+    if valid {
+        Ok(())
+    } else {
+        tracing::warn!(
+            capability = capability.as_str(),
+            "AI provider returned an invalid response"
+        );
+        Err(GatewayError::Upstream(
+            "invalid AI provider response".to_string(),
+        ))
     }
 }
 
@@ -1115,25 +1813,37 @@ pub fn weighted_select_with_rng<'a>(
     candidates.last()
 }
 
+fn validate_protocol_capabilities(
+    protocol_type: &str,
+    capabilities: &[ModelCapability],
+) -> Result<(), GatewayError> {
+    if protocol_type == "anthropic"
+        && capabilities.iter().any(|capability| {
+            matches!(
+                capability,
+                ModelCapability::Embedding | ModelCapability::Stt | ModelCapability::Tts
+            )
+        })
+    {
+        return Err(GatewayError::InvalidInput(
+            "Anthropic channels do not support embedding, STT, or TTS capabilities".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl GatewayService {
-    fn validate(
-        &self,
-        name: &str,
-        base_url: &str,
-        weight: i32,
-        models: &[String],
-        capabilities: &[ModelCapability],
-        api_key: &str,
-    ) -> Result<(), GatewayError> {
-        if name.trim().is_empty()
-            || api_key.is_empty()
-            || models.is_empty()
-            || capabilities.is_empty()
-            || weight < 1
-            || !(base_url.starts_with("https://") || base_url.starts_with("http://"))
+    fn validate(&self, input: &CreateChannelInput) -> Result<(), GatewayError> {
+        if input.name.trim().is_empty()
+            || input.api_key.is_empty()
+            || input.models.is_empty()
+            || input.capabilities.is_empty()
+            || input.weight < 1
+            || !(input.base_url.starts_with("https://") || input.base_url.starts_with("http://"))
         {
             return Err(GatewayError::InvalidInput("name, api_key, models, capabilities, positive weight, and http(s) base_url are required".into()));
         }
+        validate_protocol_capabilities(input.protocol_type.as_str(), &input.capabilities)?;
         Ok(())
     }
     fn encrypt(&self, plaintext: &str) -> Result<String, GatewayError> {
@@ -1174,7 +1884,7 @@ mod tests {
     use super::*;
     use crate::repositories::channel::Model as ChannelModel;
     use chrono::Utc;
-    use sea_orm::DatabaseConnection;
+    use sea_orm::{DatabaseBackend, DatabaseConnection, QueryTrait};
     use serde_json::Value as Json;
     use uuid::Uuid;
 
@@ -1198,6 +1908,382 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_wait_cancels_when_receiver_is_closed() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            await_stream_or_closed(&tx, std::future::pending::<()>()),
+        )
+        .await
+        .expect("closed stream receiver should cancel the pending operation");
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn streaming_wait_returns_ready_output() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        assert_eq!(await_stream_or_closed(&tx, async { 42 }).await, Some(42));
+    }
+
+    #[tokio::test]
+    async fn downstream_stream_errors_are_always_generic() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        send_downstream_stream_error(&tx).await;
+
+        assert_eq!(
+            rx.recv().await,
+            Some(Err(DOWNSTREAM_STREAM_ERROR.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn downstream_stream_error_never_blocks_on_a_full_queue() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        tx.send(Ok(Bytes::from_static(b"queued"))).await.unwrap();
+
+        tokio::time::timeout(Duration::from_millis(10), send_downstream_stream_error(&tx))
+            .await
+            .expect("circuit-breaker outcome must not wait for queue capacity");
+    }
+
+    #[test]
+    fn cancelled_stream_does_not_change_circuit_breaker_state() {
+        assert_eq!(stream_circuit_outcome(&Ok(StreamOutcome::Cancelled)), None);
+        assert_eq!(
+            stream_circuit_outcome(&Ok(StreamOutcome::Completed)),
+            Some(CircuitOutcome::Success)
+        );
+        assert_eq!(
+            stream_circuit_outcome(&Ok(StreamOutcome::Incomplete)),
+            Some(CircuitOutcome::Failure)
+        );
+        assert_eq!(
+            stream_circuit_outcome(&Err(GatewayError::Upstream("failed".into()))),
+            Some(CircuitOutcome::Failure)
+        );
+    }
+
+    #[test]
+    fn byte_buffer_preserves_unicode_split_across_http_chunks() {
+        let event = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"你好🙂\"}}\n\n";
+        let unicode_start = event.find('你').unwrap();
+        let split = unicode_start + 1;
+        let mut buffer = Vec::new();
+
+        buffer.extend_from_slice(&event.as_bytes()[..split]);
+        assert!(find_sse_delimiter(&buffer).is_none());
+        buffer.extend_from_slice(&event.as_bytes()[split..]);
+
+        let (pos, delimiter_len) = find_sse_delimiter(&buffer).unwrap();
+        let event_bytes = &buffer[..pos];
+        let decoded = std::str::from_utf8(event_bytes).unwrap();
+        let translated = translate_anthropic_sse_event(decoded).unwrap();
+        assert!(translated.contains("你好🙂"));
+        assert_eq!(pos + delimiter_len, buffer.len());
+    }
+
+    #[test]
+    fn recognizes_only_explicit_openai_done_events() {
+        assert_eq!(
+            inspect_openai_sse_event(b"data: [DONE]").unwrap(),
+            OpenAiSseEventKind::Done
+        );
+        assert_eq!(
+            inspect_openai_sse_event(b"event: done\r\ndata:[DONE]").unwrap(),
+            OpenAiSseEventKind::Done
+        );
+        assert_eq!(
+            inspect_openai_sse_event(br#"data: {"choices":[{"delta":{"content":"[DONE]"}}]}"#)
+                .unwrap(),
+            OpenAiSseEventKind::Forward
+        );
+    }
+
+    #[test]
+    fn rejects_openai_in_band_error_events() {
+        let events: [&[u8]; 4] = [
+            b"event: error\ndata: {\"message\":\"failed\"}",
+            b"data: {\"error\":{\"message\":\"failed\",\"upstream_secret\":\"hidden\"}}",
+            b"data: {\"type\":\"error\",\"message\":\"failed\"}",
+            b"data: {\"object\":\"error\",\"message\":\"failed\"}",
+        ];
+        for event in events {
+            assert!(inspect_openai_sse_event(event).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn openai_in_band_error_is_generic_and_fails_circuit_outcome() {
+        let event = b"data: {\"error\":{\"message\":\"sensitive upstream detail\"}}\n\n".to_vec();
+        let data_len = event.len() - 2;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+
+        let result = forward_validated_openai_sse_event(event, data_len, &tx).await;
+        let stream_result = result.map(|outcome| outcome.unwrap_or(StreamOutcome::Incomplete));
+
+        assert_eq!(
+            stream_circuit_outcome(&stream_result),
+            Some(CircuitOutcome::Failure)
+        );
+        let downstream = rx.recv().await.unwrap().unwrap_err();
+        assert_eq!(downstream, DOWNSTREAM_STREAM_ERROR);
+        assert!(!downstream.contains("sensitive upstream detail"));
+        assert!(
+            rx.try_recv().is_err(),
+            "raw provider error must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn openai_null_error_field_is_not_a_failure() {
+        assert_eq!(
+            inspect_openai_sse_event(
+                br#"data: {"error":null,"choices":[{"delta":{"content":"ok"}}]}"#
+            )
+            .unwrap(),
+            OpenAiSseEventKind::Forward
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_openai_sse_utf8_and_json() {
+        assert!(inspect_openai_sse_event(b"data: {not-json}").is_err());
+        assert!(inspect_openai_sse_event(b"data: \xff").is_err());
+    }
+
+    #[test]
+    fn recognizes_anthropic_error_event_type() {
+        assert_eq!(
+            anthropic_sse_event_type(
+                "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"failed\"}}"
+            ),
+            "error"
+        );
+        assert_eq!(
+            inspect_anthropic_sse_event(
+                "event:error\ndata:{\"type\":\"error\",\"error\":{\"message\":\"failed\"}}"
+            )
+            .unwrap(),
+            AnthropicSseEventKind::Error
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_known_anthropic_events() {
+        assert!(
+            inspect_anthropic_sse_event("event: content_block_delta\ndata: {not-json}").is_err()
+        );
+        assert!(inspect_anthropic_sse_event("event: message_stop").is_err());
+        assert!(decode_sse_event(b"event: message_stop\ndata: \xff").is_err());
+    }
+
+    #[test]
+    fn valid_anthropic_message_stop_is_terminal() {
+        assert_eq!(
+            inspect_anthropic_sse_event("event: message_stop\ndata: {\"type\":\"message_stop\"}")
+                .unwrap(),
+            AnthropicSseEventKind::MessageStop
+        );
+    }
+
+    #[test]
+    fn candidate_query_requires_every_capability_and_requested_model() {
+        let query = candidate_channel_query(
+            "tenant-a",
+            &[ModelCapability::Chat, ModelCapability::Vision],
+            Some("gpt-4o"),
+        );
+        let statement = query.build(DatabaseBackend::Postgres);
+        let sql = statement.sql;
+
+        assert_eq!(sql.matches("capabilities ? CAST(").count(), 2);
+        assert_eq!(sql.matches("models ? CAST(").count(), 1);
+        assert!(sql.contains("tenant_id"));
+        assert!(sql.contains("is_active"));
+    }
+
+    #[test]
+    fn direct_capability_query_excludes_non_openai_channels() {
+        for capability in [
+            ModelCapability::Embedding,
+            ModelCapability::Stt,
+            ModelCapability::Tts,
+        ] {
+            let statement = candidate_channel_query("tenant-a", &[capability], None)
+                .build(DatabaseBackend::Postgres);
+            assert!(
+                statement.sql.contains("protocol_type"),
+                "direct capability query must constrain the upstream protocol: {}",
+                statement.sql
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_channel_rejects_openai_only_capabilities() {
+        for capability in [
+            ModelCapability::Embedding,
+            ModelCapability::Stt,
+            ModelCapability::Tts,
+        ] {
+            assert!(validate_protocol_capabilities("anthropic", &[capability]).is_err());
+        }
+        assert!(
+            validate_protocol_capabilities(
+                "anthropic",
+                &[ModelCapability::Chat, ModelCapability::Vision],
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn missing_request_model_uses_first_channel_model() {
+        let channel = test_channel("chat", 1, vec!["chat"]);
+        let mut body = serde_json::json!({"messages": []});
+
+        ensure_request_model(&mut body, &channel).unwrap();
+
+        assert_eq!(body["model"], "gpt-4");
+    }
+
+    #[test]
+    fn openai_streaming_requests_include_usage_summary() {
+        let mut body = serde_json::json!({"model": "gpt-4", "stream": true});
+
+        enable_stream_usage(&mut body).unwrap();
+
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn tts_format_maps_to_expected_content_type() {
+        let cases = [
+            ("mp3", "audio/mpeg"),
+            ("opus", "audio/ogg"),
+            ("aac", "audio/aac"),
+            ("flac", "audio/flac"),
+            ("wav", "audio/wav"),
+            ("pcm", "audio/pcm"),
+        ];
+        for (format, expected) in cases {
+            assert_eq!(tts_format_content_type(format).unwrap(), expected);
+        }
+        assert!(tts_format_content_type("avi").is_err());
+    }
+
+    #[test]
+    fn stt_audio_extensions_map_to_supported_mime_types() {
+        let cases = [
+            ("audio.wav", "audio/wav"),
+            ("audio.mp3", "audio/mpeg"),
+            ("audio.mpeg", "audio/mpeg"),
+            ("audio.mpga", "audio/mpeg"),
+            ("audio.mp4", "audio/mp4"),
+            ("audio.m4a", "audio/mp4"),
+            ("audio.webm", "audio/webm"),
+        ];
+        for (filename, expected) in cases {
+            assert_eq!(audio_mime_from_filename(filename), expected);
+        }
+        assert_eq!(
+            audio_mime_from_filename("audio.unknown"),
+            "application/octet-stream"
+        );
+    }
+
+    #[test]
+    fn malformed_provider_success_payloads_are_rejected() {
+        assert!(
+            validate_provider_response(&ModelCapability::Chat, &serde_json::json!({})).is_err()
+        );
+        assert!(
+            validate_provider_response(
+                &ModelCapability::Embedding,
+                &serde_json::json!({"data": []}),
+            )
+            .is_err()
+        );
+        assert!(validate_provider_response(&ModelCapability::Stt, &serde_json::json!({})).is_err());
+        assert!(
+            validate_provider_response(
+                &ModelCapability::Tts,
+                &serde_json::json!({"audio": "YWJj"}),
+            )
+            .is_err()
+        );
+
+        assert!(
+            validate_provider_response(
+                &ModelCapability::Embedding,
+                &serde_json::json!({"data": [{"embedding": "AACAPw=="}]}),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_provider_response(&ModelCapability::Stt, &serde_json::json!({"text": ""}),)
+                .is_ok()
+        );
+        assert!(
+            validate_provider_response(
+                &ModelCapability::Chat,
+                &serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": null},
+                        "finish_reason": "content_filter"
+                    }]
+                }),
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_provider_response(
+                &ModelCapability::Chat,
+                &serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "refusal": "I cannot help with that."
+                        },
+                        "finish_reason": "stop"
+                    }]
+                }),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn tts_audio_uses_standard_padded_base64() {
+        assert_eq!(encode_audio_base64(&[0xfb, 0xff]), "+/8=");
+    }
+
+    #[test]
+    fn tts_content_type_prefers_valid_upstream_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("audio/x-wav; charset=binary"),
+        );
+        assert_eq!(
+            tts_content_type(&headers, "audio/mpeg").unwrap(),
+            "audio/wav"
+        );
+
+        headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/octet-stream"),
+        );
+        assert_eq!(
+            tts_content_type(&headers, "audio/flac").unwrap(),
+            "audio/flac"
+        );
     }
 
     fn service() -> GatewayService {
@@ -1448,13 +2534,17 @@ mod tests {
 
     #[test]
     fn translate_anthropic_sse_message_start() {
-        let event = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-opus-20240229\"}}";
+        let event = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"content\":[],\"model\":\"claude-3-opus-20240229\",\"usage\":{\"input_tokens\":10}}}";
         let result = super::translate_anthropic_sse_event(event);
         assert!(result.is_some(), "message_start should produce an event");
         let sse = result.unwrap();
         assert!(
             sse.contains("role\":\"assistant\"") || sse.contains("\\\"role\\\":\\\"assistant\\\""),
             "should set role to assistant"
+        );
+        assert!(
+            sse.contains("\"prompt_tokens\":10"),
+            "message_start usage should preserve input tokens"
         );
     }
 
@@ -1469,6 +2559,8 @@ mod tests {
         let sse = result.unwrap();
         // end_turn should be mapped to "stop" finish_reason
         assert!(sse.contains("stop"), "end_turn should be mapped to stop");
+        assert!(sse.contains("\"prompt_tokens\":10"));
+        assert!(sse.contains("\"completion_tokens\":20"));
     }
 
     #[test]
@@ -1564,6 +2656,151 @@ mod tests {
         assert_eq!(
             output_count, 4,
             "expected 4 output events from the sequence"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Token estimation — binary media must not exhaust text TPM
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn estimate_tokens_ignores_stt_base64_audio_file_field() {
+        // A large base64 audio blob under the flat `file` field (STT dispatch).
+        let audio = "A".repeat(2_560_000); // ~2.5 MB, ~640k "tokens" if counted
+        let body = serde_json::json!({
+            "model": "whisper-1",
+            "file": audio,
+            "filename": "audio.wav",
+        });
+        // Only "whisper-1"/"audio.wav" text is counted → a handful of tokens.
+        assert!(
+            estimate_tokens(&body) < 100,
+            "base64 audio must not be charged as text tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_ignores_inline_image_data_uri() {
+        let data_uri = format!("data:image/png;base64,{}", "Q".repeat(1_000_000));
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe this"},
+                    {"type": "image_url", "image_url": {"url": data_uri}}
+                ]
+            }]
+        });
+        assert!(
+            estimate_tokens(&body) < 100,
+            "inline image data URI must not be charged as text tokens"
+        );
+    }
+
+    #[test]
+    fn estimate_tokens_still_counts_real_text() {
+        let body = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "a".repeat(400)}]
+        });
+        // ~400 chars of text ≈ 100 tokens; must be materially non-trivial.
+        assert!(
+            estimate_tokens(&body) >= 100,
+            "ordinary text must still be counted"
+        );
+    }
+
+    #[test]
+    fn synthesized_usage_skips_when_provider_reports_usage() {
+        let response = serde_json::json!({
+            "text": "hi",
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        });
+        assert!(
+            synthesized_usage_for_metering(&ModelCapability::Stt, 0, &response).is_none(),
+            "existing provider usage must be preserved untouched"
+        );
+    }
+
+    #[test]
+    fn synthesized_usage_skips_text_capabilities() {
+        let response = serde_json::json!({ "choices": [] });
+        assert!(synthesized_usage_for_metering(&ModelCapability::Chat, 42, &response).is_none());
+        assert!(
+            synthesized_usage_for_metering(&ModelCapability::Embedding, 42, &response).is_none()
+        );
+    }
+
+    #[test]
+    fn synthesized_usage_bills_tts_by_input_estimate() {
+        // TTS output is audio (no tokens); it is billed against the input text.
+        let response = serde_json::json!({ "audio": "<binary>" });
+        let augmented =
+            synthesized_usage_for_metering(&ModelCapability::Tts, 25, &response).unwrap();
+        assert_eq!(augmented["usage"]["prompt_tokens"], 25);
+        assert_eq!(augmented["usage"]["completion_tokens"], 0);
+        assert_eq!(augmented["usage"]["total_tokens"], 25);
+    }
+
+    #[test]
+    fn synthesized_usage_bills_stt_by_transcription_size() {
+        // STT input is audio (no tokens); it is billed against the transcription.
+        let response = serde_json::json!({ "text": "a".repeat(40) });
+        let augmented =
+            synthesized_usage_for_metering(&ModelCapability::Stt, 0, &response).unwrap();
+        assert_eq!(augmented["usage"]["prompt_tokens"], 0);
+        assert_eq!(augmented["usage"]["completion_tokens"], 10);
+        assert_eq!(augmented["usage"]["total_tokens"], 10);
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  Upstream status classification — client 4xx must not trip breaker
+    // ═══════════════════════════════════════════════════════════════
+
+    #[test]
+    fn client_4xx_is_not_a_channel_health_failure() {
+        for code in [400u16, 413, 422] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = upstream_status_error(status);
+            assert!(
+                matches!(err, GatewayError::UpstreamClient { status } if status == code),
+                "HTTP {code} should classify as UpstreamClient"
+            );
+            assert!(
+                !err.is_channel_health_failure(),
+                "HTTP {code} must not count toward the circuit breaker"
+            );
+        }
+    }
+
+    #[test]
+    fn server_5xx_and_429_are_channel_health_failures() {
+        for code in [429u16, 500, 502, 503] {
+            let status = reqwest::StatusCode::from_u16(code).unwrap();
+            let err = upstream_status_error(status);
+            assert!(
+                matches!(err, GatewayError::Upstream(_)),
+                "HTTP {code} should classify as Upstream"
+            );
+            assert!(
+                err.is_channel_health_failure(),
+                "HTTP {code} must count toward the circuit breaker"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_outcome_client_error_is_neutral_for_breaker() {
+        let client_err: Result<StreamOutcome, GatewayError> =
+            Err(GatewayError::UpstreamClient { status: 400 });
+        assert_eq!(stream_circuit_outcome(&client_err), None);
+
+        let health_err: Result<StreamOutcome, GatewayError> =
+            Err(GatewayError::Upstream("HTTP 500".into()));
+        assert_eq!(
+            stream_circuit_outcome(&health_err),
+            Some(CircuitOutcome::Failure)
         );
     }
 }

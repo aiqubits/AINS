@@ -6,6 +6,12 @@ metadata:
   annotations:
     # Set to "true" after deploying TLS certificates (see tls section below)
     nginx.ingress.kubernetes.io/ssl-redirect: "false"
+    # Preserve long-lived `/api/ai/response` SSE streams through the outer
+    # ingress hop. These settings are safe for the regular JSON routes too.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
 spec:
   ingressClassName: nginx
   # ==========================================

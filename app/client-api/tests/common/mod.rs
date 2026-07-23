@@ -9,11 +9,17 @@ use wiremock::MockServer;
 ///
 /// 返回的 `Client` 自动指向 Mock 服务器的随机端口，
 /// 无需启动真实后端即可测试所有 HTTP 交互。
+///
+/// 强制 `no_proxy`，使测试无论运行环境是否配置了系统代理都直连本地
+/// Wiremock；否则发往 `http://127.0.0.1:<port>` 的请求会被系统代理转发到
+/// 远端 HTTPS 服务，导致 400/503/超时等非预期错误。生产代码的代理行为仍由
+/// `AINS_SYS_NO_PROXY` 环境变量控制，不受此处影响。
 pub async fn create_test_client() -> (Client, MockServer) {
     let mock_server = MockServer::start().await;
     let config = ClientConfig::new(mock_server.uri())
         .with_max_retries(0) // 集成测试中关闭重试以简化断言
-        .with_timeout(10);
+        .with_timeout(10)
+        .with_no_proxy(true);
     let client = Client::new(config).expect("Failed to create test client");
     (client, mock_server)
 }

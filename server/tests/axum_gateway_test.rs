@@ -121,6 +121,7 @@ async fn delete(app: &Router, uri: &str, token: Option<&str>) -> (StatusCode, Va
 /// Extract error message from HttpError JSON response — checks the `message` field.
 fn error_message(body: &Value) -> String {
     body.get("message")
+        .or_else(|| body.get("error").and_then(|error| error.get("message")))
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_lowercase()
@@ -619,14 +620,18 @@ async fn test_channel_create_invalid_input_rejected() {
 // ── AI Proxy Dispatch Tests (Responses API format) ────────────
 
 #[tokio::test]
-async fn test_responses_chat_returns_503_when_no_channel() {
+async fn test_ai_response_returns_503_when_no_channel() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("ai_chat_noch");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+
+    // Use a dedicated tenant so the "no active channel" premise is hermetic.
+    // Self-registered users all share the `default` tenant, where sibling
+    // tests concurrently create channels — that race would otherwise let this
+    // request pick up an unrelated channel and fail with an upstream error.
+    let token = axum_helpers::register_isolated_tenant_user(&app, "ai_response_noch").await;
 
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&token),
         Some(&json!({
             "input": "hello"
@@ -636,8 +641,8 @@ async fn test_responses_chat_returns_503_when_no_channel() {
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let err = body
-        .get("error")
-        .or(body.get("message"))
+        .pointer("/error/message")
+        .or_else(|| body.get("message"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
     assert!(
@@ -648,12 +653,12 @@ async fn test_responses_chat_returns_503_when_no_channel() {
 }
 
 #[tokio::test]
-async fn test_responses_chat_returns_401_without_auth() {
+async fn test_ai_response_returns_401_without_auth() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
 
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         None,
         Some(&json!({
             "input": "hello"
@@ -760,7 +765,7 @@ async fn test_disabled_tenant_ai_endpoint_returns_403() {
     // User from disabled tenant should get 403 on AI endpoint
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -1179,10 +1184,10 @@ async fn test_responses_e2e_with_mock_upstream() {
     assert_eq!(status, StatusCode::OK);
     let user_token = body["token"].as_str().unwrap().to_string();
 
-    // Call chat endpoint with Responses API format
+    // Call the unified AI response endpoint with chat input.
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -1193,7 +1198,7 @@ async fn test_responses_e2e_with_mock_upstream() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "chat endpoint should return 200 with mock upstream"
+        "AI response endpoint should return 200 with mock upstream"
     );
 
     // Verify Responses API response format
@@ -1296,7 +1301,7 @@ async fn test_responses_upstream_error_is_proxied() {
 
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -1383,10 +1388,10 @@ async fn test_responses_capability_routing_only_matching_capability() {
     assert_eq!(status, StatusCode::OK);
     let user_token = body["token"].as_str().unwrap().to_string();
 
-    // Chat endpoint should get "no channel" (embedding channel not matched)
+    // A chat-capability request should get "no channel" (embedding channel not matched).
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -1484,7 +1489,7 @@ async fn test_responses_tenant_isolation_in_routing() {
     // Tenant C's user should NOT see tenant B's chat channel
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "hello"
@@ -1629,10 +1634,10 @@ async fn test_anthropic_responses_e2e_with_mock_upstream() {
     assert_eq!(status, StatusCode::OK);
     let user_token = body["token"].as_str().unwrap().to_string();
 
-    // Call chat endpoint with Responses API format
+    // Call the unified AI response endpoint with chat input.
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "Hello, Claude!"
@@ -1643,7 +1648,7 @@ async fn test_anthropic_responses_e2e_with_mock_upstream() {
     assert_eq!(
         status,
         StatusCode::OK,
-        "Anthropic chat endpoint should return 200 with mock upstream"
+        "AI response endpoint should return 200 with Anthropic mock upstream"
     );
 
     // Should get Responses API format response
@@ -1735,7 +1740,7 @@ async fn test_anthropic_responses_upstream_error_is_proxied() {
 
     let (status, body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({
             "input": "Hello"
@@ -1846,7 +1851,7 @@ async fn test_metering_not_recorded_on_upstream_error() {
     // Send a chat request — should get 503
     let (status, _body) = post(
         &app,
-        "/api/ai/chat",
+        "/api/ai/response",
         Some(&user_token),
         Some(&json!({"input": "hello"})),
     )

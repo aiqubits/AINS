@@ -73,7 +73,7 @@ translate! {
     auth_submit_captcha: "Sign In with Captcha" => "验证码登录",
 
     // dashboard.rs
-    dashboard_title: "Welcome to AINS AI Native System 🚀" => "欢迎来到 AINS AI 原生系统 🚀",
+    dashboard_title: "Welcome to AINS! AI Native System 🚀" => "欢迎来到 AINS！AI 原生垂直应用管理系统 🚀",
     dashboard_hello_user: "Hello {name}!" => "你好 {name}！",
     dashboard_click_health_hint: "Click the button to trigger a health check request." => "点击右侧按钮发起一次真实的健康检查请求。",
     dashboard_call_health_btn: "Call Health Check" => "点此调用健康检查",

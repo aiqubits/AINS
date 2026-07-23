@@ -70,6 +70,8 @@ chrono.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+# test-util 启用 tokio 虚拟时钟（start_paused），用于确定性、无实际等待的超时测试
+tokio = { version = "1", features = ["full", "test-util"] }
 # tower 仅用于内联测试和集成测试中的 ServiceExt::oneshot()
 tower = { version = "0.5", features = ["util"] }
 # reqwest 用于 Salvo 模式的集成测试（通过 HTTP 客户端发送请求）

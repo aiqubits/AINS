@@ -31,6 +31,7 @@ pub enum DispatchAction {
         audio_bytes: Vec<u8>,
         filename: String,
         model: String,
+        form_fields: Vec<(String, String)>,
     },
 }
 
@@ -54,6 +55,15 @@ pub fn dispatch_proxy(
                     body,
                 }),
                 "anthropic" => {
+                    if let Some(temperature) = body.get("temperature")
+                        && !temperature
+                            .as_f64()
+                            .is_some_and(|temperature| (0.0..=1.0).contains(&temperature))
+                    {
+                        return Err(GatewayError::InvalidInput(
+                            "Anthropic temperature must be between 0 and 1".into(),
+                        ));
+                    }
                     // Anthropic /v1/messages uses a different request format;
                     // the request body transformation happens in the anthropic
                     // proxy layer. For dispatch we just set the URL, and the
@@ -79,12 +89,9 @@ pub fn dispatch_proxy(
                 protocol_type
             ))),
         },
-        ModelCapability::Stt => {
+        ModelCapability::Stt if protocol_type == "openai" => {
             // STT: multipart upload — extract audio bytes from the request body.
-            // The client may send the audio base64-encoded (JSON string) or as raw
-            // bytes in a string. Try base64 decode first, then fall back to raw UTF-8
-            // bytes for backward compatibility with clients that embed binary data
-            // directly in the JSON string.
+            // The JSON contract carries audio as standard or URL-safe base64.
             let raw = body.get("file").and_then(|v| v.as_str()).ok_or_else(|| {
                 GatewayError::InvalidInput(
                     "STT request must include a 'file' field with audio data".into(),
@@ -115,13 +122,34 @@ pub fn dispatch_proxy(
                 .unwrap_or("whisper-1")
                 .to_string();
 
+            let mut form_fields = Vec::new();
+            for field in ["language", "prompt", "response_format"] {
+                if let Some(value) = body.get(field) {
+                    let value = value.as_str().ok_or_else(|| {
+                        GatewayError::InvalidInput(format!("STT {field} must be a string"))
+                    })?;
+                    form_fields.push((field.to_string(), value.to_string()));
+                }
+            }
+            if let Some(value) = body.get("temperature") {
+                let value = value.as_f64().ok_or_else(|| {
+                    GatewayError::InvalidInput("STT temperature must be a number".into())
+                })?;
+                form_fields.push(("temperature".into(), value.to_string()));
+            }
+
             Ok(DispatchAction::SttMultipart {
                 url: format!("{}/v1/audio/transcriptions", base),
                 audio_bytes,
                 filename,
                 model,
+                form_fields,
             })
         }
+        ModelCapability::Stt => Err(GatewayError::InvalidInput(format!(
+            "STT only supports OpenAI protocol (got: {})",
+            protocol_type
+        ))),
         ModelCapability::Tts => match protocol_type {
             "openai" => Ok(DispatchAction::TtsBinary {
                 url: format!("{}/v1/audio/speech", base),
@@ -203,6 +231,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_anthropic_rejects_out_of_range_temperature() {
+        let body = json!({
+            "model": "claude-3-opus-20240229",
+            "messages": [{"role": "user", "content": "hi"}],
+            "temperature": 1.5
+        });
+
+        assert!(matches!(
+            dispatch_proxy(
+                &ModelCapability::Chat,
+                "anthropic",
+                "https://api.anthropic.com",
+                body,
+            ),
+            Err(GatewayError::InvalidInput(message))
+                if message.contains("temperature")
+        ));
+    }
+
+    #[test]
     fn dispatch_openai_tts() {
         let body = json!({"model": "tts-1", "input": "hello", "voice": "alloy"});
         let action = dispatch_proxy(
@@ -242,5 +290,48 @@ mod tests {
             body,
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn dispatch_openai_stt_preserves_supported_form_fields() {
+        let body = json!({
+            "model": "whisper-1",
+            "file": "YWJj",
+            "filename": "audio.wav",
+            "language": "zh",
+            "prompt": "AINS",
+            "response_format": "json",
+            "temperature": 0.25
+        });
+        let action = dispatch_proxy(
+            &ModelCapability::Stt,
+            "openai",
+            "https://api.openai.com",
+            body,
+        )
+        .unwrap();
+
+        let DispatchAction::SttMultipart { form_fields, .. } = action else {
+            panic!("expected SttMultipart");
+        };
+        assert!(form_fields.contains(&("language".into(), "zh".into())));
+        assert!(form_fields.contains(&("prompt".into(), "AINS".into())));
+        assert!(form_fields.contains(&("response_format".into(), "json".into())));
+        assert!(form_fields.contains(&("temperature".into(), "0.25".into())));
+    }
+
+    #[test]
+    fn dispatch_anthropic_stt_returns_error() {
+        let body = json!({"model": "whisper-1", "file": "YWJj"});
+        let result = dispatch_proxy(
+            &ModelCapability::Stt,
+            "anthropic",
+            "https://api.anthropic.com",
+            body,
+        );
+
+        assert!(
+            matches!(result, Err(GatewayError::InvalidInput(message)) if message.contains("STT only supports OpenAI"))
+        );
     }
 }

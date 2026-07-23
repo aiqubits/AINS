@@ -117,6 +117,7 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "tokio",
+ "tokio-stream",
  "tracing",
 ]
 

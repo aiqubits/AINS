@@ -195,6 +195,7 @@ where
         ctrl: &mut FlowCtrl,
     ) {
         let path = req.uri().path();
+        let uses_ai_response_envelope = is_ai_response_path(path);
         if path == "/health" || path == "/api/health" {
             ctrl.call_next(req, depot, res).await;
             return;
@@ -204,8 +205,13 @@ where
             Ok(s) => s.clone(),
             Err(_) => {
                 tracing::error!("AuthMiddleware: state not found in Depot");
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR)
-                    .render(salvo::writing::Json(serde_json::json!({"error": "internal_error", "message": "An unexpected error occurred"})));
+                render_auth_error(
+                    res,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal_error",
+                    "An unexpected error occurred",
+                    uses_ai_response_envelope,
+                );
                 return;
             }
         };
@@ -213,8 +219,13 @@ where
         let token = match extract_bearer_token(req).or_else(|| extract_jwt_cookie(req)) {
             Some(t) => t,
             None => {
-                res.status_code(StatusCode::UNAUTHORIZED)
-                    .render(salvo::writing::Json(serde_json::json!({"error": "unauthorized", "message": "Missing or invalid Authorization header"})));
+                render_auth_error(
+                    res,
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid Authorization header",
+                    uses_ai_response_envelope,
+                );
                 return;
             }
         };
@@ -225,8 +236,13 @@ where
                     Ok(id) => id,
                     Err(_) => {
                         tracing::warn!("Invalid user ID format in token: {}", claims.sub);
-                        res.status_code(StatusCode::UNAUTHORIZED)
-                            .render(salvo::writing::Json(serde_json::json!({"error": "unauthorized", "message": "Invalid or expired token"})));
+                        render_auth_error(
+                            res,
+                            StatusCode::UNAUTHORIZED,
+                            "unauthorized",
+                            "Invalid or expired token",
+                            uses_ai_response_envelope,
+                        );
                         return;
                     }
                 };
@@ -241,18 +257,49 @@ where
                     }
                     Err(e) => {
                         tracing::warn!("Token version validation failed: {}", e);
-                        res.status_code(StatusCode::UNAUTHORIZED)
-                            .render(salvo::writing::Json(serde_json::json!({"error": "unauthorized", "message": "Invalid or expired token"})));
+                        render_auth_error(
+                            res,
+                            StatusCode::UNAUTHORIZED,
+                            "unauthorized",
+                            "Invalid or expired token",
+                            uses_ai_response_envelope,
+                        );
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("Token validation failed: {}", e);
-                res.status_code(StatusCode::UNAUTHORIZED)
-                    .render(salvo::writing::Json(serde_json::json!({"error": "unauthorized", "message": "Invalid or expired token"})));
+                render_auth_error(
+                    res,
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Invalid or expired token",
+                    uses_ai_response_envelope,
+                );
             }
         }
     }
+}
+
+fn is_ai_response_path(path: &str) -> bool {
+    matches!(path, "/ai/response" | "/api/ai/response")
+}
+
+fn render_auth_error(
+    response: &mut Response,
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    uses_ai_response_envelope: bool,
+) {
+    let body = if uses_ai_response_envelope {
+        ains_runtime::ai_response_error_body(error_type, message)
+    } else {
+        serde_json::json!({"error": error_type, "message": message})
+    };
+    response
+        .status_code(status)
+        .render(salvo::writing::Json(body));
 }
 
 impl<S> Clone for AuthMiddleware<S> {
@@ -491,6 +538,13 @@ fn extract_email_from_body(bytes: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifies_ai_response_paths_for_auth_envelopes() {
+        assert!(is_ai_response_path("/ai/response"));
+        assert!(is_ai_response_path("/api/ai/response"));
+        assert!(!is_ai_response_path("/api/users"));
+    }
 
     // ── extract_bearer_token tests ────────────────────────────────
 

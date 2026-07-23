@@ -4,7 +4,7 @@ use http::HeaderName;
 use http::StatusCode;
 use serde::Serialize;
 use serde_json::Value as JsonValue;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 
 use crate::HttpError;
 
@@ -23,7 +23,7 @@ pub enum ResponseBody {
     Bytes(Bytes),
     /// Server-Sent Events streaming response.
     /// Each item is a complete SSE event string (as raw bytes).
-    Sse(UnboundedReceiver<Result<Bytes, String>>),
+    Sse(Receiver<Result<Bytes, String>>),
 }
 
 impl Response {
@@ -73,7 +73,7 @@ impl Response {
     }
 
     /// Create a new SSE streaming response.
-    pub fn sse(rx: UnboundedReceiver<Result<Bytes, String>>) -> Self {
+    pub fn sse(rx: Receiver<Result<Bytes, String>>) -> Self {
         let mut res = Self::new();
         res.body = ResponseBody::Sse(rx);
         res.content_type = Some("text/event-stream");
@@ -87,7 +87,7 @@ impl Response {
 
     /// Take ownership of the SSE receiver.
     /// Returns `None` if this is not an SSE response.
-    pub fn take_sse_receiver(&mut self) -> Option<UnboundedReceiver<Result<Bytes, String>>> {
+    pub fn take_sse_receiver(&mut self) -> Option<Receiver<Result<Bytes, String>>> {
         let old = std::mem::replace(&mut self.body, ResponseBody::Empty);
         match old {
             ResponseBody::Sse(rx) => Some(rx),
@@ -232,7 +232,7 @@ mod tests {
 
     #[test]
     fn sse_constructor_sets_content_type() {
-        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = tokio::sync::mpsc::channel(1);
         let resp = Response::sse(rx);
         assert!(resp.is_sse());
         assert_eq!(resp.content_type(), Some("text/event-stream"));
@@ -240,14 +240,14 @@ mod tests {
 
     #[test]
     fn take_sse_receiver_returns_receiver() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         let mut resp = Response::sse(rx);
         assert!(resp.is_sse());
         let taken = resp.take_sse_receiver();
         assert!(taken.is_some(), "should return the receiver");
         assert!(!resp.is_sse(), "should no longer be SSE after taking");
         // The channel is still usable (tx is still alive)
-        let _ = tx.send(Ok(Bytes::from("data: hello\n\n")));
+        let _ = tx.try_send(Ok(Bytes::from("data: hello\n\n")));
     }
 
     #[test]

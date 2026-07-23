@@ -6,9 +6,9 @@ use http::StatusCode;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio_stream::Stream;
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::wrappers::ReceiverStream;
 
 /// 统一 Response 的 axum 包装器，实现 IntoResponse
 pub struct UnifiedResponse(pub Response);
@@ -84,14 +84,14 @@ pub fn response_to_axum(mut resp: Response) -> AxumResponse {
 /// received. This ensures that no data after an upstream error reaches the
 /// SSE client.
 struct SseByteStream {
-    inner: UnboundedReceiverStream<Result<Bytes, String>>,
+    inner: ReceiverStream<Result<Bytes, String>>,
     terminated: bool,
 }
 
 impl SseByteStream {
-    fn new(rx: UnboundedReceiver<Result<Bytes, String>>) -> Self {
+    fn new(rx: Receiver<Result<Bytes, String>>) -> Self {
         Self {
-            inner: UnboundedReceiverStream::new(rx),
+            inner: ReceiverStream::new(rx),
             terminated: false,
         }
     }
@@ -400,8 +400,8 @@ mod tests {
 
     #[tokio::test]
     async fn sse_response_has_correct_content_type() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(Bytes::from("data: hello\n\n")));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(Ok(Bytes::from("data: hello\n\n"))).await;
         drop(tx);
         let resp = Response::sse(rx);
         let axum_resp = response_to_axum(resp);
@@ -416,7 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_response_preserves_custom_headers() {
-        let (_, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, rx) = tokio::sync::mpsc::channel(1);
         let mut resp = Response::sse(rx);
         resp.insert_header("x-custom", "test-value");
         let axum_resp = response_to_axum(resp);
@@ -431,10 +431,12 @@ mod tests {
 
     #[tokio::test]
     async fn sse_response_streams_data_correctly() {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(Bytes::from(
-            "event: test\ndata: {\"key\":\"value\"}\n\n",
-        )));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx
+            .send(Ok(Bytes::from(
+                "event: test\ndata: {\"key\":\"value\"}\n\n",
+            )))
+            .await;
         drop(tx); // Close the channel so the stream terminates
         let resp = Response::sse(rx);
         let axum_resp = response_to_axum(resp);
@@ -458,9 +460,11 @@ mod tests {
         // When an Err is sent through the SSE channel, the filter_map drops
         // the error (returning None), terminating the stream. Any data sent
         // AFTER the error should NOT appear in the response body.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Err("connection lost".to_string()));
-        let _ = tx.send(Ok(Bytes::from("data: this should not appear\n\n")));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(Err("connection lost".to_string())).await;
+        let _ = tx
+            .send(Ok(Bytes::from("data: this should not appear\n\n")))
+            .await;
         drop(tx);
 
         let resp = Response::sse(rx);
@@ -483,10 +487,10 @@ mod tests {
     #[tokio::test]
     async fn sse_response_data_before_error_is_delivered() {
         // Valid data sent BEFORE an error should still reach the client.
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-        let _ = tx.send(Ok(Bytes::from("data: valid data\n\n")));
-        let _ = tx.send(Err("connection lost".to_string()));
-        let _ = tx.send(Ok(Bytes::from("data: after error\n\n")));
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let _ = tx.send(Ok(Bytes::from("data: valid data\n\n"))).await;
+        let _ = tx.send(Err("connection lost".to_string())).await;
+        let _ = tx.send(Ok(Bytes::from("data: after error\n\n"))).await;
         drop(tx);
 
         let resp = Response::sse(rx);
