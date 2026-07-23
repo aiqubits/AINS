@@ -243,7 +243,7 @@ translate! {
 
     // not_found.rs
     not_found_page: "The page you visited does not exist." => "你访问的页面不存在。",
-    not_found_back_to_dashboard: "Back to Dashboard" => "返回控制中心",
+    not_found_back_to_home: "Back to Home" => "返回主页",
 
     // app_shell_layout.rs
     app_shell_guest: "Guest" => "Guest",

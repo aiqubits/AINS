@@ -51,56 +51,6 @@ input, textarea, select {
   color: inherit;
 }
 
-/* Phase 1 view stub — 居中显示图标 + 标题 + 提示文字 */
-.ains-view-placeholder {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  min-height: 60vh;
-  text-align: center;
-  gap: 16px;
-  color: var(--color-text-tertiary);
-}
-
-.ains-view-placeholder svg {
-  width: 56px;
-  height: 56px;
-  stroke: var(--color-brand-indigo);
-}
-
-.ains-view-placeholder h1 {
-  font-family: var(--font-family);
-  font-size: 20px;
-  font-weight: 700;
-  line-height: 28px;
-  color: var(--color-text-primary);
-  margin: 0;
-}
-
-.ains-view-placeholder p {
-  font-family: var(--font-family);
-  font-size: 12px;
-  font-weight: 400;
-  line-height: 18px;
-  color: var(--color-text-muted);
-  max-width: 360px;
-  margin: 0;
-}
-
-.ains-view-placeholder a {
-  margin-top: 8px;
-  font-family: var(--font-family);
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--color-brand-indigo-deep);
-  text-decoration: none;
-}
-
-.ains-view-placeholder a:hover {
-  text-decoration: underline;
-}
-
 /* Auth 视图 —— 让 AuthForm 卡片居中 */
 .ains-auth-view {
   flex: 1;

@@ -2,7 +2,7 @@
 //!
 //! 流程：填写邮箱 → 提交到 `POST /api/public/auth/forgot-password` →
 //! 显示通用提示文案（服务端 anti-enumeration，对未知邮箱也返回 200）。
-//! 已登录用户访问此路由会被踢回 `/`（改密应走 `/settings`）。
+//! 已登录用户访问此路由会被踢回个人中心 `/personal`（改密应走 `/settings`）。
 
 use dioxus::prelude::*;
 
@@ -12,6 +12,9 @@ use crate::Route;
 use crate::api::{ErrorContext, humanize_error};
 use crate::auth::AuthState;
 use crate::components::{HttpMethod, LogBus, push_log_result};
+
+/// 系统默认 Logo（与浏览器 favicon 同源），保持鉴权页品牌一致。
+const LOGO: Asset = asset!("/assets/favicon.jpg");
 
 #[component]
 pub fn ForgotPassword() -> Element {
@@ -26,7 +29,8 @@ pub fn ForgotPassword() -> Element {
     let mut submitting = use_signal(|| false);
     let mut error_msg = use_signal(|| Option::<String>::None);
 
-    // 已登录守卫：让"找回密码"对已登录用户毫无意义，直接踢回首页。
+    // 已登录守卫：让"找回密码"对已登录用户毫无意义，直接踢回个人中心
+    // （与 login_landing / reset_password 的已登录守卫目标保持一致）。
     // 注意：必须先等待 initialization 完成（restore_from_storage_async），
     // 否则 authenticated 永远是 false，导致已登录用户闪现表单（同 reset_password.rs 做法）。
     let initialized = *auth.initialized.read();
@@ -45,12 +49,16 @@ pub fn ForgotPassword() -> Element {
     }
 
     rsx! {
+        document::Link {
+            rel: "stylesheet",
+            href: asset!("/assets/styling/forgot_password.css"),
+        }
         div { class: "ains-forgot",
             div { class: "ains-forgot__orb ains-forgot__orb--blue" }
             div { class: "ains-forgot__orb ains-forgot__orb--indigo" }
 
             div { class: "ains-forgot__card",
-                div { class: "ains-forgot__icon" }
+                img { class: "ains-forgot__icon", src: LOGO, alt: "AINS" }
                 h1 { class: "ains-forgot__title", {t.forgot_pw_title} }
                 p { class: "ains-forgot__subtitle", {t.forgot_pw_subtitle} }
 
@@ -102,7 +110,7 @@ pub fn ForgotPassword() -> Element {
                     },
                     TextInput {
                         label: t.forgot_pw_email_label.to_string(),
-                        placeholder: Some("name@domain.com".to_string()),
+                        placeholder: Some("ains@openpick.org".to_string()),
                         value: email,
                         input_type: InputType::Email,
                         required: true,

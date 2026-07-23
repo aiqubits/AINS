@@ -15,6 +15,9 @@ use crate::api::{ErrorContext, humanize_error};
 use crate::auth::AuthState;
 use crate::components::{HttpMethod, LogBus, push_log_result};
 
+/// 系统默认 Logo（与浏览器 favicon 同源），保持鉴权页品牌一致。
+const LOGO: Asset = asset!("/assets/favicon.jpg");
+
 #[component]
 pub fn ResetPassword(email: Option<String>) -> Element {
     let i18n = use_context::<I18nContext>();
@@ -40,7 +43,7 @@ pub fn ResetPassword(email: Option<String>) -> Element {
     let auth_for_auth_guard = auth.clone();
     use_effect(move || {
         if *auth_for_auth_guard.initialized.read() && auth_for_auth_guard.is_authenticated() {
-            nav.replace(Route::Dashboard {});
+            nav.replace(Route::PersonalCenter {});
         }
     });
 
@@ -51,12 +54,16 @@ pub fn ResetPassword(email: Option<String>) -> Element {
     }
 
     rsx! {
+        document::Link {
+            rel: "stylesheet",
+            href: asset!("/assets/styling/reset_password.css"),
+        }
         div { class: "ains-reset",
             div { class: "ains-reset__orb ains-reset__orb--cyan" }
             div { class: "ains-reset__orb ains-reset__orb--purple" }
 
             div { class: "ains-reset__card",
-                div { class: "ains-reset__icon" }
+                img { class: "ains-reset__icon", src: LOGO, alt: "AINS" }
                 h1 { class: "ains-reset__title", {t.reset_pw_title} }
                 p { class: "ains-reset__subtitle", {t.reset_pw_subtitle} }
 
@@ -112,7 +119,7 @@ pub fn ResetPassword(email: Option<String>) -> Element {
                                 Ok(resp) => {
                                     let _ = resp.message;
                                     auth_async.persist_session_async(&resp.token, was_remembered).await;
-                                    nav.replace(Route::Dashboard {});
+                                    nav.replace(Route::PersonalCenter {});
                                 }
                                 Err(err) => {
                                     let msg = humanize_error(
@@ -127,7 +134,7 @@ pub fn ResetPassword(email: Option<String>) -> Element {
                     },
                     TextInput {
                         label: t.reset_pw_email_label.to_string(),
-                        placeholder: Some("name@domain.com".to_string()),
+                        placeholder: Some("ains@openpick.org".to_string()),
                         value: email_signal,
                         input_type: InputType::Email,
                         required: true,

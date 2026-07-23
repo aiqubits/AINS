@@ -1,10 +1,49 @@
 /* AINS UI — VerifyEmail 邮件验证码视图 */
 
+/* 外层容器 —— 全视口居中，裁剪装饰光晕（与 forgot/reset/not_found 对齐） */
 .ains-verify {
   position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  width: 100%;
+  padding: 24px;
+  overflow: hidden;
+}
+
+/* 装饰光晕 —— 蓝/青色调与登录页的紫色调区分，传达“安全验证”语义 */
+.ains-verify__orb {
+  position: absolute;
+  width: 320px;
+  height: 320px;
+  border-radius: 9999px;
+  filter: blur(80px);
+  pointer-events: none;
+  z-index: 0;
+}
+
+.ains-verify__orb--blue {
+  top: -80px;
+  right: -60px;
+  background: rgba(96, 165, 250, 0.28);
+}
+
+.ains-verify__orb--cyan {
+  bottom: -80px;
+  left: -60px;
+  background: rgba(34, 211, 238, 0.28);
+}
+
+/* 玻璃卡片 —— 与 forgot/reset/not_found 卡片一致的观感 */
+.ains-verify__card {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
   width: 100%;
   max-width: 28rem;
-  margin: 0 auto;
   padding: 32px;
   background: var(--glass-panel-bg);
   backdrop-filter: var(--glass-panel-blur);
@@ -15,46 +54,14 @@
     0 20px 25px -5px rgba(59, 130, 246, 0.08),
     0 8px 10px -6px rgba(6, 182, 212, 0.05),
     0 0 0 1px rgba(255, 255, 255, 0.5) inset;
-  overflow: hidden;
 }
 
-/* 装饰光晕 —— 蓝/青色调与登录页的紫色调区分，传达"安全验证"语义 */
-.ains-verify__orb {
-  position: absolute;
-  width: 144px;
-  height: 144px;
-  border-radius: 9999px;
-  filter: blur(32px);
-  pointer-events: none;
-  z-index: 0;
-}
-
-.ains-verify__orb--blue {
-  top: -64px;
-  right: -64px;
-  background: rgba(96, 165, 250, 0.35);
-}
-
-.ains-verify__orb--cyan {
-  bottom: -64px;
-  left: -64px;
-  background: rgba(34, 211, 238, 0.3);
-}
-
-.ains-verify__card {
-  position: relative;
-  z-index: 1;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-}
-
-/* 顶部邮件图标（占位元素，可后续替换为 SVG） */
+/* 顶部 Logo —— 系统默认 favicon.jpg */
 .ains-verify__icon {
   width: 56px;
   height: 56px;
   margin-bottom: 16px;
-  background: linear-gradient(135deg, #3b82f6 0%, #06b6d4 100%);
+  object-fit: cover;
   border-radius: 16px;
   box-shadow: 0 8px 16px -4px rgba(59, 130, 246, 0.3);
 }

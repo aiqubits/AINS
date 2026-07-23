@@ -26,6 +26,9 @@ const MAX_CLIENT_ATTEMPTS: i32 = 5;
 /// 服务端 `RESEND_COOLDOWN_SECONDS = 60`：与 `server/src/services/verification.rs:15` 保持一致。
 const RESEND_COOLDOWN_SECS: i32 = 60;
 
+/// 系统默认 Logo（与浏览器 favicon 同源），与其他鉴权页品牌一致。
+const LOGO: Asset = asset!("/assets/favicon.jpg");
+
 #[component]
 pub fn VerifyEmail(email: String) -> Element {
     // ── 所有 hook 必须在组件顶部无条件调用 ─────────────────────────
@@ -243,7 +246,7 @@ pub fn VerifyEmail(email: String) -> Element {
             div { class: "ains-verify__orb ains-verify__orb--cyan" }
 
             div { class: "ains-verify__card",
-                div { class: "ains-verify__icon" }
+                img { class: "ains-verify__icon", src: LOGO, alt: "AINS" }
 
                 h1 { class: "ains-verify__title", {t.verify_email_title} }
                 p { class: "ains-verify__subtitle",

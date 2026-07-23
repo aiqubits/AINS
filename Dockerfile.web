@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     curl \
     pkg-config \
     libssl-dev \
+    binaryen \
     && rm -rf /var/lib/apt/lists/*
 
 # Install wasm32 target needed for Dioxus WASM compilation
@@ -35,6 +36,12 @@ RUN curl -L --proto '=https' --tlsv1.2 -sSf \
     tar xzf /tmp/binstall.tgz -C /usr/local/cargo/bin && \
     rm /tmp/binstall.tgz
 RUN cargo binstall dioxus-cli --version 0.7.9 -y
+
+# Install wasm-bindgen-cli at the EXACT version of the wasm-bindgen crate in Cargo.lock
+# (0.2.126). Required because NO_DOWNLOADS=1 (set before `dx build` below) makes dioxus-cli
+# resolve ALL tooling from PATH instead of downloading — dx does an exact version match on
+# `wasm-bindgen --version`, so this MUST be kept in sync with the wasm-bindgen crate version.
+RUN cargo binstall wasm-bindgen-cli --version 0.2.126 -y
 
 # ── Copy all workspace Cargo.toml manifests for dependency caching ──
 COPY Cargo.toml Cargo.lock ./
@@ -98,6 +105,11 @@ RUN find app/web/src app/ui/src crates/i18n/src app/client-api/src \
 
 # Build the Dioxus frontend (from workspace root for correct path resolution)
 WORKDIR /app
+# Use locally installed tooling (wasm-opt from the `binaryen` apt package + wasm-bindgen-cli
+# installed above, both on PATH) instead of downloading from GitHub at build time.
+# NO_DOWNLOADS is the flag dioxus-cli 0.7.9 actually honors (see CliSettings::prefer_no_downloads);
+# the previous WASM_BINDGEN_USE_LOCAL_OPT was silently ignored and dx still hit the network.
+ENV NO_DOWNLOADS=1
 RUN dx build --release --package web --platform web
 
 # ── Runtime stage - nginx static file server ──
