@@ -43,6 +43,19 @@ RUN cargo binstall dioxus-cli --version 0.7.9 -y
 # `wasm-bindgen --version`, so this MUST be kept in sync with the wasm-bindgen crate version.
 RUN cargo binstall wasm-bindgen-cli --version 0.2.126 -y
 
+# Install esbuild (required by dioxus-cli for web builds; NO_DOWNLOADS=1 prevents dx from
+# downloading it automatically, so it must be pre-installed on PATH).
+# Downloaded from npm registry for reliable version pinning and binary naming.
+ENV ESBUILD_VERSION=0.28.1
+RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
+    curl -L --proto '=https' --tlsv1.2 -sSf \
+    "https://registry.npmjs.org/@esbuild/linux-${ARCH}/-/linux-${ARCH}-${ESBUILD_VERSION}.tgz" \
+    -o /tmp/esbuild.tgz && \
+    tar xzf /tmp/esbuild.tgz -C /tmp && \
+    mv /tmp/package/bin/esbuild /usr/local/bin/esbuild && \
+    chmod +x /usr/local/bin/esbuild && \
+    rm -rf /tmp/esbuild.tgz /tmp/package
+
 # ── Copy all workspace Cargo.toml manifests for dependency caching ──
 COPY Cargo.toml Cargo.lock ./
 COPY app/web/Cargo.toml ./app/web/Cargo.toml
