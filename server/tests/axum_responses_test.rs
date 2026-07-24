@@ -249,8 +249,10 @@ async fn test_responses_rejects_invalid_format() {
 #[tokio::test]
 async fn test_responses_multi_turn_messages() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_mult");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    // Isolated tenant: a sibling test may create an active chat channel in the
+    // shared `default` tenant, which this chat request would then select and
+    // proxy — surfacing the upstream 4xx instead of the expected NoChannel 503.
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_mult").await;
 
     let (status, _body) = post(
         &app,
@@ -272,8 +274,9 @@ async fn test_responses_multi_turn_messages() {
 #[tokio::test]
 async fn test_responses_with_image_input() {
     let (app, _state) = axum_helpers::create_app_and_state().await;
-    let email = common::unique_email("resp_img");
-    let token = axum_helpers::register_and_login(&app, &email).await;
+    // Isolated tenant so no sibling-created channel can satisfy this request and
+    // mask the expected NoChannel 503.
+    let token = axum_helpers::register_isolated_tenant_user(&app, "resp_img").await;
 
     let (status, _body) = post(
         &app,
