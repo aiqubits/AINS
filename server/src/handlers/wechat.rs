@@ -1,189 +1,20 @@
-//! WeChat captcha-login API handlers.
+//! WeChat callback API handlers.
 //!
-//! Provides the `wx_login` endpoint that verifies a captcha code obtained
-//! from the WeChat Official Account and issues a JWT, as well as WeChat
-//! callback handlers for server verification and message processing.
+//! Provides WeChat callback handlers for server verification (echostr
+//! handshake) and incoming message processing (captcha generation on a
+//! trigger keyword or a custom-menu CLICK event, a configurable welcome
+//! reply on subscribe, AI-reply transfer for other user chat messages, and a
+//! bare `success` ack for non-chat events), plus a small endpoint reporting
+//! whether the WeChat captcha-login feature is enabled.
 
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use wechat_api::callback::CallbackQuery;
 
 use crate::AppState;
-use crate::handlers::auth::{expiry_cookie, token_cookie, unix_timestamp_from_now};
 use crate::handlers::helpers::extract_state;
-use crate::middlewares::{JWT_COOKIE, REFRESH_COOKIE};
-use crate::services::wechat::WechatComponents;
-use crate::utils::error::ApiError;
 use ains_runtime::{HttpError, RequestContext, Response};
-
-// ── wx-login endpoint ─────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-pub struct WxLoginRequestBody {
-    /// The captcha code received from the WeChat Official Account.
-    pub code: String,
-}
-
-#[derive(Serialize)]
-pub struct WxLoginResponse {
-    pub token: String,
-    pub token_type: String,
-    pub expires_in: u64,
-    pub user_id: String,
-    pub role: String,
-    pub tenant_id: String,
-}
-
-/// POST /api/public/auth/wx-login
-///
-/// Verify a WeChat captcha code and issue a JWT.
-/// The code is obtained by sending a trigger keyword to the WeChat Official
-/// Account. The openid must already be bound to a user account (via the
-/// user settings page or by admin assignment).
-pub async fn wx_login(mut req: crate::ServerRequest) -> Result<Response, HttpError> {
-    let state: AppState = extract_state(&req)?;
-    let payload: WxLoginRequestBody = req
-        .parse_json_or_form()
-        .await
-        .map_err(HttpError::bad_request)?;
-
-    let wechat = state
-        .wechat
-        .as_ref()
-        .ok_or_else(|| HttpError::bad_request("WeChat login is not configured"))?;
-
-    let result = wx_login_inner(&state, wechat, &payload).await?;
-    let (resp, cookies) = result;
-
-    let mut response = Response::json(&resp)?;
-    for cookie in cookies {
-        response.set_cookie(cookie);
-    }
-    Ok(response)
-}
-
-async fn wx_login_inner(
-    state: &AppState,
-    wechat: &WechatComponents,
-    payload: &WxLoginRequestBody,
-) -> Result<(WxLoginResponse, Vec<cookie::Cookie<'static>>), ApiError> {
-    let account_id = &wechat.config.account_id;
-
-    // 1. Look up openid from the reverse index (code → openid).
-    let code_key = format!("wechat:{account_id}:code:{}", payload.code);
-    let openid = wechat
-        .captcha_store
-        .get_opt(&code_key)
-        .await?
-        .ok_or_else(|| ApiError::BadRequest("Invalid or expired captcha code".to_string()))?;
-
-    // 2. Verify the captcha via LoginService.
-    let login_result = wechat
-        .login_service
-        .verify_and_login(account_id, &openid, &payload.code)
-        .await;
-
-    let user_id = match login_result {
-        Ok(verified) => verified.user_id,
-        Err(_) => {
-            // Return the same generic message for all captcha-validation
-            // failures (invalid code, expired code, unbound account) to
-            // prevent information leakage about captcha validity.
-            return Err(ApiError::BadRequest(
-                "Invalid or expired captcha code".to_string(),
-            ));
-        }
-    };
-
-    // 3. Look up the user's role and token_version.
-    let (role, token_version, tenant_id) = lookup_user_role_and_version(state, user_id).await?;
-
-    // 3.5. Reject login for disabled tenants — same security boundary
-    // as the email login endpoint (services/auth.rs login()).
-    match crate::services::tenant::TenantService::with_cache(state.db.clone(), state.cache.clone())
-        .is_active(&tenant_id)
-        .await
-    {
-        Ok(true) => { /* tenant is active — continue */ }
-        Ok(false) => {
-            tracing::info!(
-                user_id = %user_id,
-                tenant_id = %tenant_id,
-                "WeChat login rejected: tenant is not active"
-            );
-            return Err(ApiError::BadRequest("WeChat login failed".to_string()));
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                user_id = %user_id,
-                tenant_id = %tenant_id,
-                "Failed to check tenant status — rejecting WeChat login (fail-closed)"
-            );
-            return Err(ApiError::BadRequest("WeChat login failed".to_string()));
-        }
-    }
-
-    // 4. Issue JWT.
-    let jwt_expiry = state.config.jwt_expiry_seconds;
-    let token = crate::middlewares::generate_token(
-        &user_id.to_string(),
-        &role,
-        &state.config.jwt_secret,
-        jwt_expiry,
-        false,
-        token_version,
-        &tenant_id,
-    )
-    .map_err(|_| ApiError::Internal("An unexpected error occurred".to_string()))?;
-
-    let jwt_expires_at_unix = unix_timestamp_from_now(jwt_expiry)?;
-
-    let cookies = vec![
-        token_cookie(JWT_COOKIE, &token, jwt_expiry, state.config.cookie_secure),
-        token_cookie(REFRESH_COOKIE, "", 0, state.config.cookie_secure),
-        expiry_cookie(
-            &jwt_expires_at_unix.to_string(),
-            jwt_expiry,
-            state.config.cookie_secure,
-        ),
-    ];
-
-    tracing::debug!(user_id, "WeChat captcha login successful");
-
-    Ok((
-        WxLoginResponse {
-            token,
-            token_type: "Bearer".to_string(),
-            expires_in: jwt_expiry,
-            user_id: user_id.to_string(),
-            role,
-            tenant_id,
-        },
-        cookies,
-    ))
-}
-
-/// Look up a user's role, token_version, and tenant_id by id.
-async fn lookup_user_role_and_version(
-    state: &AppState,
-    user_id: i64,
-) -> Result<(String, i32, String), ApiError> {
-    use crate::repositories::user::Entity as UserEntity;
-    use sea_orm::EntityTrait;
-
-    let user = UserEntity::find_by_id(user_id)
-        .one(state.db.write_conn())
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %e, user_id, "Database lookup failed after WeChat captcha login");
-            ApiError::Internal("An unexpected error occurred".to_string())
-        })?
-        .ok_or_else(|| ApiError::Internal("An unexpected error occurred".to_string()))?;
-
-    Ok((user.role, user.token_version, user.tenant_id))
-}
 
 // ── WeChat configuration status endpoint ───────────────────────────────────
 
@@ -287,47 +118,70 @@ async fn wechat_process_callback(
     let account_id = &wechat.config.account_id;
     let msg = &parsed.message;
 
-    // Check if this is a text message with a trigger keyword.
-    let reply_xml = if msg.msg_type == "text" {
-        let content = msg.content.as_deref().unwrap_or("");
-        if wechat.captcha_service.matches_trigger(content) {
-            // Generate a captcha, store it, and reply with the code.
-            match wechat
-                .captcha_service
-                .generate(account_id, &msg.from_user_name)
-                .await
-            {
-                Ok(code) => {
-                    let reply_text = format!(
-                        "Your verification code: {}\nEnter this code on the login page to sign in. Valid for {} seconds.",
-                        code,
-                        wechat.captcha_service.captcha_ttl(),
-                    );
-                    wechat_api::build_text_reply(
-                        &msg.from_user_name,
-                        &msg.to_user_name,
-                        &reply_text,
-                    )
-                }
-                Err(wechat_api::WechatError::CooldownActive) => {
-                    let reply_text = "A verification code was already sent recently. Please check your chat history or wait before requesting a new one.";
-                    wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
-                }
-                Err(e) => {
-                    tracing::error!("Failed to generate captcha: {e}");
-                    let reply_text = "System busy, please try again later.";
-                    wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
-                }
-            }
-        } else {
-            // No trigger keyword — send a help message.
-            let reply_text = "Send \"verification code\" or \"login\" to receive a captcha code for logging in to AINS.";
-            wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
-        }
+    // A captcha is issued when either:
+    // - a text message contains a trigger keyword (e.g. 「验证码」), or
+    // - the user taps the custom-menu CLICK button whose key is `GET_AINS_CAPTCHA`.
+    let should_send_captcha = if msg.msg_type == "text" {
+        wechat
+            .captcha_service
+            .matches_trigger(msg.content.as_deref().unwrap_or(""))
     } else {
-        // Non-text messages — send a default reply.
-        let reply_text = "Welcome to AINS! Send \"verification code\" to log in.";
-        wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
+        msg.is_event()
+            && msg.event.as_deref() == Some("CLICK")
+            && msg.event_key.as_deref() == Some("GET_AINS_CAPTCHA")
+    };
+
+    let reply_xml = if should_send_captcha {
+        // Generate a captcha, store it, and reply with the code.
+        match wechat
+            .captcha_service
+            .generate(account_id, &msg.from_user_name)
+            .await
+        {
+            Ok(code) => {
+                let reply_text = format!(
+                    "你的验证码：{}，有效期{}分钟。请在登录页输入该验证码完成登录。",
+                    code,
+                    wechat.captcha_service.captcha_ttl() / 60,
+                );
+                wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, &reply_text)
+            }
+            Err(wechat_api::WechatError::CooldownActive) => {
+                let reply_text = "最近已发送过验证码，请查看聊天记录，或稍后再重新获取。";
+                wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
+            }
+            Err(e) => {
+                tracing::error!("Failed to generate captcha: {e}");
+                let reply_text = "系统繁忙，请稍后再试。";
+                wechat_api::build_text_reply(&msg.from_user_name, &msg.to_user_name, reply_text)
+            }
+        }
+    } else if msg.is_subscribe() && !wechat.subscribe_reply.is_empty() {
+        // A user just followed the account. The backend "subscribe auto-reply"
+        // is bypassed once a callback URL + Token is configured, so we emit the
+        // configured welcome text ourselves. When `subscribe_reply` is empty
+        // this branch is skipped and the event falls through to the AI reply.
+        wechat_api::build_text_reply(
+            &msg.from_user_name,
+            &msg.to_user_name,
+            &wechat.subscribe_reply,
+        )
+    } else if !msg.is_event() || msg.is_subscribe() {
+        // A user-sent chat message that isn't a captcha trigger (regular text,
+        // image, voice, video, shared location, link), OR a `subscribe` event
+        // when no welcome is configured: hand the conversation over to WeChat's
+        // official AI reply service via a `transfer_biz_ai_ivr` passive reply.
+        // Returning our own text (or "success"/empty) here would suppress the
+        // account's configured AI reply, so we explicitly transfer instead.
+        wechat_api::build_ai_transfer_reply(&msg.from_user_name, &msg.to_user_name)
+    } else {
+        // Any other event message (unsubscribe, automatic LOCATION/SCAN
+        // reports, menu VIEW clicks, non-captcha CLICK keys, template-send
+        // callbacks, …). These are not user chat messages, so replying — even
+        // a transfer — would push an unwanted message to the user or produce
+        // an error reply. Acknowledge with a bare "success" so WeChat does not
+        // retry, without sending anything to the user.
+        "success".to_string()
     };
 
     Ok(reply_xml)

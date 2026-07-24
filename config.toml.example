@@ -225,6 +225,12 @@ timeout_secs = 30
 # Keywords that trigger captcha generation (comma-separated)
 # trigger_keywords = ["验证码", "登录码", "login"]
 
+# Welcome text sent when a user subscribes (follows) the account. Because a
+# callback URL + Token is configured, the backend "subscribe auto-reply" is
+# bypassed, so the server sends this itself. Set to "" to disable the welcome
+# and hand subscribe events to the official AI reply instead.
+# subscribe_reply = "感谢关注 AINS！发送「验证码」即可获取用于网页端登录的验证码。"
+
 # AI Gateway quota and circuit-breaker configuration
 # All fields have sensible defaults — only uncomment if you need to override.
 [quota]

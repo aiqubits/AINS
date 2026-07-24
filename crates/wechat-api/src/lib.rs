@@ -71,7 +71,14 @@
 //!        .with(DefaultReplyHandler::default());
 //!    ```
 //!
-//! 4. Call `LoginService::verify_and_login` from the `/auth/wx-login` endpoint.
+//! 4. Verify captcha codes in the login endpoint. **ains** uses a shared-captcha
+//!    model where the code is a *second factor* for email+password login (no
+//!    openid → user binding): call [`CaptchaService::verify_for_openid`], which
+//!    one-shot consumes the code, before running the password check.
+//!
+//!    Apps that instead want openid-bound passwordless login can implement
+//!    [`store::UserBindingStore`] and use [`login::LoginService`] to resolve the
+//!    bound user id from a verified openid.
 //!
 //! ## Extensibility
 //!
@@ -106,8 +113,8 @@ pub use handler::CaptchaTriggerHandler;
 pub use handler::{DefaultReplyHandler, HandleOutcome, HandlerChain, MessageHandler};
 pub use login::{LoginService, VerifiedLogin};
 pub use message::{
-    BasicMessage, WechatMessage, build_image_reply, build_news_reply, build_text_reply,
-    parse_basic, parse_message,
+    BasicMessage, WechatMessage, build_ai_transfer_reply, build_image_reply, build_news_reply,
+    build_text_reply, parse_basic, parse_message,
 };
 pub use store::{CaptchaStore, UserBindingStore};
 

@@ -261,22 +261,6 @@ pub struct ChangePasswordResponse {
 //  WeChat captcha-login types
 // ──────────────────────────────────────────────
 
-/// WeChat captcha login request body
-#[derive(Debug, Serialize)]
-pub struct WxLoginRequest {
-    pub code: String,
-}
-
-/// WeChat captcha login response
-#[derive(Debug, Deserialize)]
-pub struct WxLoginResponse {
-    pub token: String,
-    pub token_type: String,
-    pub expires_in: u64,
-    pub user_id: String,
-    pub role: String,
-}
-
 /// WeChat enabled check response
 #[derive(Debug, Deserialize)]
 pub struct WechatEnabledResponse {

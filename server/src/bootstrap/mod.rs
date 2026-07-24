@@ -151,8 +151,7 @@ pub fn create_app_state(
     config: AppConfig,
 ) -> AppState {
     let email_service = emailserver::EmailService::new(config.email.clone());
-    let wechat =
-        crate::services::wechat::init_wechat_components(&config.wechat, &cache, db.clone());
+    let wechat = crate::services::wechat::init_wechat_components(&config.wechat, &cache);
     let secret = if !config.gateway_encryption_key.is_empty() {
         &config.gateway_encryption_key
     } else {

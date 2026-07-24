@@ -68,7 +68,9 @@ pub struct Model {
     #[sea_orm(default_value = 0)]
     pub balance: i64,
 
-    /// WeChat Official Account openid (bound on first wx-login)
+    /// WeChat Official Account openid. Legacy/reserved column: the current
+    /// shared-captcha login model does not bind openids, so this is not
+    /// written today. Kept for optional openid-bound login (see wechat-api).
     pub wx_openid: Option<String>,
 
     /// Owning server-side tenant. Clients never select this value themselves.
@@ -135,7 +137,8 @@ pub struct UserResponse {
     pub token_version: i32,
     /// User balance (stored as big value)
     pub balance: i64,
-    /// WeChat Official Account openid (bound on first wx-login)
+    /// WeChat Official Account openid. Legacy/reserved column (see the entity
+    /// model): not written under the current shared-captcha login model.
     /// NOTE: This is PII — always skipped from API responses to prevent
     /// accidental exposure via list/get-user endpoints.  If the owning user
     /// needs to see their binding status, add a dedicated bool flag or

@@ -433,6 +433,14 @@ pub struct WechatAccountConfig {
     /// account by the user. Defaults to ["验证码", "登录码", "login"].
     #[serde(default = "default_trigger_keywords")]
     pub trigger_keywords: Vec<String>,
+
+    /// Text sent as the passive reply when a user subscribes (follows) the
+    /// official account. Because a callback URL + Token is configured, the
+    /// backend "subscribe auto-reply" is bypassed, so the server must emit
+    /// this welcome message itself. An empty string disables the welcome and
+    /// hands subscribe events over to the official AI reply instead.
+    #[serde(default = "default_subscribe_reply")]
+    pub subscribe_reply: String,
 }
 
 impl Default for WechatAccountConfig {
@@ -451,6 +459,7 @@ impl Default for WechatAccountConfig {
             max_failed_attempts: default_max_attempts(),
             captcha_len: default_captcha_len(),
             trigger_keywords: default_trigger_keywords(),
+            subscribe_reply: default_subscribe_reply(),
         }
     }
 }
@@ -533,6 +542,9 @@ fn default_trigger_keywords() -> Vec<String> {
         "登录码".to_string(),
         "login".to_string(),
     ]
+}
+fn default_subscribe_reply() -> String {
+    "感谢关注 AINS！发送「验证码」即可获取用于网页端登录的验证码。".to_string()
 }
 
 /// Load application configuration from file and environment variables

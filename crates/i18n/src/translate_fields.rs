@@ -67,7 +67,7 @@ translate! {
     login_password_mismatch: "Passwords do not match" => "两次输入的密码不一致",
     login_captcha_empty: "Captcha code cannot be empty" => "验证码不能为空",
     auth_captcha_tab: "Captcha" => "验证码",
-    auth_captcha_hint: "Send \"验证码\" to our WeChat Official Account, then enter the code you received below" => "发送「验证码」至微信公众号，将收到的验证码填入下方",
+    auth_captcha_hint: "Send \"AINS验证码\" to our WeChat Official Account, then enter the code you received below" => "发送「AINS验证码」至微信公众号，将收到的验证码填入下方",
     auth_captcha_label: "Captcha Code" => "验证码",
     auth_captcha_placeholder: "Enter the code from WeChat" => "请输入微信收到的验证码",
     auth_submit_captcha: "Sign In with Captcha" => "验证码登录",

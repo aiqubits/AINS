@@ -36,20 +36,25 @@ standalone, pluggable crate designed to grow with future WeChat features.
    → CaptchaService::generate → WechatClient::send_text_message
    → User receives code in WeChat
 
-② User enters code on the web login page
-   → POST /auth/wx-login { openid, code }
-   → LoginService::verify_and_login
+② User enters the code on the web login page
+   → POST /api/public/auth/login { email, password, captcha_code }
    → CaptchaService::verify_for_openid (one-shot consume)
-   → UserBindingStore::find_user_by_openid
-   → host app issues JWT for the returned user_id
+   → password check → host app issues JWT for the email+password account
 ```
+
+> **ains uses a shared-captcha model**: the code is a *second factor* for
+> email+password login and is **not** bound to any openid — any follower's
+> valid code satisfies the check. The optional `LoginService` /
+> `UserBindingStore` (openid-bound passwordless login) is retained as SDK
+> surface but is **not** used by ains.
 
 ## Integration with ains
 
 1. Implement the store traits for ains's `CacheService` and DB layer.
-2. Build `WechatClient` + `CaptchaService` + `LoginService` in `bootstrap`.
+2. Build `WechatClient` + `CaptchaService` in `bootstrap`.
 3. Wire `CaptchaTriggerHandler` into the WeChat callback route.
-4. Call `LoginService::verify_and_login` from a new `/auth/wx-login` handler.
+4. Call `CaptchaService::verify_for_openid` as a second factor inside the
+   existing `/api/public/auth/login` handler (before the password check).
 
 ## Extensibility
 

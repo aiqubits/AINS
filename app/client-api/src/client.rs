@@ -249,18 +249,6 @@ impl Client {
             .await
     }
 
-    /// WeChat 验证码登录 — `POST /api/public/auth/wx-login`
-    ///
-    /// 用户从微信公众号获取验证码后，传入 code 进行登录。
-    /// 如果 WeChat 账号未绑定任何用户，请先用 email/password 登录并在设置页绑定。
-    pub async fn wx_login(&self, code: &str) -> Result<WxLoginResponse, ClientError> {
-        let body = WxLoginRequest {
-            code: code.to_string(),
-        };
-        self.post_json_no_auth("/api/public/auth/wx-login", &body)
-            .await
-    }
-
     /// WeChat captcha-login 功能开关 — `GET /api/public/auth/wechat-enabled`
     ///
     /// 返回 WeChat 验证码登录功能是否已启用。前端据此决定是否显示 captcha 登录标签。

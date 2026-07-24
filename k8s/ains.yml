@@ -68,6 +68,28 @@ spec:
             secretKeyRef:
               name: ains-secrets
               key: system_admin_password
+        # WeChat Official Account secrets (optional). The feature is OFF unless
+        # [wechat].enabled = true in the ains-config ConfigMap; non-secret
+        # WeChat settings live there. These three are marked optional: true so
+        # the pod still starts when the keys are absent from ains-secrets.
+        - name: AINS_WECHAT__APP_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: wechat_app_secret
+              optional: true
+        - name: AINS_WECHAT__TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: wechat_token
+              optional: true
+        - name: AINS_WECHAT__ENCODING_AES_KEY
+          valueFrom:
+            secretKeyRef:
+              name: ains-secrets
+              key: wechat_encoding_aes_key
+              optional: true
         volumeMounts:
         - name: config-volume
           mountPath: /app/config.toml

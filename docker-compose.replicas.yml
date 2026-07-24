@@ -20,6 +20,9 @@
 #   AINS_REPLICATION_PASSWORD  — 复制角色密码（可选，默认同主库密码）
 #   AINS_SYSTEM_ADMIN_EMAIL    — 系统管理员邮箱（可选，默认 admin@ains.local）
 #   AINS_SYSTEM_ADMIN_PASSWORD — 系统管理员密码（可选，默认 change-me-admin-password）
+#   AINS_ENV                   — 运行环境（可选，默认 development）
+#   AINS_WEB_PORT              — Web(nginx) 容器对外发布端口（可选，默认 80）
+#   RUST_LOG                   — 日志级别（可选，默认 info）
 # ============================================
 name: ains-replicas
 
@@ -37,13 +40,32 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=${RUST_LOG:-info}
       - AINS_ENV=${AINS_ENV:-development}
       - AINS_DATABASE_URL=postgres://postgres:${AINS_POSTGRES_PASSWORD:-CHANGE_ME_POSTGRES_PASSWORD}@postgres-primary:5432/ains
       # 两个流式复制从库地址，AutoRouter 自动路由 SELECT 查询
       - AINS_DATABASE_READ_URLS=postgres://postgres:${AINS_POSTGRES_PASSWORD:-CHANGE_ME_POSTGRES_PASSWORD}@postgres-replica1:5432/ains,postgres://postgres:${AINS_POSTGRES_PASSWORD:-CHANGE_ME_POSTGRES_PASSWORD}@postgres-replica2:5432/ains
       - AINS_REDIS_URL=redis://:${AINS_REDIS_PASSWORD:-CHANGE_ME_REDIS_PASSWORD}@redis:6379
       - AINS_JWT_SECRET=${AINS_JWT_SECRET:?Set AINS_JWT_SECRET in .env file}
+      # 系统管理员账号（首次启动时写入），显式传递以保证 .env 中的值生效
+      - AINS_SYSTEM_ADMIN_EMAIL=${AINS_SYSTEM_ADMIN_EMAIL:-admin@ains.local}
+      - AINS_SYSTEM_ADMIN_PASSWORD=${AINS_SYSTEM_ADMIN_PASSWORD:-change-me-admin-password}
+      # 微信公众号（验证码登录）。必须在此显式列出，否则 .env 中的
+      # AINS_WECHAT__* 只用于 ${VAR} 替换而不会注入容器；凭据为空时功能优雅禁用。
+      - AINS_WECHAT__ENABLED=${AINS_WECHAT__ENABLED:-false}
+      - AINS_WECHAT__APP_ID=${AINS_WECHAT__APP_ID:-}
+      - AINS_WECHAT__APP_SECRET=${AINS_WECHAT__APP_SECRET:-}
+      - AINS_WECHAT__TOKEN=${AINS_WECHAT__TOKEN:-}
+      - AINS_WECHAT__ACCOUNT_ID=${AINS_WECHAT__ACCOUNT_ID:-}
+      - AINS_WECHAT__ORIGINAL_ID=${AINS_WECHAT__ORIGINAL_ID:-}
+      - AINS_WECHAT__ENCODING_AES_KEY=${AINS_WECHAT__ENCODING_AES_KEY:-}
+      - AINS_WECHAT__MESSAGE_MODE=${AINS_WECHAT__MESSAGE_MODE:-plain}
+      - AINS_WECHAT__CAPTCHA_TTL_SECS=${AINS_WECHAT__CAPTCHA_TTL_SECS:-300}
+      - AINS_WECHAT__RESEND_COOLDOWN_SECS=${AINS_WECHAT__RESEND_COOLDOWN_SECS:-60}
+      - AINS_WECHAT__MAX_FAILED_ATTEMPTS=${AINS_WECHAT__MAX_FAILED_ATTEMPTS:-5}
+      - AINS_WECHAT__CAPTCHA_LEN=${AINS_WECHAT__CAPTCHA_LEN:-5}
+      - AINS_WECHAT__TRIGGER_KEYWORDS=${AINS_WECHAT__TRIGGER_KEYWORDS:-验证码,登录码,login}
+      - AINS_WECHAT__SUBSCRIBE_REPLY=${AINS_WECHAT__SUBSCRIBE_REPLY:-感谢关注 AINS！发送「验证码」即可获取用于网页端登录的验证码。}
     depends_on:
       postgres-primary:
         condition: service_healthy
@@ -74,7 +96,8 @@ services:
     pull_policy: build
     container_name: ains-web
     ports:
-      - "80:80"
+      # Host-side web port is operator-tunable via .env (AINS_WEB_PORT).
+      - "${AINS_WEB_PORT:-80}:80"
     volumes:
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
     depends_on:

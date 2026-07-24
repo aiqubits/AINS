@@ -113,20 +113,21 @@ async fn login_inner(
     payload.validate()?;
 
     // ── WeChat captcha verification (must precede password login) ──────
-    // Verify the captcha FIRST so that a failed captcha does not leave
-    // behind a stored refresh token from the password login step (the
-    // login service persists the refresh token in a transaction).
-    // On success the captcha is consumed (one-shot); if the subsequent
-    // password login fails, the user simply requests a new captcha from
-    // the WeChat Official Account — a cheaper cost than an orphaned
-    // refresh token row.
+    // When the WeChat captcha-login feature is enabled, email+password login
+    // additionally requires a valid captcha code obtained from the WeChat
+    // Official Account.
     //
-    // When the WeChat captcha-login feature is enabled, the email+password
-    // login also requires a valid captcha code obtained from the WeChat
-    // Official Account.  The captcha-bound user must match the authenticated
-    // user — this prevents a captcha obtained by one user from being used to
-    // log in as another user.
-    let captcha_user_id = if let Some(wechat) = state.wechat.as_ref() {
+    // SHARED-CAPTCHA MODEL: the captcha is NOT tied to the login account. Any
+    // WeChat follower can obtain a code by sending a trigger keyword, and any
+    // valid, unexpired, unconsumed code satisfies this second factor. The
+    // target account is determined solely by the email+password below — there
+    // is no openid → user binding or cross-check.
+    //
+    // Verify the captcha FIRST so a failed captcha does not leave behind a
+    // stored refresh token from the password login step. On success the code
+    // is consumed (one-shot); if the subsequent password login fails, the user
+    // simply requests a new code from the Official Account.
+    if let Some(wechat) = state.wechat.as_ref() {
         let captcha_code = payload.captcha_code.as_deref().unwrap_or("");
         if captcha_code.is_empty() {
             return Err(ApiError::BadRequest(
@@ -136,7 +137,9 @@ async fn login_inner(
 
         let account_id = &wechat.config.account_id;
 
-        // 1. Look up openid from reverse index (code → openid).
+        // 1. Resolve which openid this code belongs to via the reverse index
+        //    (code → openid). This only locates the stored captcha; the openid
+        //    is NOT required to be bound to any user.
         let code_key = format!("wechat:{account_id}:code:{}", captcha_code);
         let openid = wechat
             .captcha_store
@@ -144,10 +147,11 @@ async fn login_inner(
             .await?
             .ok_or_else(|| ApiError::BadRequest("Invalid or expired captcha code".to_string()))?;
 
-        // 2. Verify captcha via LoginService (consumes it on success).
-        let verified = wechat
-            .login_service
-            .verify_and_login(account_id, &openid, captcha_code)
+        // 2. Verify and consume the captcha (one-shot). Any valid code from
+        //    any follower is accepted — no binding requirement.
+        wechat
+            .captcha_service
+            .verify_for_openid(account_id, &openid, captcha_code)
             .await
             .map_err(|e| {
                 // Log internal/unexpected errors at error level; expected
@@ -158,7 +162,7 @@ async fn login_inner(
                     | WechatError::Store(_)
                     | WechatError::ApiRequest(_)
                     | WechatError::ApiBusiness { .. } => {
-                        tracing::error!(error = %e, "WeChat verify_and_login failed");
+                        tracing::error!(error = %e, "WeChat captcha verification failed");
                     }
                     _ => {
                         tracing::warn!(error = %e, "WeChat captcha verification failed");
@@ -166,11 +170,7 @@ async fn login_inner(
                 }
                 ApiError::BadRequest("Invalid or expired captcha code".to_string())
             })?;
-
-        Some(verified.user_id)
-    } else {
-        None
-    };
+    }
 
     // ── Password login ───────────────────────────────────────────────
     let service = AuthService::new(
@@ -188,20 +188,6 @@ async fn login_inner(
             remember: payload.remember,
         })
         .await?;
-
-    // ── Post-login captcha-bound user check ──────────────────────────
-    if let Some(captcha_user_id) = captcha_user_id {
-        if captcha_user_id.to_string() != result.user_id {
-            return Err(ApiError::BadRequest(
-                "Invalid or expired captcha code".to_string(),
-            ));
-        }
-
-        tracing::debug!(
-            user_id = %result.user_id,
-            "WeChat captcha verified for email+password login"
-        );
-    }
 
     let jwt_max_age = result.expires_in;
     let jwt_expires_at_unix = unix_timestamp_from_now(jwt_max_age)?;

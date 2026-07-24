@@ -163,6 +163,20 @@ pub fn build_news_reply(
     )
 }
 
+/// Build a "transfer to AI reply" XML string.
+///
+/// When a callback URL + Token is configured, WeChat's built-in auto/AI reply
+/// is bypassed and only the developer's response is delivered. Returning this
+/// `transfer_biz_ai_ivr` message tells WeChat to hand the message over to the
+/// official AI reply service (which must be enabled and trained on the
+/// account). See the "转接AI回复" section of the passive-reply documentation.
+pub fn build_ai_transfer_reply(to_user: &str, from_user: &str) -> String {
+    let ts = Utc::now().timestamp();
+    format!(
+        r#"<xml><ToUserName><![CDATA[{to_user}]]></ToUserName><FromUserName><![CDATA[{from_user}]]></FromUserName><CreateTime>{ts}</CreateTime><MsgType><![CDATA[transfer_biz_ai_ivr]]></MsgType></xml>"#
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

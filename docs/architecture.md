@@ -708,12 +708,22 @@ Authorization: Bearer <token>
 ```http
 GET /api/public/wechat/callback    # 微信服务器 GET 验证
 POST /api/public/wechat/callback   # 微信消息回调
-POST /api/public/auth/wx-login     # 验证码登录
+GET /api/public/auth/wechat-enabled # 验证码登录功能开关
+
+# 验证码作为邮箱+密码登录的第二因子（共享验证码模型，不绑定 openid）
+POST /api/public/auth/login        # 启用微信后额外携带 captcha_code
 {
-  "captcha": "12345"
+  "email": "user@example.com",
+  "password": "******",
+  "captcha_code": "12345"
 }
-GET /api/public/auth/wechat-enabled
 ```
+
+> **安全提示（共享验证码模型）**：验证码不与登录账号绑定，任何关注了公众号的
+> 用户都能获取有效验证码，且任意有效验证码都可满足该第二因子校验。因此它证明的是
+> “请求者是公众号关注者”，而非账号级的强 MFA——掌握了目标账号密码且本人（或同伙）
+> 是关注者的攻击者仍可登录。若需账号级绑定登录，可改用 `wechat-api` 中保留的
+> `LoginService` / `UserBindingStore`（openid 绑定的免密登录）。
 
 ### 错误处理
 

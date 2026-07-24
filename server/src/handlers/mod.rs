@@ -14,4 +14,4 @@ pub use api::{
 pub use auth::{
     forgot_password, login, logout, refresh, register, resend_code, reset_password, verify_email,
 };
-pub use wechat::{wechat_callback_get, wechat_callback_post, wechat_enabled, wx_login};
+pub use wechat::{wechat_callback_get, wechat_callback_post, wechat_enabled};

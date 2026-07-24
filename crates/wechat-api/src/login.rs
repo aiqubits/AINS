@@ -1,8 +1,8 @@
-//! High-level orchestration of the WeChat captcha login flow.
+//! High-level orchestration of an openid-bound WeChat captcha login flow.
 //!
 //! This module ties together [`CaptchaService`] (code generation /
 //! verification) and [`UserBindingStore`] (openid → user id lookup) to
-//! provide a single entry point for the web login endpoint:
+//! provide a single entry point for a *passwordless* login endpoint:
 //!
 //! ```text
 //! POST /auth/wx-login  { openid, code }
@@ -17,6 +17,12 @@
 //! application's responsibility (ains has its own auth layer). The
 //! `LoginService` returns the verified `UserId`, leaving token issuance
 //! to the caller.
+//!
+//! NOTE: **ains itself does not use this module.** ains adopts a shared-captcha
+//! model where the code is a second factor for email+password login and there
+//! is no openid → user binding (see [`CaptchaService::verify_for_openid`]). This
+//! `LoginService` is retained as optional SDK surface for host apps that want
+//! openid-bound passwordless login.
 
 use std::sync::Arc;
 

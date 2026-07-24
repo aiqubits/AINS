@@ -70,6 +70,27 @@ data:
     idle_timeout_secs = 600
     acquire_timeout_secs = 10
 
+    # WeChat Official Account (captcha login) — NON-SECRET settings only.
+    # Secrets (app_secret, token, encoding_aes_key) are NOT stored here; they
+    # are injected from the ains-secrets Secret via the AINS_WECHAT__* env vars
+    # in the Deployment (env overrides these file values).
+    # To enable: set enabled = true and fill account_id / app_id / original_id,
+    # then provide the three secret keys in ains-secrets.
+    [wechat]
+    enabled = false
+    account_id = ""
+    app_id = ""
+    original_id = ""
+    # Message encryption mode: plain | compatible | safe
+    # (encoding_aes_key is required only for "safe")
+    message_mode = "plain"
+    captcha_ttl_secs = 300
+    resend_cooldown_secs = 60
+    max_failed_attempts = 5
+    captcha_len = 5
+    trigger_keywords = ["验证码", "登录码", "login"]
+    subscribe_reply = "感谢关注 AINS！发送「验证码」即可获取用于网页端登录的验证码。"
+
   # ------------------------------------------
   # Individual keys for env var injection
   # (used by Deployment envFrom / configMapKeyRef)

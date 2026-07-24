@@ -11,15 +11,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use redis::aio::ConnectionManager;
-use sea_orm::{ColumnTrait, ConnectionTrait, DatabaseBackend, EntityTrait, QueryFilter, Statement};
-use wechat_api::{
-    CaptchaService, LoginConfig, LoginService, WechatConfig,
-    store::{CaptchaStore, UserBindingStore},
-};
+use wechat_api::{CaptchaService, LoginConfig, WechatConfig, store::CaptchaStore};
 
 use crate::services::CacheService;
 use crate::utils::config::WechatAccountConfig;
-use crate::utils::db_router::AutoRouter;
 
 // ── Redis key helpers ──────────────────────────────────────────────────────
 
@@ -325,83 +320,6 @@ impl CaptchaStore for RedisCaptchaStore {
     }
 }
 
-// ── UserBindingStore implementation (DB-backed) ────────────────────────────
-
-/// Database-backed [`UserBindingStore`] using the `wx_openid` column.
-pub struct DbUserBindingStore {
-    db: Arc<AutoRouter>,
-}
-
-impl DbUserBindingStore {
-    pub fn new(db: Arc<AutoRouter>) -> Self {
-        Self { db }
-    }
-}
-
-#[async_trait]
-impl UserBindingStore for DbUserBindingStore {
-    type UserId = i64;
-
-    async fn find_user_by_openid(
-        &self,
-        openid: &str,
-    ) -> wechat_api::WechatResult<Option<Self::UserId>> {
-        use crate::repositories::user::{Column, Entity as UserEntity};
-
-        let user = UserEntity::find()
-            .filter(Column::WxOpenid.eq(openid))
-            .one(self.db.write_conn())
-            .await
-            .map_err(|e| {
-                wechat_api::WechatError::Internal(anyhow::anyhow!(
-                    "DB query by wx_openid failed: {e}"
-                ))
-            })?;
-
-        Ok(user.map(|u| u.id))
-    }
-
-    async fn bind_openid(
-        &self,
-        user_id: &Self::UserId,
-        openid: &str,
-    ) -> wechat_api::WechatResult<()> {
-        let sql = "UPDATE users SET wx_openid = $1 WHERE id = $2";
-        self.db
-            .write_conn()
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                [openid.into(), (*user_id).into()],
-            ))
-            .await
-            .map_err(|e| {
-                wechat_api::WechatError::Internal(anyhow::anyhow!("Failed to bind wx_openid: {e}"))
-            })?;
-
-        Ok(())
-    }
-
-    async fn unbind_openid(&self, user_id: &Self::UserId) -> wechat_api::WechatResult<()> {
-        let sql = "UPDATE users SET wx_openid = NULL WHERE id = $1";
-        self.db
-            .write_conn()
-            .execute(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                [(*user_id).into()],
-            ))
-            .await
-            .map_err(|e| {
-                wechat_api::WechatError::Internal(anyhow::anyhow!(
-                    "Failed to unbind wx_openid: {e}"
-                ))
-            })?;
-
-        Ok(())
-    }
-}
-
 // ── WechatComponents bundle ────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -411,10 +329,11 @@ pub struct WechatComponents {
     pub config: WechatConfig,
     /// Captcha service (generate / verify).
     pub captcha_service: Arc<CaptchaService>,
-    /// Login service orchestration.
-    pub login_service: Arc<LoginService<DbUserBindingStore>>,
     /// Reference to the captcha store for reverse-index lookups (code → openid).
     pub captcha_store: Arc<RedisCaptchaStore>,
+    /// Welcome text sent on a `subscribe` event. Empty = no welcome (the
+    /// subscribe event is handed over to the official AI reply instead).
+    pub subscribe_reply: String,
 }
 
 /// Initialise WeChat components from configuration.
@@ -424,7 +343,6 @@ pub struct WechatComponents {
 pub fn init_wechat_components(
     config: &WechatAccountConfig,
     cache: &CacheService,
-    db: Arc<AutoRouter>,
 ) -> Option<WechatComponents> {
     if !config.enabled {
         tracing::info!("WeChat captcha-login is disabled (set [wechat].enabled = true to enable)");
@@ -461,12 +379,6 @@ pub fn init_wechat_components(
     };
     let captcha_service = Arc::new(CaptchaService::new(captcha_store.clone(), login_config));
 
-    // Build UserBindingStore (DB).
-    let binding_store = Arc::new(DbUserBindingStore::new(db));
-
-    // Build LoginService.
-    let login_service = Arc::new(LoginService::new(captcha_service.clone(), binding_store));
-
     // Build WechatConfig for callbacks / client.
     let message_mode = match config.message_mode.to_lowercase().as_str() {
         "safe" => wechat_api::MessageMode::Safe,
@@ -495,8 +407,8 @@ pub fn init_wechat_components(
     Some(WechatComponents {
         config: wechat_config,
         captcha_service,
-        login_service,
         captcha_store,
+        subscribe_reply: config.subscribe_reply.clone(),
     })
 }
 

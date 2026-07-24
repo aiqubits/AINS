@@ -15,7 +15,7 @@ services:
     ports:
       - "127.0.0.1:3000:3000"
     environment:
-      - RUST_LOG=info
+      - RUST_LOG=${RUST_LOG:-info}
       - AINS_ENV=${AINS_ENV:-development}
       # ⚠️  For production, always set AINS_POSTGRES_PASSWORD in .env; the fallback below
       #     is for local development only and MUST be changed before deploying.
@@ -33,6 +33,28 @@ services:
       #     (hex-only passwords are URL-safe.)
       - AINS_REDIS_URL=redis://:${AINS_REDIS_PASSWORD:-CHANGE_ME_REDIS_PASSWORD}@redis:6379
       - AINS_JWT_SECRET=${AINS_JWT_SECRET:?Set AINS_JWT_SECRET in .env file}
+      # System admin account (seeded on first boot). Passed through so values set
+      # in .env actually reach the container; required in non-development mode.
+      - AINS_SYSTEM_ADMIN_EMAIL=${AINS_SYSTEM_ADMIN_EMAIL:-admin@ains.local}
+      - AINS_SYSTEM_ADMIN_PASSWORD=${AINS_SYSTEM_ADMIN_PASSWORD:-change-me-admin-password}
+      # WeChat Official Account (captcha login). These MUST be listed here so
+      # values in .env actually reach the container — docker-compose only uses
+      # .env for ${VAR} substitution, NOT automatic container injection. When
+      # the required credentials are empty the feature is disabled gracefully.
+      - AINS_WECHAT__ENABLED=${AINS_WECHAT__ENABLED:-false}
+      - AINS_WECHAT__APP_ID=${AINS_WECHAT__APP_ID:-}
+      - AINS_WECHAT__APP_SECRET=${AINS_WECHAT__APP_SECRET:-}
+      - AINS_WECHAT__TOKEN=${AINS_WECHAT__TOKEN:-}
+      - AINS_WECHAT__ACCOUNT_ID=${AINS_WECHAT__ACCOUNT_ID:-}
+      - AINS_WECHAT__ORIGINAL_ID=${AINS_WECHAT__ORIGINAL_ID:-}
+      - AINS_WECHAT__ENCODING_AES_KEY=${AINS_WECHAT__ENCODING_AES_KEY:-}
+      - AINS_WECHAT__MESSAGE_MODE=${AINS_WECHAT__MESSAGE_MODE:-plain}
+      - AINS_WECHAT__CAPTCHA_TTL_SECS=${AINS_WECHAT__CAPTCHA_TTL_SECS:-300}
+      - AINS_WECHAT__RESEND_COOLDOWN_SECS=${AINS_WECHAT__RESEND_COOLDOWN_SECS:-60}
+      - AINS_WECHAT__MAX_FAILED_ATTEMPTS=${AINS_WECHAT__MAX_FAILED_ATTEMPTS:-5}
+      - AINS_WECHAT__CAPTCHA_LEN=${AINS_WECHAT__CAPTCHA_LEN:-5}
+      - AINS_WECHAT__TRIGGER_KEYWORDS=${AINS_WECHAT__TRIGGER_KEYWORDS:-验证码,登录码,login}
+      - AINS_WECHAT__SUBSCRIBE_REPLY=${AINS_WECHAT__SUBSCRIBE_REPLY:-感谢关注 AINS！发送「验证码」即可获取用于网页端登录的验证码。}
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,7 +81,8 @@ services:
     pull_policy: build
     container_name: ains-web
     ports:
-      - "80:80"
+      # Host-side web port is operator-tunable via .env (AINS_WEB_PORT).
+      - "${AINS_WEB_PORT:-80}:80"
     volumes:
       # Mount nginx config for runtime override without rebuilding
       - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
