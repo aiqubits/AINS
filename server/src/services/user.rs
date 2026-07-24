@@ -37,6 +37,11 @@ pub enum UserError {
     SamePassword(String),
     #[error("Operation not allowed: {0}")]
     NotAllowed(String),
+    /// Balance adjustment would drive the balance below zero. This is a
+    /// client input error (400), NOT a permission error (403) — the actor is
+    /// authorized to adjust, the requested amount is simply too large.
+    #[error("Insufficient balance")]
+    InsufficientBalance,
     #[error(transparent)]
     Internal(#[from] anyhow::Error),
 }
@@ -1039,9 +1044,11 @@ impl UserService {
             .checked_add(amount)
             .ok_or_else(|| UserError::NotAllowed("Balance overflow".to_string()))?;
 
-        // Reject negative balance
+        // Reject negative balance. This is a client input error (400), not a
+        // permission failure (403): the actor is authorized, the amount is
+        // just larger than the current balance.
         if new_balance < 0 {
-            return Err(UserError::NotAllowed("Insufficient balance".to_string()));
+            return Err(UserError::InsufficientBalance);
         }
 
         let mut active_model: ActiveModel = target.into();

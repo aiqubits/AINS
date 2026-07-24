@@ -693,6 +693,16 @@ fn make_adjust_handler(params: AdjustHandlerParams) -> impl FnMut(MouseEvent) + 
             return;
         }
         let stored = (display * BALANCE_SCALE as f64).round() as i64 * multiplier;
+        // Client-side guard for decreases: mirror the authoritative server-side
+        // check so the user gets instant, localized feedback and we avoid a
+        // doomed request. The server still re-validates (source of truth) for
+        // concurrent adjustments / stale balances.
+        if u.balance.checked_add(stored).is_none_or(|n| n < 0) {
+            signals
+                .form_error
+                .set(Some(t.users_adjust_insufficient.to_string()));
+            return;
+        }
         signals.submitting.set(true);
         signals.form_error.set(None);
         let mut s_async = signals;

@@ -161,6 +161,7 @@ translate! {
     users_adjust_invalid: "Invalid amount format" => "金额格式无效，请输入数字 (如 0.50)",
     users_adjust_positive: "Amount must be greater than 0" => "金额必须大于 0",
     users_adjust_overflow: "Amount exceeds maximum (1,000,000)" => "金额超出允许范围，最大 1,000,000",
+    users_adjust_insufficient: "Amount exceeds current balance" => "减少金额超过当前余额",
     users_modal_no_target_id: "No target user ID" => "缺少用户 ID",
 
     // settings.rs

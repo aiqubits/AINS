@@ -23,6 +23,9 @@ pub enum ApiError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    #[error("Insufficient balance: {0}")]
+    InsufficientBalance(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 
@@ -43,6 +46,13 @@ impl From<ApiError> for HttpError {
                 // Validation errors use a specific error_type
                 let mut http_err = HttpError::bad_request(msg);
                 http_err.error_type = "validation_error";
+                http_err
+            }
+            ApiError::InsufficientBalance(msg) => {
+                // 400 with a dedicated code so the client can map it to a
+                // localized message instead of the generic /personal 403 path.
+                let mut http_err = HttpError::bad_request(msg);
+                http_err.error_type = "insufficient_balance";
                 http_err
             }
             ApiError::Internal(_) => HttpError::internal("An unexpected error occurred"),
@@ -93,6 +103,9 @@ impl From<crate::services::user::UserError> for ApiError {
             crate::services::user::UserError::WeakPassword(msg) => ApiError::BadRequest(msg),
             crate::services::user::UserError::SamePassword(msg) => ApiError::BadRequest(msg),
             crate::services::user::UserError::NotAllowed(msg) => ApiError::Forbidden(msg),
+            crate::services::user::UserError::InsufficientBalance => {
+                ApiError::InsufficientBalance("Insufficient balance".to_string())
+            }
             crate::services::user::UserError::Internal(e) => {
                 tracing::error!("Internal error: {:?}", e);
                 ApiError::Internal("An unexpected error occurred".to_string())

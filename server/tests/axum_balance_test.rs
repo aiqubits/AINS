@@ -371,7 +371,7 @@ async fn test_adjust_balance_below_zero_rejected() {
     .await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::BAD_REQUEST,
         "balance below zero rejected: {:?}",
         body
     );

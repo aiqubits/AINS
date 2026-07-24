@@ -71,6 +71,7 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (401, _) => "Not logged in or session expired".to_string(),
                         (403, _) => "Insufficient permissions (admin required)".to_string(),
                         (404, _) => "User not found".to_string(),
+                        (_, "insufficient_balance") => "Amount exceeds current balance".to_string(),
                         (_, "validation_error") => format!("Validation error: {msg}"),
                         (_, "conflict") => {
                             "Operation conflict (email already exists or constraint violation)"
@@ -120,6 +121,7 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (401, _) => "未登录或会话已过期".to_string(),
                         (403, _) => "权限不足 (需 admin)".to_string(),
                         (404, _) => "用户不存在".to_string(),
+                        (_, "insufficient_balance") => "减少金额超过当前余额".to_string(),
                         (_, "validation_error") => format!("参数错误: {msg}"),
                         (_, "conflict") => "操作冲突（邮箱已存在或违反约束）".to_string(),
                         _ => format!("请求失败 (HTTP {status}): {msg}"),
@@ -374,6 +376,20 @@ mod tests {
         let err = ClientError::Other(404, r#"{"error":"not_found"}"#.into());
         let msg = humanize_error(&err, ErrorContext::UserManagement, Language::En);
         assert_eq!(msg, "User not found");
+    }
+
+    #[test]
+    fn humanize_usermgmt_insufficient_balance_zh() {
+        let err = ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::UserManagement, Language::Zh);
+        assert_eq!(msg, "减少金额超过当前余额");
+    }
+
+    #[test]
+    fn humanize_usermgmt_insufficient_balance_en() {
+        let err = ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::UserManagement, Language::En);
+        assert_eq!(msg, "Amount exceeds current balance");
     }
 
     #[test]
