@@ -134,7 +134,7 @@ pub fn ResetPassword(email: Option<String>) -> Element {
                     },
                     TextInput {
                         label: t.reset_pw_email_label.to_string(),
-                        placeholder: Some("ains@openpick.org".to_string()),
+                        placeholder: Some("admin@ains.local".to_string()),
                         value: email_signal,
                         input_type: InputType::Email,
                         required: true,

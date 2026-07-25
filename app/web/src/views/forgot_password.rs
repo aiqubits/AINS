@@ -110,7 +110,7 @@ pub fn ForgotPassword() -> Element {
                     },
                     TextInput {
                         label: t.forgot_pw_email_label.to_string(),
-                        placeholder: Some("ains@openpick.org".to_string()),
+                        placeholder: Some("admin@ains.local".to_string()),
                         value: email,
                         input_type: InputType::Email,
                         required: true,

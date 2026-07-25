@@ -18,9 +18,9 @@ mod tests {
         "top_header_node_online",            // 技术术语 Node Online 不翻译
         "dashboard_middleware_active",       // 技术术语 Active 不翻译
         "auth_name_placeholder",             // 占位符 e.g., rust_master 中英相同
-        "auth_email_placeholder_login",      // ains@openpick.org
-        "auth_email_placeholder_register",   // ains@openpick.org
-        "auth_password_placeholder",         // ••••••••
+        "auth_email_placeholder_login",      // admin@ains.local
+        "auth_email_placeholder_register",   // admin@ains.local
+        "auth_password_placeholder",         // 12345
         "app_shell_guest",                   // Guest 品牌名不翻译
         "users_form_name_placeholder",       // 占位符 e.g., rust_master 中英相同
         "users_form_email_placeholder",      // 占位符 master@rust.org 中英相同
