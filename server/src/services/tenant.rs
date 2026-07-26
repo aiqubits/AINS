@@ -13,6 +13,7 @@ use crate::{
     AutoRouter,
     repositories::{
         channel::Entity as ChannelEntity,
+        plan::Entity as PlanEntity,
         tenant::{ActiveModel, DEFAULT_TENANT_ID, Entity, TenantResponse},
         user::Entity as UserEntity,
     },
@@ -23,11 +24,12 @@ use crate::{
 pub enum TenantError {
     #[error("Tenant not found")]
     NotFound,
-    #[error("Tenant {id} has {users} user(s) and {channels} channel(s)")]
+    #[error("Tenant {id} has {users} user(s), {channels} channel(s) and {plans} plan(s)")]
     NotEmpty {
         id: String,
         users: u64,
         channels: u64,
+        plans: u64,
     },
     #[error("Invalid tenant status")]
     InvalidStatus,
@@ -260,17 +262,68 @@ impl TenantService {
             .count(db)
             .await
             .context("count channels")?;
-        if users != 0 || channels != 0 {
+        // Plans reference tenants with ON DELETE RESTRICT — count them here
+        // so the caller gets a structured NotEmpty error instead of a raw
+        // FK violation from the database.
+        let plans = PlanEntity::find()
+            .filter(crate::repositories::plan::Column::TenantId.eq(id))
+            .count(db)
+            .await
+            .context("count plans")?;
+        if users != 0 || channels != 0 || plans != 0 {
             return Err(TenantError::NotEmpty {
                 id: id.to_string(),
                 users,
                 channels,
+                plans,
             });
         }
-        Entity::delete_by_id(id)
-            .exec(db)
-            .await
-            .context("delete tenant")?;
+        if let Err(e) = Entity::delete_by_id(id).exec(db).await {
+            // A dependent row (user / channel / plan) may be created between
+            // the pre-check above and the delete; the RESTRICT FK then
+            // rejects it. Surface the same structured NotEmpty error instead
+            // of a raw 500. All three counts are re-read so the message
+            // names the actual blocker regardless of which table raced.
+            if matches!(
+                e.sql_err(),
+                Some(sea_orm::SqlErr::ForeignKeyConstraintViolation(_))
+            ) {
+                // The FK violation already proves the tenant is non-empty;
+                // a recount failure must not downgrade that to a 500. Fall
+                // back to zero counts, which the handler renders as the
+                // generic "dependent resource(s)" message.
+                let recount = async {
+                    let users = UserEntity::find()
+                        .filter(crate::repositories::user::Column::TenantId.eq(id))
+                        .count(db)
+                        .await?;
+                    let channels = ChannelEntity::find()
+                        .filter(crate::repositories::channel::Column::TenantId.eq(id))
+                        .count(db)
+                        .await?;
+                    let plans = PlanEntity::find()
+                        .filter(crate::repositories::plan::Column::TenantId.eq(id))
+                        .count(db)
+                        .await?;
+                    Ok::<_, sea_orm::DbErr>((users, channels, plans))
+                };
+                let (users, channels, plans) = recount.await.unwrap_or_else(|e| {
+                    tracing::warn!(
+                        tenant_id = %id,
+                        error = ?e,
+                        "recount after FK violation failed; reporting generic NotEmpty"
+                    );
+                    (0, 0, 0)
+                });
+                return Err(TenantError::NotEmpty {
+                    id: id.to_string(),
+                    users,
+                    channels,
+                    plans,
+                });
+            }
+            return Err(anyhow::Error::from(e).context("delete tenant").into());
+        }
 
         tracing::info!(tenant_id = %id, "Tenant deleted");
 
@@ -358,18 +411,20 @@ mod tests {
                 id: "t1".into(),
                 users: 3,
                 channels: 2,
+                plans: 0,
             }
             .to_string(),
-            "Tenant t1 has 3 user(s) and 2 channel(s)"
+            "Tenant t1 has 3 user(s), 2 channel(s) and 0 plan(s)"
         );
         assert_eq!(
             TenantError::NotEmpty {
                 id: "t2".into(),
                 users: 0,
                 channels: 1,
+                plans: 4,
             }
             .to_string(),
-            "Tenant t2 has 0 user(s) and 1 channel(s)"
+            "Tenant t2 has 0 user(s), 1 channel(s) and 4 plan(s)"
         );
         assert_eq!(
             TenantError::InvalidStatus.to_string(),

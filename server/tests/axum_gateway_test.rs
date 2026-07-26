@@ -83,6 +83,35 @@ async fn put(
     (status, json_body)
 }
 
+/// Create a plan in `tenant_id` and grant it to `user_id`, so the
+/// user-role caller passes the /api/ai/response plan-quota gate and the
+/// test keeps exercising the channel-routing / proxy path.
+async fn grant_test_plan(app: &Router, sys_token: &str, tenant_id: &str, user_id: &str) {
+    let (status, plan) = post(
+        app,
+        "/api/plans",
+        Some(sys_token),
+        Some(&json!({
+            "tenant_id": tenant_id,
+            "name": "Gateway Test Plan",
+            "price": 10_000_000_000i64,
+            "total_calls": 1_000_000,
+            "validity_days": 365,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test plan creation failed: {plan}");
+    let plan_id = plan["id"].as_str().unwrap();
+    let (status, body) = post(
+        app,
+        &format!("/api/users/{}/plans", user_id),
+        Some(sys_token),
+        Some(&json!({ "plan_id": plan_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "test plan grant failed: {body}");
+}
+
 /// Delete all active channels.
 #[allow(dead_code)]
 async fn cleanup_channels(app: &Router, sys_token: &str) {
@@ -1157,7 +1186,7 @@ async fn test_responses_e2e_with_mock_upstream() {
 
     // Create a user in the isolated tenant
     let user_email = common::unique_email("e2e_iso_user");
-    let (status, _user_body) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1170,6 +1199,13 @@ async fn test_responses_e2e_with_mock_upstream() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &isolated_tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1272,7 +1308,7 @@ async fn test_responses_upstream_error_is_proxied() {
 
     // Create a user in the isolated tenant
     let user_email = common::unique_email("err_iso_user");
-    let (status, _) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1285,6 +1321,13 @@ async fn test_responses_upstream_error_is_proxied() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &isolated_tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1361,7 +1404,7 @@ async fn test_responses_capability_routing_only_matching_capability() {
 
     // Create a user in the isolated tenant
     let user_email = common::unique_email("cap_routing_user");
-    let (status, _body) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1374,6 +1417,13 @@ async fn test_responses_capability_routing_only_matching_capability() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &isolated_tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1459,7 +1509,7 @@ async fn test_responses_tenant_isolation_in_routing() {
 
     // Create a user in tenant C and login
     let user_email = common::unique_email("iso_routing_user");
-    let (status, _body) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1472,6 +1522,13 @@ async fn test_responses_tenant_isolation_in_routing() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &tenant_c_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1607,7 +1664,7 @@ async fn test_anthropic_responses_e2e_with_mock_upstream() {
 
     // Create a user in the isolated tenant
     let user_email = common::unique_email("anth_iso_user");
-    let (status, _) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1620,6 +1677,13 @@ async fn test_anthropic_responses_e2e_with_mock_upstream() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &isolated_tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1711,7 +1775,7 @@ async fn test_anthropic_responses_upstream_error_is_proxied() {
 
     // Create a user in the isolated tenant
     let user_email = common::unique_email("anth_err_iso_user");
-    let (status, _) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1724,6 +1788,13 @@ async fn test_anthropic_responses_upstream_error_is_proxied() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &isolated_tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,
@@ -1819,7 +1890,7 @@ async fn test_metering_not_recorded_on_upstream_error() {
 
     // Create a user in the tenant and login
     let user_email = common::unique_email("met_err_user");
-    let (status, _body) = post(
+    let (status, user_body) = post(
         &app,
         "/api/users",
         Some(&sys_token),
@@ -1832,6 +1903,13 @@ async fn test_metering_not_recorded_on_upstream_error() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    grant_test_plan(
+        &app,
+        &sys_token,
+        &tenant_id,
+        user_body["id"].as_str().unwrap(),
+    )
+    .await;
 
     let (status, body) = post(
         &app,

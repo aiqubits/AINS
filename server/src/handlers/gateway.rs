@@ -85,15 +85,7 @@ pub async fn list_channels(req: crate::ServerRequest) -> Result<Response, HttpEr
 
     let mut items = items;
     // Best-effort enrich each row with its tenant display name (see list_users).
-    let tenant_ids: Vec<String> = items.iter().map(|c| c.tenant_id.clone()).collect();
-    if let Ok(names) = crate::services::tenant::TenantService::new(state.db.clone())
-        .names_for(&tenant_ids)
-        .await
-    {
-        for item in items.iter_mut() {
-            item.tenant_name = names.get(&item.tenant_id).cloned();
-        }
-    }
+    helpers::enrich_tenant_names(&state, &mut items).await;
 
     let total_pages = total.div_ceil(per_page);
 

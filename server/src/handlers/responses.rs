@@ -33,6 +33,56 @@ async fn require_active_tenant(state: &crate::AppState, tenant_id: &str) -> Resu
     helpers::require_active_tenant(state, tenant_id).await
 }
 
+/// Enforce plan-based call quota for regular users.
+///
+/// `user` role must hold an active plan instance (not expired, remaining
+/// calls > 0); one call is consumed per request — streaming and
+/// non-streaming alike. Returns the consumed instance ID as a refund ticket
+/// (`None` for exempt roles). Channel-selection failures (NoChannel) are
+/// refunded via `refund_plan_call`; genuine upstream failures are not.
+/// `admin`/`system` are exempt.
+async fn consume_plan_quota(
+    state: &crate::AppState,
+    actor: &ains_runtime::AuthUser,
+) -> Result<Option<i64>, HttpError> {
+    if actor.role != "user" {
+        return Ok(None);
+    }
+    let user_id: i64 = actor
+        .user_id
+        .parse()
+        .map_err(|_| HttpError::unauthorized("Invalid user ID in token"))?;
+    match crate::services::plan::PlanService::new(state.db.clone())
+        .consume_call(user_id)
+        .await
+    {
+        Ok(instance_id) => Ok(Some(instance_id)),
+        Err(crate::services::plan::PlanError::NoActivePlan) => Err(HttpError::with_status(
+            403,
+            "no_active_plan",
+            "No active plan with remaining calls — purchase or renew a plan to call the AI API",
+        )),
+        Err(e) => {
+            tracing::error!(error = ?e, user_id = %actor.user_id, "plan quota consumption failed");
+            Err(HttpError::internal("Plan quota check failed"))
+        }
+    }
+}
+
+/// Best-effort refund of a consumed plan call after a NoChannel failure.
+///
+/// A missing channel is an operator-side configuration issue — the request
+/// never reached any upstream, so the user's quota must not be burned.
+async fn refund_plan_call(state: &crate::AppState, ticket: Option<i64>) {
+    let Some(instance_id) = ticket else { return };
+    if let Err(e) = crate::services::plan::PlanService::new(state.db.clone())
+        .refund_call(instance_id)
+        .await
+    {
+        tracing::warn!(error = ?e, instance_id, "failed to refund plan call after NoChannel");
+    }
+}
+
 // ── Main handler ────────────────────────────────────────────────
 
 pub async fn ai_response(req: crate::ServerRequest) -> Result<Response, HttpError> {
@@ -60,6 +110,8 @@ async fn ai_response_inner(mut req: crate::ServerRequest) -> Result<Response, Ht
         | crate::repositories::channel::ModelCapability::Tts),
     ) = requested_capability
     {
+        // Plan quota is consumed inside handle_direct_capability, after all
+        // direct-request validation — a malformed request must not burn a call.
         return handle_direct_capability(&state, &actor, capability, body).await;
     }
 
@@ -96,6 +148,11 @@ async fn ai_response_inner(mut req: crate::ServerRequest) -> Result<Response, Ht
     let upstream_body = translate_request(&responses_req)
         .map_err(|e| HttpError::bad_request(format!("Request translation error: {}", e)))?;
 
+    // Request shape is fully validated at this point — consume one plan call
+    // before any upstream work. The direct STT path above consumes inside
+    // handle_direct_capability (after its own validation), so no double count.
+    let plan_ticket = consume_plan_quota(&state, &actor).await?;
+
     // Check streaming mode
     let is_streaming = responses_req.stream.unwrap_or(false);
 
@@ -106,6 +163,7 @@ async fn ai_response_inner(mut req: crate::ServerRequest) -> Result<Response, Ht
             primary_capability,
             &required_capabilities,
             upstream_body,
+            plan_ticket,
         )
         .await
     } else {
@@ -116,6 +174,7 @@ async fn ai_response_inner(mut req: crate::ServerRequest) -> Result<Response, Ht
             &required_capabilities,
             upstream_body,
             &responses_req,
+            plan_ticket,
         )
         .await
     }
@@ -258,7 +317,11 @@ async fn handle_direct_capability(
     validate_direct_fields(&capability, object)?;
     validate_direct_input(&capability, object)?;
 
-    let mut result = service(state)
+    // Request is fully validated — consume one plan call before proxying,
+    // mirroring the main chat path (invalid requests never burn quota).
+    let plan_ticket = consume_plan_quota(state, actor).await?;
+
+    let mut result = match service(state)
         .proxy(
             &actor.tenant_id,
             &actor.user_id,
@@ -267,7 +330,16 @@ async fn handle_direct_capability(
             body,
         )
         .await
-        .map_err(error)?;
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // NoChannel never reached an upstream — give the call back.
+            if matches!(e, crate::services::gateway::GatewayError::NoChannel) {
+                refund_plan_call(state, plan_ticket).await;
+            }
+            return Err(error(e));
+        }
+    };
     normalize_and_validate_direct_result(&capability, &mut result)?;
     Response::json(&unified_direct_response(&capability, &result))
 }
@@ -849,9 +921,10 @@ async fn handle_non_streaming(
     required_capabilities: &[crate::repositories::channel::ModelCapability],
     upstream_body: Value,
     _req: &ResponsesRequest,
+    plan_ticket: Option<i64>,
 ) -> Result<Response, HttpError> {
     // Proxy via existing non-streaming method
-    let result = service(state)
+    let result = match service(state)
         .proxy(
             &actor.tenant_id,
             &actor.user_id,
@@ -860,7 +933,16 @@ async fn handle_non_streaming(
             upstream_body,
         )
         .await
-        .map_err(error)?;
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // NoChannel never reached an upstream — give the call back.
+            if matches!(e, crate::services::gateway::GatewayError::NoChannel) {
+                refund_plan_call(state, plan_ticket).await;
+            }
+            return Err(error(e));
+        }
+    };
 
     validate_chat_result(&result)?;
 
@@ -1117,13 +1199,14 @@ async fn handle_streaming(
     capability: crate::repositories::channel::ModelCapability,
     required_capabilities: &[crate::repositories::channel::ModelCapability],
     upstream_body: Value,
+    plan_ticket: Option<i64>,
 ) -> Result<Response, HttpError> {
     // Start streaming proxy — this creates a background task that reads
     // streaming chunks from the upstream and sends them through a channel.
     // The returned channel_id identifies which channel was selected for
     // downstream token metering recording.
     let capability_name = capability.as_str().to_string();
-    let (mut upstream_rx, channel_id, selected_model, input_token_estimate) = service(state)
+    let (mut upstream_rx, channel_id, selected_model, input_token_estimate) = match service(state)
         .proxy_stream(
             &actor.tenant_id,
             &actor.user_id,
@@ -1132,7 +1215,16 @@ async fn handle_streaming(
             upstream_body,
         )
         .await
-        .map_err(error)?;
+    {
+        Ok(stream) => stream,
+        Err(e) => {
+            // NoChannel never reached an upstream — give the call back.
+            if matches!(e, crate::services::gateway::GatewayError::NoChannel) {
+                refund_plan_call(state, plan_ticket).await;
+            }
+            return Err(error(e));
+        }
+    };
 
     // Prepare metering dependencies before entering the spawned task.
     // The spawned closure cannot borrow `state` or `actor`.

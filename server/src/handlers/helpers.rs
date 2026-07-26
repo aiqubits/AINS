@@ -97,9 +97,88 @@ pub async fn require_active_tenant(state: &AppState, tenant_id: &str) -> Result<
     Ok(())
 }
 
+/// Verify that a non-system actor belongs to an active tenant.
+///
+/// Tenant-scoped resource management (plans, payment orders — mirroring the
+/// channel module) must be closed for actors of disabled tenants; `system`
+/// operates across tenants and is exempt.
+pub async fn require_actor_tenant_active(
+    state: &AppState,
+    actor: &AuthUser,
+) -> Result<(), HttpError> {
+    if actor.role != "system" {
+        require_active_tenant(state, &actor.tenant_id).await?;
+    }
+    Ok(())
+}
+
 /// Build a JSON response with status 200 OK.
 pub fn json_response<T: serde::Serialize>(value: &T) -> Result<Response, HttpError> {
     Response::json(value)
+}
+
+/// A list row carrying a `tenant_id` and an enrichable `tenant_name`.
+///
+/// Implemented by the admin-facing list response types so
+/// [`enrich_tenant_names`] can decorate them generically.
+pub trait TenantNamed {
+    fn tenant_id(&self) -> &str;
+    fn set_tenant_name(&mut self, name: Option<String>);
+}
+
+impl TenantNamed for crate::repositories::user::UserResponse {
+    fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    fn set_tenant_name(&mut self, name: Option<String>) {
+        self.tenant_name = name;
+    }
+}
+
+impl TenantNamed for crate::repositories::channel::ChannelResponse {
+    fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    fn set_tenant_name(&mut self, name: Option<String>) {
+        self.tenant_name = name;
+    }
+}
+
+impl TenantNamed for crate::repositories::plan::PlanResponse {
+    fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    fn set_tenant_name(&mut self, name: Option<String>) {
+        self.tenant_name = name;
+    }
+}
+
+impl TenantNamed for crate::repositories::payment_order::PaymentOrderResponse {
+    fn tenant_id(&self) -> &str {
+        &self.tenant_id
+    }
+    fn set_tenant_name(&mut self, name: Option<String>) {
+        self.tenant_name = name;
+    }
+}
+
+/// Best-effort enrich each row with its tenant display name so the admin UI
+/// can render names without pre-fetching the entire tenant set. A lookup
+/// failure leaves `tenant_name` as None; the client falls back to the ID.
+pub async fn enrich_tenant_names<T: TenantNamed>(state: &AppState, items: &mut [T]) {
+    let tenant_ids: Vec<String> = items
+        .iter()
+        .map(|item| item.tenant_id().to_string())
+        .collect();
+    if let Ok(names) = TenantService::new(state.db.clone())
+        .names_for(&tenant_ids)
+        .await
+    {
+        for item in items.iter_mut() {
+            let name = names.get(item.tenant_id()).cloned();
+            item.set_tenant_name(name);
+        }
+    }
 }
 
 #[cfg(test)]

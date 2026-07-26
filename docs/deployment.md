@@ -513,6 +513,15 @@ echo "k8s/secret.yml" >> .gitignore
 - **非 root 运行**：Dockerfile 使用 `USER ains`
 - **NetworkPolicy**：限制 ains 命名空间内流量
 
+### 升级注意：套餐配额门禁
+
+引入套餐（Plan）功能后，`/api/ai/response` 对 `user` 角色强制校验有效套餐
+（`admin`/`system` 豁免）。存量部署升级后，未持有套餐的存量用户调用该接口
+会收到 `403 no_active_plan`。升级前请二选一：
+
+1. 通过管理后台（或 `POST /api/users/{id}/plans`）为存量用户批量授予套餐；
+2. 在公告/发布说明中告知用户需先购买套餐后方可继续调用。
+
 ---
 
 ## 故障排查

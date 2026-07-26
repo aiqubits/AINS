@@ -3,6 +3,8 @@ pub mod auth;
 pub mod gateway;
 pub mod helpers;
 pub mod metering;
+pub mod payment_order;
+pub mod plan;
 pub mod responses;
 pub mod tenant;
 pub mod wechat;

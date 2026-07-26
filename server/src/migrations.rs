@@ -134,5 +134,19 @@ mod tests {
         assert!(migrations[0].1.contains("ai_gateway_channels"));
         assert!(migrations[0].1.contains("token_usage"));
         assert!(migrations[0].1.contains("idx_token_usage_model"));
+        assert!(migrations[0].1.contains("CREATE TABLE IF NOT EXISTS plans"));
+        assert!(
+            migrations[0]
+                .1
+                .contains("CREATE TABLE IF NOT EXISTS user_plans")
+        );
+        assert!(
+            migrations[0]
+                .1
+                .contains("CREATE TABLE IF NOT EXISTS payment_orders")
+        );
+        assert!(migrations[0].1.contains("idx_plans_tenant_status"));
+        assert!(migrations[0].1.contains("idx_user_plans_user"));
+        assert!(migrations[0].1.contains("idx_payment_orders_tenant"));
     }
 }

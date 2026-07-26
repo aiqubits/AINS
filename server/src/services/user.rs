@@ -262,7 +262,10 @@ impl UserService {
     const USER_CACHE_TTL_SECS: u64 = 300; // 5 minutes for user data
     const USER_NULL_TTL_SECS: u64 = 30; // 30 seconds for negative cache
 
-    fn user_cache_key(id: i64) -> String {
+    /// Cache key for a user profile. Shared with other services (e.g.
+    /// `PlanService::purchase`) that must invalidate the cached profile
+    /// after mutating user rows outside of `UserService`.
+    pub(crate) fn user_cache_key(id: i64) -> String {
         format!("user:{}", id)
     }
 

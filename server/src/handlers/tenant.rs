@@ -17,20 +17,31 @@ fn error(e: TenantError) -> HttpError {
             id,
             users,
             channels,
+            plans,
         } => {
-            let msg = if users > 0 && channels > 0 {
-                format!(
-                    "Tenant '{}' has {users} user(s) and {channels} channel(s). Remove them first.",
-                    id
-                )
-            } else if users > 0 {
-                format!("Tenant '{}' has {users} user(s). Remove them first.", id)
-            } else {
-                format!(
-                    "Tenant '{}' has {channels} channel(s). Remove them first.",
-                    id
-                )
+            // List only the non-zero resource kinds in the message.
+            let mut parts = Vec::new();
+            if users > 0 {
+                parts.push(format!("{users} user(s)"));
+            }
+            if channels > 0 {
+                parts.push(format!("{channels} channel(s)"));
+            }
+            if plans > 0 {
+                parts.push(format!("{plans} plan(s)"));
+            }
+            // Natural-language join: "a", "a and b", "a, b and c". The
+            // all-zero fallback covers the delete-race path where the
+            // blocking resource vanished before it could be recounted.
+            let list = match parts.len() {
+                0 => "dependent resource(s)".to_string(),
+                1 => parts.remove(0),
+                _ => {
+                    let last = parts.pop().expect("len >= 2");
+                    format!("{} and {}", parts.join(", "), last)
+                }
             };
+            let msg = format!("Tenant '{}' has {}. Remove them first.", id, list);
             HttpError::conflict(msg)
         }
         TenantError::InvalidStatus => HttpError::bad_request("status must be active or disabled"),
@@ -269,4 +280,56 @@ pub async fn move_user_tenant(mut req: crate::ServerRequest) -> Result<Response,
     tracing::info!(user_id = %user_id, from_tenant = %old_tenant_id, to_tenant = %new_tenant_id, "User moved to another tenant");
 
     Response::json(&crate::repositories::user::UserResponse::from(updated))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn not_empty_message(users: u64, channels: u64, plans: u64) -> String {
+        error(TenantError::NotEmpty {
+            id: "t1".into(),
+            users,
+            channels,
+            plans,
+        })
+        .message
+    }
+
+    #[test]
+    fn not_empty_message_lists_only_non_zero_kinds() {
+        assert_eq!(
+            not_empty_message(3, 0, 0),
+            "Tenant 't1' has 3 user(s). Remove them first."
+        );
+        assert_eq!(
+            not_empty_message(0, 2, 0),
+            "Tenant 't1' has 2 channel(s). Remove them first."
+        );
+        assert_eq!(
+            not_empty_message(0, 0, 4),
+            "Tenant 't1' has 4 plan(s). Remove them first."
+        );
+    }
+
+    #[test]
+    fn not_empty_message_joins_naturally() {
+        assert_eq!(
+            not_empty_message(3, 2, 0),
+            "Tenant 't1' has 3 user(s) and 2 channel(s). Remove them first."
+        );
+        assert_eq!(
+            not_empty_message(3, 2, 1),
+            "Tenant 't1' has 3 user(s), 2 channel(s) and 1 plan(s). Remove them first."
+        );
+    }
+
+    #[test]
+    fn not_empty_message_all_zero_fallback() {
+        // Delete-race path: the blocking resource vanished before recount.
+        assert_eq!(
+            not_empty_message(0, 0, 0),
+            "Tenant 't1' has dependent resource(s). Remove them first."
+        );
+    }
 }

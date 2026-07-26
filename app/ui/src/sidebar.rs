@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
-    Activity, ChartPie, ExternalLink, Layers, Route, Server, UserCog, Wallet, X,
+    Activity, ChartPie, CreditCard, ExternalLink, Layers, Package, Route, Server, UserCog, Wallet,
+    X,
 };
 
 use crate::I18nContext;
@@ -102,6 +103,22 @@ pub fn Sidebar(
                             active: active == NavKey::Metering,
                             onclick: move |_| on_select.call(NavKey::Metering),
                         }
+                        SidebarItem {
+                            icon: rsx! {
+                                Package {}
+                            },
+                            label: t.sidebar_plans_label.to_string(),
+                            active: active == NavKey::Plans,
+                            onclick: move |_| on_select.call(NavKey::Plans),
+                        }
+                        SidebarItem {
+                            icon: rsx! {
+                                CreditCard {}
+                            },
+                            label: t.sidebar_orders_label.to_string(),
+                            active: active == NavKey::Orders,
+                            onclick: move |_| on_select.call(NavKey::Orders),
+                        }
                     }
                 }
 
@@ -157,6 +174,8 @@ pub enum NavKey {
     Tenants,
     Channels,
     Metering,
+    Plans,
+    Orders,
 }
 
 #[component]

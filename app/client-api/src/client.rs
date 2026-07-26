@@ -583,6 +583,195 @@ impl Client {
     }
 
     // ──────────────────────────────────────────
+    //  Admin: Plan management
+    // ──────────────────────────────────────────
+
+    /// 分页列出套餐 — `GET /api/plans?page=&per_page=`（需要 admin/system 角色）
+    ///
+    /// `tenant_id` 仅对 system 生效（按租户过滤）；admin 由服务端强制
+    /// 限定在自身租户，忽略该字段。
+    pub async fn list_plans(
+        &self,
+        page: u64,
+        per_page: u64,
+        tenant_id: Option<String>,
+    ) -> Result<PlanListResponse, ClientError> {
+        if page == 0 || per_page == 0 {
+            return Err(ClientError::Config(
+                "page and per_page must be greater than 0".to_string(),
+            ));
+        }
+        let url = self.inner.config.build_url("/api/plans");
+        let mut builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        if let Some(ref tenant) = tenant_id {
+            builder = builder.query(&[("tenant_id", tenant)]);
+        }
+        self.send_and_parse(builder).await
+    }
+
+    /// 创建套餐 — `POST /api/plans`（需要 admin/system 角色）
+    pub async fn create_plan(&self, input: CreatePlanRequest) -> Result<PlanResponse, ClientError> {
+        self.post_json("/api/plans", &input, None).await
+    }
+
+    /// 更新套餐 — `PUT /api/plans/{id}`（需要 admin/system 角色）
+    pub async fn update_plan(
+        &self,
+        id: &str,
+        input: UpdatePlanRequest,
+    ) -> Result<PlanResponse, ClientError> {
+        self.put_json(&format!("/api/plans/{}", id), &input, None)
+            .await
+    }
+
+    /// 删除套餐 — `DELETE /api/plans/{id}`（需要 admin/system 角色）
+    ///
+    /// 套餐为快照式设计，删除模板不影响用户已持有的套餐实例。
+    pub async fn delete_plan(&self, id: &str) -> Result<DeleteResponse, ClientError> {
+        self.delete_json(&format!("/api/plans/{}", id), None).await
+    }
+
+    /// 查看用户的套餐实例 — `GET /api/users/{id}/plans`（需要 admin/system 角色）
+    pub async fn list_user_plans(
+        &self,
+        user_id: &str,
+    ) -> Result<UserPlanListResponse, ClientError> {
+        self.get_json(&format!("/api/users/{}/plans", user_id), None)
+            .await
+    }
+
+    /// 给用户分配套餐 — `POST /api/users/{id}/plans`（需要 admin/system 角色）
+    pub async fn assign_user_plan(
+        &self,
+        user_id: &str,
+        plan_id: impl Into<String>,
+    ) -> Result<UserPlanResponse, ClientError> {
+        let body = AssignPlanRequest {
+            plan_id: plan_id.into(),
+        };
+        self.post_json(&format!("/api/users/{}/plans", user_id), &body, None)
+            .await
+    }
+
+    // ──────────────────────────────────────────
+    //  Self-service: Plans & purchase
+    // ──────────────────────────────────────────
+
+    /// 列出本租户可购套餐 — `GET /api/plans/available`（任意已认证用户）
+    pub async fn list_available_plans(&self) -> Result<AvailablePlansResponse, ClientError> {
+        self.get_json("/api/plans/available", None).await
+    }
+
+    /// 余额购买套餐 — `POST /api/plans/{id}/purchase`（任意已认证用户）
+    ///
+    /// 余额不足时服务端以 `400 insufficient_balance` 拒绝；同一用户的
+    /// 并发重复提交会被服务端购买锁以 `409 purchase_in_progress` 拒绝。
+    ///
+    /// 注意：购买锁是按用户（而非用户+套餐）粒度的防重复提交保护，
+    /// `409` 表示“稍后重试”而非终态拒绝 —— 集成方应在短暂延迟后重试，
+    /// 而不是将其视为失败。
+    pub async fn purchase_plan(&self, id: &str) -> Result<PurchasePlanResponse, ClientError> {
+        self.post_json(
+            &format!("/api/plans/{}/purchase", id),
+            &serde_json::json!({}),
+            None,
+        )
+        .await
+    }
+
+    /// 列出自己的套餐实例 — `GET /api/users/me/plans`（任意已认证用户）
+    pub async fn list_my_plans(&self) -> Result<UserPlanListResponse, ClientError> {
+        self.get_json("/api/users/me/plans", None).await
+    }
+
+    /// 列出自己的支付记录 — `GET /api/users/me/orders`（任意已认证用户）
+    pub async fn list_my_orders(
+        &self,
+        page: u64,
+        per_page: u64,
+    ) -> Result<PaymentOrderListResponse, ClientError> {
+        if page == 0 || per_page == 0 {
+            return Err(ClientError::Config(
+                "page and per_page must be greater than 0".to_string(),
+            ));
+        }
+        let url = self.inner.config.build_url("/api/users/me/orders");
+        let builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        self.send_and_parse(builder).await
+    }
+
+    // ──────────────────────────────────────────
+    //  Admin: Payment order management
+    // ──────────────────────────────────────────
+
+    /// 分页列出支付订单 — `GET /api/orders`（需要 admin/system 角色）
+    pub async fn list_orders(
+        &self,
+        page: u64,
+        per_page: u64,
+        filter: Option<&ListOrdersFilter>,
+    ) -> Result<PaymentOrderListResponse, ClientError> {
+        if page == 0 || per_page == 0 {
+            return Err(ClientError::Config(
+                "page and per_page must be greater than 0".to_string(),
+            ));
+        }
+        let url = self.inner.config.build_url("/api/orders");
+        let mut builder = self
+            .request_with_auth(Method::GET, &url, None)?
+            .query(&[("page", page), ("per_page", per_page)]);
+        if let Some(f) = filter {
+            if let Some(ref tenant_id) = f.tenant_id {
+                builder = builder.query(&[("tenant_id", tenant_id)]);
+            }
+            if let Some(ref user_id) = f.user_id {
+                builder = builder.query(&[("user_id", user_id)]);
+            }
+            if let Some(ref status) = f.status {
+                builder = builder.query(&[("status", status)]);
+            }
+        }
+        self.send_and_parse(builder).await
+    }
+
+    /// 获取单个订单 — `GET /api/orders/{id}`（需要 admin/system 角色）
+    pub async fn get_order(&self, id: &str) -> Result<PaymentOrderResponse, ClientError> {
+        self.get_json(&format!("/api/orders/{}", id), None).await
+    }
+
+    /// 手工创建订单 — `POST /api/orders`（需要 admin/system 角色）
+    pub async fn create_order(
+        &self,
+        input: CreateOrderRequest,
+    ) -> Result<PaymentOrderResponse, ClientError> {
+        self.post_json("/api/orders", &input, None).await
+    }
+
+    /// 更新订单 — `PUT /api/orders/{id}`（需要 admin/system 角色）
+    ///
+    /// 仅为记录性操作：将状态改为 refunded/cancelled 不会回补余额或撤销套餐。
+    pub async fn update_order(
+        &self,
+        id: &str,
+        input: UpdateOrderRequest,
+    ) -> Result<PaymentOrderResponse, ClientError> {
+        self.put_json(&format!("/api/orders/{}", id), &input, None)
+            .await
+    }
+
+    /// 删除订单 — `DELETE /api/orders/{id}`（仅限 system 角色）
+    ///
+    /// 订单是资金流水的审计记录，租户 admin 仅可改状态不可删除；
+    /// 非 system 角色调用将收到 `403`。
+    pub async fn delete_order(&self, id: &str) -> Result<DeleteResponse, ClientError> {
+        self.delete_json(&format!("/api/orders/{}", id), None).await
+    }
+
+    // ──────────────────────────────────────────
     //  Internal HTTP helpers
     // ──────────────────────────────────────────
 

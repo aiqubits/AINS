@@ -128,3 +128,78 @@ CREATE INDEX IF NOT EXISTS idx_token_usage_channel
 -- A composite index on (model, created_at DESC) covers both query patterns.
 CREATE INDEX IF NOT EXISTS idx_token_usage_model
     ON token_usage(model, created_at DESC);
+
+-- Subscription plans (tenant-scoped, mirrors ai_gateway_channels isolation).
+-- price shares the balance scale: 1 display unit = 10^10 stored units.
+-- total_calls is the number of /api/ai/response calls granted per instance,
+-- validity_days determines expires_at at grant/purchase time.
+CREATE TABLE IF NOT EXISTS plans (
+    id BIGINT PRIMARY KEY,
+    tenant_id VARCHAR(255) NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
+    name VARCHAR(255) NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    price BIGINT NOT NULL CHECK (price > 0),
+    total_calls BIGINT NOT NULL CHECK (total_calls > 0),
+    validity_days INTEGER NOT NULL CHECK (validity_days > 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'disabled')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Covers tenant-scoped admin listing and the user-facing
+-- "available plans in my tenant" query (tenant_id + status = 'active').
+CREATE INDEX IF NOT EXISTS idx_plans_tenant_status
+    ON plans(tenant_id, status);
+
+-- Plan instances held by users (snapshot-style).
+-- plan_id intentionally has no FK: deleting a plan template must not
+-- invalidate instances users already purchased or were granted.
+-- An instance is "active" while expires_at > NOW() AND remaining_calls > 0;
+-- expiry is evaluated at query time, no background job required.
+CREATE TABLE IF NOT EXISTS user_plans (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    plan_id BIGINT,
+    plan_name VARCHAR(255) NOT NULL,
+    total_calls BIGINT NOT NULL CHECK (total_calls > 0),
+    remaining_calls BIGINT NOT NULL CHECK (remaining_calls >= 0),
+    expires_at TIMESTAMPTZ NOT NULL,
+    source VARCHAR(32) NOT NULL
+        CHECK (source IN ('purchase', 'admin_grant')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Covers per-user plan listing and the consume_call earliest-expiry lookup.
+CREATE INDEX IF NOT EXISTS idx_user_plans_user
+    ON user_plans(user_id, expires_at DESC);
+
+-- Payment orders (audit trail of plan purchases and manual entries).
+-- tenant_id and user_email are snapshots taken at order creation so that
+-- admin tenant-isolation filtering and UI display remain stable even if
+-- the user later moves tenant or changes email. payment_method reserves
+-- 'wechat' / 'alipay' for future external payment integration.
+CREATE TABLE IF NOT EXISTS payment_orders (
+    id BIGINT PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    tenant_id VARCHAR(255) NOT NULL,
+    user_email VARCHAR(255) NOT NULL,
+    plan_id BIGINT,
+    plan_name VARCHAR(255) NOT NULL DEFAULT '',
+    amount BIGINT NOT NULL CHECK (amount >= 0),
+    status VARCHAR(32) NOT NULL DEFAULT 'paid'
+        CHECK (status IN ('paid', 'pending', 'refunded', 'cancelled')),
+    payment_method VARCHAR(32) NOT NULL DEFAULT 'balance'
+        CHECK (payment_method IN ('balance', 'wechat', 'alipay')),
+    external_txn_id VARCHAR(255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paid_at TIMESTAMPTZ
+);
+
+-- Index for admin tenant-scoped order listing.
+CREATE INDEX IF NOT EXISTS idx_payment_orders_tenant
+    ON payment_orders(tenant_id, created_at DESC);
+
+-- Index for per-user order queries (/users/me/orders).
+CREATE INDEX IF NOT EXISTS idx_payment_orders_user
+    ON payment_orders(user_id, created_at DESC);

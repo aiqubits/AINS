@@ -5,6 +5,8 @@ pub mod gateway;
 pub mod lock;
 pub mod metering;
 pub mod password_reset;
+pub mod payment_order;
+pub mod plan;
 pub mod quota;
 pub mod responses;
 pub mod tenant;
@@ -22,6 +24,8 @@ pub use lock::{
 };
 pub use metering::{ListUsageParams, MeteringService, UsageStatsResponse};
 pub use password_reset::{PasswordResetError, PasswordResetOutcome, PasswordResetService};
+pub use payment_order::{PaymentOrderError, PaymentOrderService};
+pub use plan::{PlanError, PlanService};
 pub use quota::QuotaService;
 pub use user::{UserError, UserService};
 pub use verification::{VerificationError, VerificationService};

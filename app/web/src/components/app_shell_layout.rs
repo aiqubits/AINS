@@ -37,9 +37,11 @@ pub fn AppShellLayout() -> Element {
         Route::Tenants {} => NavKey::Tenants,
         Route::Channels {} => NavKey::Channels,
         Route::Metering {} => NavKey::Metering,
+        Route::Plans {} => NavKey::Plans,
+        Route::Orders {} => NavKey::Orders,
         // Settings 在本布局内但没有专用 NavKey，沿用个人中心高亮。
         Route::Settings {} => NavKey::PersonalCenter,
-        // 通配臂——此布局仅包裹 PersonalCenter / Dashboard / Settings / Users / Tenants / Channels / Metering（见 main.rs 路由定义），
+        // 通配臂——此布局仅包裹 PersonalCenter / Dashboard / Settings / Users / Tenants / Channels / Metering / Plans / Orders（见 main.rs 路由定义），
         // 其他 Route 变体不应到达本布局。若未来新增路由加入此布局，
         // 编译器不会警告，需手动在此处补充分支。
         _ => NavKey::PersonalCenter,
@@ -77,6 +79,8 @@ pub fn AppShellLayout() -> Element {
                             NavKey::Tenants => Route::Tenants {},
                             NavKey::Channels => Route::Channels {},
                             NavKey::Metering => Route::Metering {},
+                            NavKey::Plans => Route::Plans {},
+                            NavKey::Orders => Route::Orders {},
                         };
                         sidebar_open.set(false);
                         nav.push(target);

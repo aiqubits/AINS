@@ -293,7 +293,7 @@ pub async fn register_isolated_tenant_user(app: &Router, label: &str) -> String 
     let tenant_id = body["id"].as_str().expect("tenant id").to_string();
 
     let email = common::unique_email(label);
-    let (status, _) = auth_json_post(
+    let (status, user_body) = auth_json_post(
         app,
         "/api/users",
         &sys_token,
@@ -310,6 +310,40 @@ pub async fn register_isolated_tenant_user(app: &Router, label: &str) -> String 
         StatusCode::OK,
         "isolated tenant user creation should succeed"
     );
+    let user_id = user_body["id"].as_str().expect("user id").to_string();
+
+    // The plan-quota gate on /api/ai/response requires `user`-role callers to
+    // hold an active plan instance. Grant a generous plan so these tests keep
+    // exercising the channel-selection path (503 NoChannel) instead of being
+    // rejected with 403 no_active_plan.
+    let (status, plan_body) = auth_json_post(
+        app,
+        "/api/plans",
+        &sys_token,
+        &serde_json::json!({
+            "tenant_id": tenant_id,
+            "name": "Isolated Test Plan",
+            "price": 10_000_000_000i64,
+            "total_calls": 1_000_000,
+            "validity_days": 365,
+        }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "isolated tenant plan creation should succeed"
+    );
+    let plan_id = plan_body["id"].as_str().expect("plan id").to_string();
+
+    let (status, _) = auth_json_post(
+        app,
+        &format!("/api/users/{}/plans", user_id),
+        &sys_token,
+        &serde_json::json!({ "plan_id": plan_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "plan grant should succeed");
 
     login(app, &email).await
 }

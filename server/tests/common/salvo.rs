@@ -228,6 +228,49 @@ pub async fn register_and_login(server: &TestServer, email: &str) -> String {
     body["token"].as_str().unwrap().to_string()
 }
 
+/// Create a system-role user in the database and return the JWT token.
+/// Mirrors `common::axum::create_system_and_login`.
+pub async fn create_system_and_login(server: &TestServer, email: &str) -> String {
+    use ains_runtime::auth::JwtClaims;
+    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+    let token = register_and_login(server, email).await;
+    let secret = common::load_test_config().jwt_secret;
+
+    let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.set_issuer(&["ains-server"]);
+    validation.set_audience(&["ains"]);
+    let token_data = jsonwebtoken::decode::<JwtClaims>(
+        &token,
+        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &validation,
+    )
+    .expect("Failed to decode token");
+    let user_id: i64 = token_data.claims.sub.parse().expect("Invalid user ID");
+
+    let config = common::load_test_config();
+    let db = sea_orm::Database::connect(&config.database_url)
+        .await
+        .expect("Failed to connect to database");
+    db.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "UPDATE users SET role = $1, token_version = token_version + 1, updated_at = NOW() WHERE id = $2",
+        ["system".into(), user_id.into()],
+    ))
+    .await
+    .expect("Failed to update user to system");
+
+    // Re-login to get a new token with the updated role
+    let login_payload = serde_json::json!({
+        "email": email,
+        "password": DEFAULT_TEST_PASSWORD
+    });
+    let (status, body) = post_json(server, "/api/public/auth/login", &login_payload).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    body["token"].as_str().unwrap().to_string()
+}
+
 /// Create a test AppState for service-level tests (no HTTP server needed).
 pub async fn create_test_state() -> ains_server::AppState {
     let db = crate::common::create_test_db_and_run_migrations().await;

@@ -1,9 +1,12 @@
 pub mod channel;
+pub mod payment_order;
+pub mod plan;
 pub mod refresh_token;
 pub mod snowflake_worker;
 pub mod tenant;
 pub mod token_usage;
 pub mod user;
+pub mod user_plan;
 
 pub use refresh_token::{
     ActiveModel as RefreshTokenActiveModel, Column as RefreshTokenColumn,

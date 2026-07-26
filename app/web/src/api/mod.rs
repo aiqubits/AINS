@@ -36,6 +36,10 @@ pub enum ErrorContext {
     ChannelManagement,
     /// 用量统计页面
     Metering,
+    /// 套餐管理页面（含个人中心购买场景的 no_active_plan / insufficient_balance）
+    PlanManagement,
+    /// 支付订单页面
+    OrderManagement,
 }
 
 /// 将 `ClientError` 翻译为当前语言提示，根据 `ctx` 差异化状态码文案。
@@ -109,6 +113,28 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (403, _) => "Insufficient permissions (admin required)".to_string(),
                         _ => format!("Request failed (HTTP {status}): {msg}"),
                     },
+                    ErrorContext::PlanManagement => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (_, "no_active_plan") => "No active plan with remaining calls".to_string(),
+                        (_, "insufficient_balance") => {
+                            "Insufficient balance to purchase this plan".to_string()
+                        }
+                        (_, "purchase_in_progress") => {
+                            "A purchase is already in progress, please try again shortly"
+                                .to_string()
+                        }
+                        (403, _) => "Insufficient permissions (admin required)".to_string(),
+                        (404, _) => "Plan or user not found".to_string(),
+                        (_, "validation_error") => format!("Validation error: {msg}"),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::OrderManagement => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (403, _) => "Insufficient permissions (admin required)".to_string(),
+                        (404, _) => "Order not found".to_string(),
+                        (_, "validation_error") => format!("Validation error: {msg}"),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
                 },
                 Language::Zh => match ctx {
                     ErrorContext::Auth => match (status, code.as_str()) {
@@ -154,6 +180,25 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                     ErrorContext::Metering => match (status, code.as_str()) {
                         (401, _) => "未登录或会话已过期".to_string(),
                         (403, _) => "权限不足 (需 admin)".to_string(),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::PlanManagement => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (_, "no_active_plan") => "没有可用套餐或套餐次数已用尽".to_string(),
+                        (_, "insufficient_balance") => "余额不足，无法购买该套餐".to_string(),
+                        (_, "purchase_in_progress") => {
+                            "已有一笔购买正在处理中，请稍后再试".to_string()
+                        }
+                        (403, _) => "权限不足 (需 admin)".to_string(),
+                        (404, _) => "套餐或用户不存在".to_string(),
+                        (_, "validation_error") => format!("参数错误: {msg}"),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    ErrorContext::OrderManagement => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (403, _) => "权限不足 (需 admin)".to_string(),
+                        (404, _) => "订单不存在".to_string(),
+                        (_, "validation_error") => format!("参数错误: {msg}"),
                         _ => format!("请求失败 (HTTP {status}): {msg}"),
                     },
                 },
@@ -390,6 +435,23 @@ mod tests {
         let err = ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into());
         let msg = humanize_error(&err, ErrorContext::UserManagement, Language::En);
         assert_eq!(msg, "Amount exceeds current balance");
+    }
+
+    #[test]
+    fn humanize_plan_purchase_in_progress_zh() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_in_progress"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PlanManagement, Language::Zh);
+        assert_eq!(msg, "已有一笔购买正在处理中，请稍后再试");
+    }
+
+    #[test]
+    fn humanize_plan_purchase_in_progress_en() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_in_progress"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PlanManagement, Language::En);
+        assert_eq!(
+            msg,
+            "A purchase is already in progress, please try again shortly"
+        );
     }
 
     #[test]

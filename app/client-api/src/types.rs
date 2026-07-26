@@ -515,3 +515,195 @@ pub struct ListUsageFilter {
 
 /// Query parameters for usage stats (alias of `ListUsageFilter` — identical fields).
 pub type UsageStatsFilter = ListUsageFilter;
+
+// ──────────────────────────────────────────────
+//  Plan types
+// ──────────────────────────────────────────────
+
+/// Plan response (mirrors server's `PlanResponse`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct PlanResponse {
+    pub id: String,
+    pub tenant_id: String,
+    /// Tenant display name resolved server-side (best-effort; may be absent).
+    #[serde(default)]
+    pub tenant_name: Option<String>,
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Price in stored units (1 display unit = 10^10 stored units)
+    pub price: i64,
+    pub total_calls: i64,
+    pub validity_days: i32,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// Plan list response (paginated)
+#[derive(Debug, Deserialize)]
+pub struct PlanListResponse {
+    pub items: Vec<PlanResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Available plans response (user-facing, active plans of own tenant)
+#[derive(Debug, Deserialize)]
+pub struct AvailablePlansResponse {
+    pub items: Vec<PlanResponse>,
+}
+
+/// Create plan request body
+#[derive(Debug, Serialize)]
+pub struct CreatePlanRequest {
+    /// Only required when actor is system (to pick the owning tenant)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub price: i64,
+    pub total_calls: i64,
+    pub validity_days: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// Update plan request body (all fields optional)
+#[derive(Debug, Default, Serialize)]
+pub struct UpdatePlanRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub price: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_calls: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validity_days: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+/// User plan instance response (mirrors server's `UserPlanResponse`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserPlanResponse {
+    pub id: String,
+    pub user_id: String,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    pub plan_name: String,
+    pub total_calls: i64,
+    pub remaining_calls: i64,
+    pub expires_at: DateTime<Utc>,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    /// Derived state: "active" | "expired" | "exhausted".
+    pub status: String,
+}
+
+/// User plan list response ({ items })
+#[derive(Debug, Deserialize)]
+pub struct UserPlanListResponse {
+    pub items: Vec<UserPlanResponse>,
+}
+
+/// Assign plan request body (admin grants a plan to a user)
+#[derive(Debug, Serialize)]
+pub struct AssignPlanRequest {
+    pub plan_id: String,
+}
+
+/// Purchase plan response
+#[derive(Debug, Deserialize)]
+pub struct PurchasePlanResponse {
+    pub order: PaymentOrderResponse,
+    pub user_plan: UserPlanResponse,
+    /// Remaining balance after deduction (stored units).
+    pub balance: i64,
+    pub display_balance: f64,
+    pub message: String,
+}
+
+// ──────────────────────────────────────────────
+//  Payment order types
+// ──────────────────────────────────────────────
+
+/// Payment order response (mirrors server's `PaymentOrderResponse`)
+#[derive(Debug, Clone, Deserialize)]
+pub struct PaymentOrderResponse {
+    pub id: String,
+    pub user_id: String,
+    pub tenant_id: String,
+    /// Tenant display name resolved server-side (best-effort; may be absent).
+    #[serde(default)]
+    pub tenant_name: Option<String>,
+    pub user_email: String,
+    #[serde(default)]
+    pub plan_id: Option<String>,
+    #[serde(default)]
+    pub plan_name: String,
+    /// Amount in stored units (1 display unit = 10^10 stored units)
+    pub amount: i64,
+    pub status: String,
+    pub payment_method: String,
+    #[serde(default)]
+    pub external_txn_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    #[serde(default)]
+    pub paid_at: Option<DateTime<Utc>>,
+}
+
+/// Payment order list response (paginated)
+#[derive(Debug, Deserialize)]
+pub struct PaymentOrderListResponse {
+    pub items: Vec<PaymentOrderResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub per_page: u64,
+    pub total_pages: u64,
+}
+
+/// Create payment order request body (admin manual entry)
+#[derive(Debug, Serialize)]
+pub struct CreateOrderRequest {
+    pub user_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_id: Option<String>,
+    /// Amount in stored units (1 display unit = 10^10 stored units)
+    pub amount: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_txn_id: Option<String>,
+}
+
+/// Update payment order request body (all fields optional)
+#[derive(Debug, Default, Serialize)]
+pub struct UpdateOrderRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payment_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_txn_id: Option<String>,
+}
+
+/// Filters for the admin order listing (used as query string)
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct ListOrdersFilter {
+    /// system-only tenant filter; ignored for admin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
+    /// Snowflake user ID as string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}

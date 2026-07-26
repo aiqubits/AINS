@@ -94,17 +94,8 @@ pub async fn list_users(req: crate::ServerRequest) -> Result<Response, HttpError
         .map_err(to_http)?;
 
     // Best-effort enrich each row with its tenant display name so the admin UI
-    // can render names without pre-fetching the entire tenant set. A lookup
-    // failure leaves `tenant_name` as None; the client falls back to the ID.
-    let tenant_ids: Vec<String> = result.items.iter().map(|u| u.tenant_id.clone()).collect();
-    if let Ok(names) = crate::services::tenant::TenantService::new(state.db.clone())
-        .names_for(&tenant_ids)
-        .await
-    {
-        for item in result.items.iter_mut() {
-            item.tenant_name = names.get(&item.tenant_id).cloned();
-        }
-    }
+    // can render names without pre-fetching the entire tenant set.
+    crate::handlers::helpers::enrich_tenant_names(&state, &mut result.items).await;
 
     Response::json(&PaginatedUsersResponse::from(result))
 }

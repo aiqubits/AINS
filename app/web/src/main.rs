@@ -5,8 +5,8 @@ use components::{AppShellLayout, LogBus, RequireAuth};
 use i18n::Language;
 use ui::I18nContext;
 use views::{
-    Auth, Channels, Dashboard, ForgotPassword, LoginLanding, Metering, NotFound, PersonalCenter,
-    ResetPassword, Settings, Tenants, Users, VerifyEmail,
+    Auth, Channels, Dashboard, ForgotPassword, LoginLanding, Metering, NotFound, Orders,
+    PersonalCenter, Plans, ResetPassword, Settings, Tenants, Users, VerifyEmail,
 };
 
 mod api;
@@ -48,6 +48,10 @@ enum Route {
                 Channels {},
                 #[route("/metering")]
                 Metering {},
+                #[route("/plans")]
+                Plans {},
+                #[route("/orders")]
+                Orders {},
             #[end_layout]
         #[end_layout]
     #[end_layout]
