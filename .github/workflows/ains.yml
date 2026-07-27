@@ -243,3 +243,29 @@ jobs:
       run: cargo build --package client-api --verbose
     - name: Run Client API Tests
       run: cargo test --package client-api --verbose
+
+  # ========================================
+  # Agent Core CI (wasm32 + native dual target)
+  # ========================================
+  agent-core:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "agent-core"
+    - name: Format Check
+      run: cargo fmt --check --package agent-core
+    - name: Lint (Clippy, native)
+      run: cargo clippy --package agent-core --all-targets -- -D warnings
+    - name: Build & Test (native)
+      run: cargo test --package agent-core --verbose
+    - name: Install wasm32 target
+      run: rustup target add wasm32-unknown-unknown
+    - name: Lint (Clippy, wasm32)
+      run: cargo clippy --package agent-core --target wasm32-unknown-unknown --all-targets -- -D warnings
+    - name: Install wasm-pack
+      uses: taiki-e/install-action@wasm-pack
+    # IndexedDB 等浏览器环境测试仅在 CI 执行（AINS_PLAN Phase 0.5）
+    - name: Run wasm tests (headless Chrome)
+      run: wasm-pack test --headless --chrome crates/agent-core

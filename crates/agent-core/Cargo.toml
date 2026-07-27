@@ -1,0 +1,46 @@
+[package]
+name = "agent-core"
+description = "AINS Agent Runtime Core: WASM/Native dual-target embedded agent runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml = "0.9"
+async-trait.workspace = true
+thiserror.workspace = true
+futures.workspace = true
+
+# ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
+# redb / hnsw_rs 等存储实现依赖在 Phase 2 引入（Phase 0 仅定义 trait，偏差记录于
+# docs/alignment/phase0-core-traits.md）
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# 供 runtime_native.rs（TokioRuntimeAdapter）使用
+tokio.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# 供 runtime_web.rs（WasmRuntimeAdapter）与 IndexedDB 可行性验证使用
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+web-sys = { version = "0.3", features = [
+    "Window",
+    "Event",
+    "DomException",
+    "IdbFactory",
+    "IdbOpenDbRequest",
+    "IdbDatabase",
+    "IdbObjectStore",
+    "IdbTransaction",
+    "IdbTransactionMode",
+    "IdbRequest",
+] }
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

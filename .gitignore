@@ -27,7 +27,7 @@ app/*/dist/
 
 # Node (if used by frontend tooling)
 node_modules/
-
+OpenHarness/
 AINS_PLAN.md
 AINS_CLIENT_PLAN.md
 AINS_SERVER_PLAN.md

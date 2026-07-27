@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "app/ui", "app/web", "app/desktop", "app/mobile", "app/client-api", "crates/emailserver", "crates/distributed-ratelimit", "crates/ains-runtime", "crates/ains-axum", "crates/ains-salvo", "crates/i18n", "crates/wechat-api"]
+members = ["server", "app/ui", "app/web", "app/desktop", "app/mobile", "app/client-api", "crates/agent-core", "crates/emailserver", "crates/distributed-ratelimit", "crates/ains-runtime", "crates/ains-axum", "crates/ains-salvo", "crates/i18n", "crates/wechat-api"]
 # resolver = "3" is required for Rust edition 2024
 # Minimum Rust version: 1.92+
 resolver = "3"
@@ -41,6 +41,7 @@ ui = { path = "app/ui" }
 client-api = { path = "app/client-api" }
 
 # Shared crates
+agent-core = { path = "crates/agent-core" }
 emailserver = { path = "crates/emailserver" }
 distributed-ratelimit = { path = "crates/distributed-ratelimit" }
 
