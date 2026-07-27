@@ -615,7 +615,11 @@ mod tests {
         // 防漂移守卫：三个购买专属错误码在 PlanManagement 与
         // PersonalCenter 两语境下必须产生完全一致的文案（共享
         // purchase_code_message），不随状态码变化（401 除外）。
-        for code in ["no_active_plan", "insufficient_balance", "purchase_in_progress"] {
+        for code in [
+            "no_active_plan",
+            "insufficient_balance",
+            "purchase_in_progress",
+        ] {
             for status in [400u16, 403, 409] {
                 let err = ClientError::Other(status, format!(r#"{{"error":"{code}"}}"#));
                 for lang in [Language::Zh, Language::En] {

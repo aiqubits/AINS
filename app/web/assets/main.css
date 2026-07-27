@@ -148,12 +148,16 @@ input, textarea, select {
   -webkit-overflow-scrolling: touch;
 }
 
-/* 表格嵌入包装器时：恢复 overflow:hidden 以裁切圆角，由 wrapper 提供滚动 */
+/* 表格嵌入包装器时：恢复 overflow:hidden 以裁切圆角，由 wrapper 提供滚动。
+   width:max-content 让容器随表格内容撑开（min-width:100% 保证窄表铺满），
+   超出部分由 wrapper 横向滚动/左划查看，避免 overflow:hidden 把右侧
+   「操作」列裁掉且无法滚动触达。 */
 .ains-users__table-wrapper .ains-table {
   overflow: hidden;
   border-bottom-left-radius: 0;
   border-bottom-right-radius: 0;
-  min-width: 42rem;
+  width: max-content;
+  min-width: 100%;
 }
 
 /* 用户名单元格 —— 悬停显示 Snowflake ID tooltip */
@@ -208,7 +212,9 @@ input, textarea, select {
   border-top: none;
   border-radius: 0 0 var(--radius-3xl) var(--radius-3xl);
   font-family: var(--font-family);
-  min-width: 42rem;
+  /* 表格横向滚动时分页条黏在可视区左侧，始终完整可见不随内容移出视口 */
+  position: sticky;
+  left: 0;
   font-size: 12px;
   color: var(--color-text-muted);
 }
@@ -436,6 +442,16 @@ input, textarea, select {
   background: rgba(99, 102, 241, 0.1);
   color: var(--color-brand-indigo-light);
   font-weight: 600;
+}
+
+/* 向下展开变体：字段位于 Modal 顶部时使用（如套餐的「所属租户」），
+   避免 drop-up 弹层越出模态框顶部被 overflow 裁切；阴影改为朝下 */
+.ains-select--down .ains-select__panel {
+  top: calc(100% + 6px);
+  bottom: auto;
+  box-shadow:
+    0 12px 24px -8px rgba(15, 23, 42, 0.18),
+    0 4px 8px -4px rgba(15, 23, 42, 0.08);
 }
 
 /* ─── 表单堆叠（Modal 内） ────────────────────── */

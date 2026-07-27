@@ -11,9 +11,7 @@ use chrono::{DateTime, Utc};
 use client_api::{TenantResponse, UserResponse};
 use dioxus::prelude::dioxus_router::Navigator;
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{
-    ChevronDown, LoaderCircle, Pencil, Plus, ShieldHalf, Trash2, TriangleAlert,
-};
+use dioxus_icons::lucide::{LoaderCircle, Pencil, Plus, ShieldHalf, Trash2, TriangleAlert};
 
 use ui::{
     Align, Badge, BadgeVariant, Button, ButtonType, Column, DataTable, I18nContext, InputType,
@@ -27,6 +25,8 @@ use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
 use ui::Language;
+
+use super::tenant_select::{TenantSelectView, load_tenant_page, render_tenant_select};
 
 /// DOM id of the tenant dropdown scroll panel — used by the infinite-scroll
 /// handler to read the panel's scroll position via `element_near_bottom`.
@@ -110,7 +110,7 @@ pub fn Users() -> Element {
         form_balance: use_signal(String::new),
         form_tenant_id: use_signal(String::new),
         tenant_dropdown_open: use_signal(|| false),
-        tenant_next_page: use_signal(|| 2u64),
+        tenant_next_page: use_signal(|| 1u64),
         tenant_has_more: use_signal(|| false),
         tenant_loading: use_signal(|| false),
         submitting: use_signal(|| false),
@@ -137,34 +137,24 @@ pub fn Users() -> Element {
         });
     }
 
-    // 租户列表拉取：独立于分页 effect，挂载后仅执行一次。
-    // 用途：system 创建用户时的「所属租户」下拉选择。错误显式上报，
-    // 避免静默吞掉导致下拉为空。
+    // 租户列表拉取：独立于分页 effect，挂载后仅执行一次（load_tenant_page
+    // 内部全部 peek()，不会为本 effect 增加订阅）。用途：system 创建用户时
+    // 的「所属租户」下拉 + 列表租户列的 ID→名称映射。错误显式上报，
+    // 避免静默吞掉导致下拉为空；失败后展开下拉时会自动重试首页。
     {
         let client = auth.client.clone();
-        let bus = log_bus;
         let auth_for_tenants = auth.clone();
-        let mut at_inner = available_tenants;
-        let mut has_more = signals.tenant_has_more;
-        let mut next_page = signals.tenant_next_page;
         use_effect(move || {
-            let client = client.clone();
-            let auth_inner = auth_for_tenants.clone();
-            spawn(async move {
-                match client.list_tenants(1, 100).await {
-                    Ok(data) => {
-                        has_more.set(data.page < data.total_pages);
-                        next_page.set(2);
-                        at_inner.set(data.items);
-                    }
-                    Err(err) => {
-                        if crate::api::handle_unauth(&err, auth_inner, nav, bus).await {
-                            return;
-                        }
-                        push_log_err(bus, HttpMethod::Get, "/api/tenants", &err);
-                    }
-                }
-            });
+            load_tenant_page(
+                client.clone(),
+                auth_for_tenants.clone(),
+                nav,
+                log_bus,
+                available_tenants,
+                signals.tenant_next_page,
+                signals.tenant_has_more,
+                signals.tenant_loading,
+            );
         });
     }
 
@@ -610,16 +600,6 @@ fn close_all(mut signals: UsersSignals) {
     signals.tenant_dropdown_open.set(false);
     signals.submitting.set(false);
     signals.form_error.set(None);
-}
-
-/// 截断租户 ID 仅展示前 8 位（超过 8 位附省略号），用于下拉选项与触发器。
-fn short_tenant_id(id: &str) -> String {
-    if id.chars().count() > 8 {
-        let head: String = id.chars().take(8).collect();
-        format!("{head}...")
-    } else {
-        id.to_string()
-    }
 }
 
 /// Create a balance adjustment handler closure.
@@ -1159,64 +1139,8 @@ fn render_form_modal(
         lang: current_lang,
     });
 
-    // 自定义租户下拉（仅 Create + system）：展开态与当前选中项标题。
-    let tenants_snapshot = available_tenants.cloned();
-    let active_tenants: Vec<&TenantResponse> = tenants_snapshot
-        .iter()
-        .filter(|t| t.status == "active")
-        .collect();
-    let tenant_dropdown_open = *signals.tenant_dropdown_open.read();
-    let selected_tenant_id = signals.form_tenant_id.read().clone();
-    let selected_tenant_label = tenants_snapshot
-        .iter()
-        .find(|t| t.id == selected_tenant_id)
-        .map(|t| format!("{} ({})", t.name, short_tenant_id(&t.id)))
-        .unwrap_or_else(|| {
-            if selected_tenant_id.is_empty() {
-                "—".to_string()
-            } else {
-                short_tenant_id(&selected_tenant_id)
-            }
-        });
-
-    // 租户下拉的「无限滚动」加载：每次滚到接近底部时拉取下一页（100 条），
-    // 直到 has_more 为 false。loading 标志防止并发重复拉取。
-    let mut load_more_tenants = {
-        let client = client.clone();
-        let auth_for_more = auth.clone();
-        let bus = log_bus;
-        let mut at = available_tenants;
-        let mut next_page = signals.tenant_next_page;
-        let mut has_more = signals.tenant_has_more;
-        let mut loading = signals.tenant_loading;
-        move || {
-            if *loading.read() || !*has_more.read() {
-                return;
-            }
-            let page = *next_page.read();
-            loading.set(true);
-            let client = client.clone();
-            let auth_inner = auth_for_more.clone();
-            spawn(async move {
-                match client.list_tenants(page, 100).await {
-                    Ok(data) => {
-                        let more = data.page < data.total_pages;
-                        at.with_mut(|v| v.extend(data.items));
-                        next_page.set(page + 1);
-                        has_more.set(more);
-                        loading.set(false);
-                    }
-                    Err(err) => {
-                        if crate::api::handle_unauth(&err, auth_inner, nav, bus).await {
-                            return;
-                        }
-                        push_log_err(bus, HttpMethod::Get, "/api/tenants", &err);
-                        loading.set(false);
-                    }
-                }
-            });
-        }
-    };
+    // 自定义租户下拉已抽取为共享组件（views::tenant_select），
+    // 与套餐管理共用同一实现，避免两处副本在维护中漂移。
 
     rsx! {
         Modal {
@@ -1305,61 +1229,27 @@ fn render_form_modal(
                         }
                     }
                 }
-                // 仅 system 角色可选择/变更所属租户（创建与编辑均可）——自绘下拉，
+                // 仅 system 角色可选择/变更所属租户（创建与编辑均可）——共享自绘下拉，
                 // 触发器与弹层均与 Modal 内其它字段对齐；选项仅展示租户 ID 前 8 位。
                 if actor_is_system {
-                    div { class: "ains-input",
-                        label { class: "ains-input__label", "{tenant_id_label}" }
-                        div {
-                            class: if tenant_dropdown_open { "ains-select ains-select--open" } else { "ains-select" },
-                            // 阻止下拉内部（触发器/弹层/选项）的点击冒泡到外层关闭逻辑，
-                            // 确保点击触发器/选项本身不会触发“点击空白处关闭”。
-                            onclick: move |e: MouseEvent| e.stop_propagation(),
-                            button {
-                                r#type: "button",
-                                class: "ains-select__trigger",
-                                disabled: submitting,
-                                onclick: move |_: MouseEvent| {
-                                    let mut open_sig = signals.tenant_dropdown_open;
-                                    let cur = *open_sig.read();
-                                    open_sig.set(!cur);
-                                },
-                                span { class: "ains-select__value", "{selected_tenant_label}" }
-                                ChevronDown { class: "ains-select__chevron" }
-                            }
-                            if tenant_dropdown_open {
-                                div {
-                                    class: "ains-select__panel",
-                                    id: "{TENANT_PANEL_ID}",
-                                    onscroll: move |_| {
-                                        if super::element_near_bottom(TENANT_PANEL_ID) {
-                                            load_more_tenants();
-                                        }
-                                    },
-                                    for tenant in &active_tenants {
-                                        {
-                                            let tid = tenant.id.clone();
-                                            let is_sel = tenant.id == selected_tenant_id;
-                                            let opt_label =
-                                                format!("{} ({})", tenant.name, short_tenant_id(&tenant.id));
-                                            let mut tid_sig = signals.form_tenant_id;
-                                            let mut open_sig = signals.tenant_dropdown_open;
-                                            rsx! {
-                                                button {
-                                                    r#type: "button",
-                                                    class: if is_sel { "ains-select__option ains-select__option--active" } else { "ains-select__option" },
-                                                    onclick: move |_: MouseEvent| {
-                                                        tid_sig.set(tid.clone());
-                                                        open_sig.set(false);
-                                                    },
-                                                    "{opt_label}"
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    {
+                        render_tenant_select(TenantSelectView {
+                            label: tenant_id_label.clone(),
+                            panel_id: TENANT_PANEL_ID,
+                            disabled: submitting,
+                            drop_down: false,
+                            empty_placeholder: "—".to_string(),
+                            available_tenants,
+                            selected_id: signals.form_tenant_id,
+                            open: signals.tenant_dropdown_open,
+                            next_page: signals.tenant_next_page,
+                            has_more: signals.tenant_has_more,
+                            loading: signals.tenant_loading,
+                            client: client.clone(),
+                            auth: auth.clone(),
+                            nav,
+                            log_bus,
+                        })
                     }
                 }
                 Button {

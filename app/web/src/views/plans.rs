@@ -25,6 +25,12 @@ use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
 
+use super::tenant_select::{TenantSelectView, load_tenant_page, render_tenant_select};
+
+/// DOM id of the tenant dropdown scroll panel — used by the infinite-scroll
+/// handler to read the panel's scroll position via `element_near_bottom`.
+const TENANT_PANEL_ID: &str = "plan-tenant-dropdown-panel";
+
 #[derive(Debug, Clone)]
 enum ListState {
     Loading,
@@ -46,6 +52,12 @@ struct PlansSignals {
     editing_plan: Signal<Option<PlanResponse>>,
     deleting_plan: Signal<Option<PlanResponse>>,
     form_tenant_id: Signal<String>,
+    /// 自定义租户下拉是否展开（与用户管理对齐：原生 select 弹层无法与 Modal 风格对齐，故自绘）。
+    tenant_dropdown_open: Signal<bool>,
+    /// 租户下拉「无限滚动」分页状态：下一页页码、是否还有更多、是否正在加载。
+    tenant_next_page: Signal<u64>,
+    tenant_has_more: Signal<bool>,
+    tenant_loading: Signal<bool>,
     form_name: Signal<String>,
     form_desc: Signal<String>,
     form_price: Signal<String>,
@@ -90,6 +102,10 @@ pub fn Plans() -> Element {
         editing_plan: use_signal(|| Option::<PlanResponse>::None),
         deleting_plan: use_signal(|| Option::<PlanResponse>::None),
         form_tenant_id: use_signal(String::new),
+        tenant_dropdown_open: use_signal(|| false),
+        tenant_next_page: use_signal(|| 1u64),
+        tenant_has_more: use_signal(|| false),
+        tenant_loading: use_signal(|| false),
         form_name: use_signal(String::new),
         form_desc: use_signal(String::new),
         form_price: use_signal(String::new),
@@ -122,22 +138,27 @@ pub fn Plans() -> Element {
         });
     }
 
-    // system 角色预取租户列表供创建套餐时选择归属租户。
-    // 单页 100 条足以覆盖常见租户规模；拉取失败静默忽略（下拉为空时
-    // 提交会被 plans_tenant_required 校验拦截）。
+    // system 角色预取租户列表供创建套餐时选择归属租户（与用户管理共用
+    // load_tenant_page，内部全部 peek() 不会为本 effect 增加订阅）：
+    // 首页 100 条 + 下拉「无限滚动」补页。错误显式上报，避免静默吞掉
+    // 导致下拉为空；失败后展开下拉时会自动重试首页。
     {
         let client = auth.client.clone();
-        let mut tenants_sig = available_tenants;
+        let auth_for_tenants = auth.clone();
         use_effect(move || {
             if !actor_is_system {
                 return;
             }
-            let client = client.clone();
-            spawn(async move {
-                if let Ok(page_data) = client.list_tenants(1, 100).await {
-                    tenants_sig.set(page_data.items);
-                }
-            });
+            load_tenant_page(
+                client.clone(),
+                auth_for_tenants.clone(),
+                nav,
+                log_bus,
+                available_tenants,
+                signals.tenant_next_page,
+                signals.tenant_has_more,
+                signals.tenant_loading,
+            );
         });
     }
 
@@ -201,7 +222,6 @@ pub fn Plans() -> Element {
     let submitting_snapshot = *signals.submitting.read();
     let editing_snapshot = signals.editing_plan.read().clone();
     let deleting_snapshot = signals.deleting_plan.read().clone();
-    let tenants_snapshot = available_tenants.cloned();
 
     let page_val = page();
     let per_page_val = per_page();
@@ -211,6 +231,7 @@ pub fn Plans() -> Element {
     let mut signals_for_open = signals;
     let open_create = move |_: MouseEvent| {
         signals_for_open.form_tenant_id.set(String::new());
+        signals_for_open.tenant_dropdown_open.set(false);
         signals_for_open.form_name.set(String::new());
         signals_for_open.form_desc.set(String::new());
         signals_for_open.form_price.set(String::new());
@@ -265,7 +286,7 @@ pub fn Plans() -> Element {
                     deleting_snapshot,
                     signals,
                     actor_is_system,
-                    tenants_snapshot,
+                    available_tenants,
                     auth.client.clone(),
                     log_bus,
                     auth.clone(),
@@ -419,6 +440,7 @@ fn row_element(
     let mut s_delete = signals;
     let edit_handler = move |_: MouseEvent| {
         s_edit.form_tenant_id.set(p_for_edit.tenant_id.clone());
+        s_edit.tenant_dropdown_open.set(false);
         s_edit.form_name.set(p_for_edit.name.clone());
         s_edit.form_desc.set(p_for_edit.description.clone());
         s_edit.form_price.set(format_balance(p_for_edit.price));
@@ -486,6 +508,7 @@ fn close_all(mut signals: PlansSignals) {
     signals.editing_plan.set(None);
     signals.deleting_plan.set(None);
     signals.form_tenant_id.set(String::new());
+    signals.tenant_dropdown_open.set(false);
     signals.form_name.set(String::new());
     signals.form_desc.set(String::new());
     signals.form_price.set(String::new());
@@ -506,7 +529,7 @@ fn render_modal(
     deleting: Option<PlanResponse>,
     signals: PlansSignals,
     actor_is_system: bool,
-    tenants: Vec<TenantResponse>,
+    available_tenants: Signal<Vec<TenantResponse>>,
     client: client_api::Client,
     log_bus: LogBus,
     auth: AuthState,
@@ -528,7 +551,7 @@ fn render_modal(
         editing,
         signals,
         actor_is_system,
-        tenants,
+        available_tenants,
         client,
         log_bus,
         auth,
@@ -632,7 +655,7 @@ fn render_form_modal(
     editing: Option<PlanResponse>,
     signals: PlansSignals,
     actor_is_system: bool,
-    tenants: Vec<TenantResponse>,
+    available_tenants: Signal<Vec<TenantResponse>>,
     client: client_api::Client,
     log_bus: LogBus,
     auth: AuthState,
@@ -659,8 +682,6 @@ fn render_form_modal(
     let pick_active = move |_: MouseEvent| signals_for_status.form_status.set("active".to_string());
     let pick_disabled =
         move |_: MouseEvent| signals_for_status.form_status.set("disabled".to_string());
-    let mut signals_for_tenant = signals;
-    let on_tenant_change = move |evt: FormEvent| signals_for_tenant.form_tenant_id.set(evt.value());
 
     let editing_for_submit = editing.clone();
     let mut signals_for_submit = signals;
@@ -808,8 +829,10 @@ fn render_form_modal(
     };
 
     let status_now = signals.form_status.cloned();
-    let tenant_now = signals.form_tenant_id.cloned();
     let is_create = kind == ModalKind::Create;
+
+    // 自定义租户下拉已抽取为共享组件（views::tenant_select），
+    // 与用户管理共用同一实现，避免两处副本在维护中漂移。
 
     rsx! {
         Modal {
@@ -817,24 +840,42 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
-            div { class: "ains-form-stack",
+            div {
+                class: "ains-form-stack",
+                // 点击下拉以外的任意空白/字段区域时关闭租户下拉（不影响模态框）。
+                // 无需覆盖层，因此不会遮挡模态框右侧滚动条。
+                onclick: move |_: MouseEvent| {
+                    let mut open_sig = signals.tenant_dropdown_open;
+                    if *open_sig.read() {
+                        open_sig.set(false);
+                    }
+                },
                 if let Some(err) = form_error.as_ref() {
                     p { class: "ains-form-error", "{err}" }
                 }
                 // system 创建套餐时需选择归属租户；编辑时租户不可变更。
-                if is_create && actor_is_system {
-                    div { class: "ains-form-field",
-                        label { class: "ains-form-label", "{t.plans_form_tenant_label}" }
-                        select {
-                            class: "ains-pagination__select",
-                            value: "{tenant_now}",
+                // 共享自绘下拉与用户管理完全对齐；字段位于 Modal 顶部，
+                // 故用 drop_down 变体向下展开，避免弹层越出模态框顶部被裁切。
+                if tenant_select_visible(kind, actor_is_system) {
+                    {
+                        render_tenant_select(TenantSelectView {
+                            label: t.plans_form_tenant_label.to_string(),
+                            panel_id: TENANT_PANEL_ID,
                             disabled: submitting,
-                            onchange: on_tenant_change,
-                            option { value: "", "{t.plans_tenant_required}" }
-                            for tn in tenants {
-                                option { value: "{tn.id}", "{tn.name}" }
-                            }
-                        }
+                            drop_down: true,
+                            // 套餐必须归属租户：未选时展示占位文案（提交时同样被校验拦截）。
+                            empty_placeholder: t.plans_tenant_required.to_string(),
+                            available_tenants,
+                            selected_id: signals.form_tenant_id,
+                            open: signals.tenant_dropdown_open,
+                            next_page: signals.tenant_next_page,
+                            has_more: signals.tenant_has_more,
+                            loading: signals.tenant_loading,
+                            client: client.clone(),
+                            auth: auth.clone(),
+                            nav,
+                            log_bus,
+                        })
                     }
                 }
                 TextInput {
@@ -937,6 +978,12 @@ fn format_dt(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
 }
 
+/// UI 纯函数：仅「创建模式 + system 角色」展示所属租户下拉
+/// （编辑时租户不可变更；admin 由服务端强制限定自身租户）。
+fn tenant_select_visible(kind: ModalKind, actor_is_system: bool) -> bool {
+    kind == ModalKind::Create && actor_is_system
+}
+
 /// 决定编辑提交时是否携带 price 字段。
 ///
 /// 输入框由 `format_balance` 预填（截断到 2 位小数）：若用户未改动
@@ -956,8 +1003,19 @@ fn price_update_field(
 
 #[cfg(test)]
 mod tests {
-    use super::price_update_field;
+    use super::{ModalKind, price_update_field, tenant_select_visible};
     use crate::balance::{BALANCE_SCALE, format_balance, parse_display_amount};
+
+    #[test]
+    fn tenant_select_only_for_system_create() {
+        // 仅 system 创建时可见；非 system 或非创建模式均不渲染 ains-select。
+        assert!(tenant_select_visible(ModalKind::Create, true));
+        assert!(!tenant_select_visible(ModalKind::Create, false));
+        assert!(!tenant_select_visible(ModalKind::Edit, true));
+        assert!(!tenant_select_visible(ModalKind::Edit, false));
+        assert!(!tenant_select_visible(ModalKind::DeleteConfirm, true));
+        assert!(!tenant_select_visible(ModalKind::None, true));
+    }
 
     #[test]
     fn create_always_sends_price() {

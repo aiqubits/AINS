@@ -10,6 +10,7 @@ mod personal_center;
 mod plans;
 mod reset_password;
 mod settings;
+mod tenant_select;
 mod tenants;
 mod users;
 mod verify_email;
@@ -56,6 +57,17 @@ pub(crate) fn element_near_bottom(_id: &str) -> bool {
     false
 }
 
+/// 截断租户 ID 仅展示前 8 位（超过 8 位附省略号），用于自绘租户下拉的
+/// 选项与触发器文案（用户管理与套餐管理共用，保证两处展示完全对齐）。
+pub(crate) fn short_tenant_id(id: &str) -> String {
+    if id.chars().count() > 8 {
+        let head: String = id.chars().take(8).collect();
+        format!("{head}...")
+    } else {
+        id.to_string()
+    }
+}
+
 /// 订单状态 → 本地化文案（订单管理页与个人中心账单共用）。
 ///
 /// 未知状态原样透出（中性回退）—— 账单/订单数据以诚实展示为先，
@@ -83,8 +95,23 @@ pub(crate) fn order_method_label<'a>(t: &'static Translations, method: &'a str) 
 
 #[cfg(test)]
 mod tests {
-    use super::{order_method_label, order_status_label};
+    use super::{order_method_label, order_status_label, short_tenant_id};
     use i18n::{EN, ZH};
+
+    #[test]
+    fn short_tenant_id_truncates_long_ids() {
+        assert_eq!(short_tenant_id("1234567890abcdef"), "12345678...");
+        // 8 位及以内原样返回
+        assert_eq!(short_tenant_id("default"), "default");
+        assert_eq!(short_tenant_id("12345678"), "12345678");
+    }
+
+    #[test]
+    fn short_tenant_id_truncates_by_chars_not_bytes() {
+        // 多字节字符按 chars() 而非字节截断，锁定不会在 UTF-8 边界 panic
+        assert_eq!(short_tenant_id("一二三四五六七八九"), "一二三四五六七八...");
+        assert_eq!(short_tenant_id("一二三四五六七八"), "一二三四五六七八");
+    }
 
     #[test]
     fn order_status_known_values_are_localized() {
