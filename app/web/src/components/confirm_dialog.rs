@@ -38,6 +38,11 @@ pub fn ConfirmDialog(
     /// 确认按钮是否处于加载中状态，默认 false
     #[props(default = false)]
     loading: bool,
+    /// 弹窗内联错误文案（如可重试的业务错误），默认无。
+    /// 适用于错误后需保持弹窗打开让用户重试的场景 —— 否则
+    /// 错误只能渲染在被遮罩层盖住的页面区域里。
+    #[props(default = None)]
+    error: Option<String>,
     /// 确认按钮文案，默认从 i18n 获取
     #[props(default = "".to_string())]
     confirm_label: String,
@@ -83,6 +88,10 @@ pub fn ConfirmDialog(
                     disable_backdrop,
 
                     p { class: "ains-confirm-dialog__msg", "{message}" }
+
+                    if let Some(err) = error.as_ref() {
+                        p { class: "ains-form-error", "{err}" }
+                    }
 
                     div { class: "ains-confirm-dialog__actions",
                         button {

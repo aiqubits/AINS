@@ -192,6 +192,58 @@ async fn test_purchase_plan_not_found() {
 }
 
 #[tokio::test]
+async fn test_purchase_plan_conflict_preserves_purchase_in_progress_code() {
+    let (client, mock_server) = create_test_client().await;
+    client.set_token(fixtures::TEST_TOKEN);
+
+    // Server-side per-user purchase lock rejects duplicate submits with
+    // 409 purchase_in_progress (handlers/plan.rs) — the code must survive
+    // in the body for the frontend to render the dedicated message.
+    Mock::given(method("POST"))
+        .and(path(format!("/api/plans/{}/purchase", PLAN_ID)))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": "purchase_in_progress",
+            "message": "Another purchase is already in progress",
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let err = client.purchase_plan(PLAN_ID).await.unwrap_err();
+    match err {
+        ClientError::Other(409, body) => {
+            assert!(body.contains("purchase_in_progress"), "body: {body}");
+        }
+        other => panic!("expected Other(409, ..), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_purchase_plan_tenant_disabled_maps_to_other_403() {
+    let (client, mock_server) = create_test_client().await;
+    client.set_token(fixtures::TEST_TOKEN);
+
+    // Disabled tenants are rejected by require_actor_tenant_active with a
+    // plain 403 (no special code) — the frontend maps it to the
+    // tenant-disabled copy via the PersonalCenter (403, _) arm.
+    Mock::given(method("POST"))
+        .and(path(format!("/api/plans/{}/purchase", PLAN_ID)))
+        .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": "forbidden",
+            "message": "Tenant is disabled",
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let err = client.purchase_plan(PLAN_ID).await.unwrap_err();
+    match err {
+        ClientError::Other(403, body) => {
+            assert!(body.contains("forbidden"), "body: {body}");
+        }
+        other => panic!("expected Other(403, ..), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_list_available_and_my_plans() {
     let (client, mock_server) = create_test_client().await;
     client.set_token(fixtures::TEST_TOKEN);
@@ -279,6 +331,35 @@ async fn test_update_order_omits_unset_fields() {
         .await
         .unwrap();
     assert_eq!(resp.status, "refunded");
+}
+
+#[tokio::test]
+async fn test_list_my_orders_sends_pagination_query() {
+    let (client, mock_server) = create_test_client().await;
+    client.set_token(fixtures::TEST_TOKEN);
+
+    // Pins the client half of the pagination contract: page/per_page must
+    // reach the server as query params (the server clamps them further in
+    // services/payment_order.rs) — the personal-center billing pager
+    // depends on this passthrough.
+    Mock::given(method("GET"))
+        .and(path("/api/users/me/orders"))
+        .and(query_param("page", "3"))
+        .and(query_param("per_page", "50"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "items": [order_json(ORDER_ID, "paid")],
+            "total": 101,
+            "page": 3,
+            "per_page": 50,
+            "total_pages": 3,
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let resp = client.list_my_orders(3, 50).await.unwrap();
+    assert_eq!(resp.total, 101);
+    assert_eq!(resp.total_pages, 3);
+    assert_eq!(resp.items.len(), 1);
 }
 
 #[tokio::test]

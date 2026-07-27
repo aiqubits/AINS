@@ -40,6 +40,32 @@ pub enum ErrorContext {
     PlanManagement,
     /// 支付订单页面
     OrderManagement,
+    /// 个人中心（自助接口）：403 的唯一来源是租户被禁用
+    /// （require_actor_tenant_active），而非权限不足 —— 不可复用
+    /// PlanManagement 的“需 admin”文案；404 覆盖购买 disabled/跨租户
+    /// 套餐时的 NotFound。
+    PersonalCenter,
+}
+
+/// 购买链路专属错误码 → 文案（PlanManagement 与 PersonalCenter 两语境
+/// 共享，防止双处维护导致文案静默漂移）。
+///
+/// 仅覆盖三个购买专属错误码；调用方需先排除 401（会话失效语义
+/// 优先）。validation_error 不在此处理 —— 两语境均约定 403/404
+/// 状态码优先于 validation_error 错误码。
+fn purchase_code_message(code: &str, lang: Language) -> Option<String> {
+    let msg = match (lang, code) {
+        (Language::En, "no_active_plan") => "No active plan with remaining calls",
+        (Language::En, "insufficient_balance") => "Insufficient balance to purchase this plan",
+        (Language::En, "purchase_in_progress") => {
+            "A purchase is already in progress, please try again shortly"
+        }
+        (Language::Zh, "no_active_plan") => "没有可用套餐或套餐次数已用尽",
+        (Language::Zh, "insufficient_balance") => "余额不足，无法购买该套餐",
+        (Language::Zh, "purchase_in_progress") => "已有一笔购买正在处理中，请稍后再试",
+        _ => return None,
+    };
+    Some(msg.to_string())
 }
 
 /// 将 `ClientError` 翻译为当前语言提示，根据 `ctx` 差异化状态码文案。
@@ -63,6 +89,17 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                 .as_ref()
                 .and_then(|v| v.get("message").and_then(|m| m.as_str().map(String::from)))
                 .unwrap_or_else(|| body.clone());
+            // 购买链路共享错误码先于各语境 match（但让位 401）：
+            // no_active_plan 服务端以 403 返回，必须在进入 (403, _)
+            // 分支前命中专属文案，不得被“需 admin”/“租户禁用”遮蔽。
+            if matches!(
+                ctx,
+                ErrorContext::PlanManagement | ErrorContext::PersonalCenter
+            ) && *status != 401
+                && let Some(shared) = purchase_code_message(code.as_str(), lang)
+            {
+                return shared;
+            }
             match lang {
                 Language::En => match ctx {
                     ErrorContext::Auth => match (status, code.as_str()) {
@@ -113,16 +150,9 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (403, _) => "Insufficient permissions (admin required)".to_string(),
                         _ => format!("Request failed (HTTP {status}): {msg}"),
                     },
+                    // 购买专属错误码已由上方 purchase_code_message 命中。
                     ErrorContext::PlanManagement => match (status, code.as_str()) {
                         (401, _) => "Not logged in or session expired".to_string(),
-                        (_, "no_active_plan") => "No active plan with remaining calls".to_string(),
-                        (_, "insufficient_balance") => {
-                            "Insufficient balance to purchase this plan".to_string()
-                        }
-                        (_, "purchase_in_progress") => {
-                            "A purchase is already in progress, please try again shortly"
-                                .to_string()
-                        }
                         (403, _) => "Insufficient permissions (admin required)".to_string(),
                         (404, _) => "Plan or user not found".to_string(),
                         (_, "validation_error") => format!("Validation error: {msg}"),
@@ -132,6 +162,17 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (401, _) => "Not logged in or session expired".to_string(),
                         (403, _) => "Insufficient permissions (admin required)".to_string(),
                         (404, _) => "Order not found".to_string(),
+                        (_, "validation_error") => format!("Validation error: {msg}"),
+                        _ => format!("Request failed (HTTP {status}): {msg}"),
+                    },
+                    // 购买专属错误码（含防御性的 no_active_plan 映射，理由
+                    // 见 purchase_code_message）已由上方共享 helper 命中。
+                    ErrorContext::PersonalCenter => match (status, code.as_str()) {
+                        (401, _) => "Not logged in or session expired".to_string(),
+                        (403, _) => {
+                            "Your tenant is disabled; purchasing is unavailable".to_string()
+                        }
+                        (404, _) => "Plan not found or no longer available".to_string(),
                         (_, "validation_error") => format!("Validation error: {msg}"),
                         _ => format!("Request failed (HTTP {status}): {msg}"),
                     },
@@ -182,13 +223,9 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (403, _) => "权限不足 (需 admin)".to_string(),
                         _ => format!("请求失败 (HTTP {status}): {msg}"),
                     },
+                    // 购买专属错误码已由上方 purchase_code_message 命中。
                     ErrorContext::PlanManagement => match (status, code.as_str()) {
                         (401, _) => "未登录或会话已过期".to_string(),
-                        (_, "no_active_plan") => "没有可用套餐或套餐次数已用尽".to_string(),
-                        (_, "insufficient_balance") => "余额不足，无法购买该套餐".to_string(),
-                        (_, "purchase_in_progress") => {
-                            "已有一笔购买正在处理中，请稍后再试".to_string()
-                        }
                         (403, _) => "权限不足 (需 admin)".to_string(),
                         (404, _) => "套餐或用户不存在".to_string(),
                         (_, "validation_error") => format!("参数错误: {msg}"),
@@ -198,6 +235,14 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                         (401, _) => "未登录或会话已过期".to_string(),
                         (403, _) => "权限不足 (需 admin)".to_string(),
                         (404, _) => "订单不存在".to_string(),
+                        (_, "validation_error") => format!("参数错误: {msg}"),
+                        _ => format!("请求失败 (HTTP {status}): {msg}"),
+                    },
+                    // 购买专属错误码已由上方共享 helper 命中。
+                    ErrorContext::PersonalCenter => match (status, code.as_str()) {
+                        (401, _) => "未登录或会话已过期".to_string(),
+                        (403, _) => "当前租户已禁用，暂不可购买".to_string(),
+                        (404, _) => "套餐不存在或已下架".to_string(),
                         (_, "validation_error") => format!("参数错误: {msg}"),
                         _ => format!("请求失败 (HTTP {status}): {msg}"),
                     },
@@ -271,6 +316,26 @@ pub async fn handle_unauth(
     } else {
         false
     }
+}
+
+/// [`handle_unauth`] 的 401-only 变体：仅拦截 token 失效（登出 + 跳
+/// `/auth`），403 一律放行给调用方。
+///
+/// 适用于把 403 作为**预期业务状态**的视图 —— 个人中心的自助接口
+/// 在租户被禁用时返回 403（require_actor_tenant_active），必须落入
+/// `humanize_error` 渲染为业务文案；若走 [`handle_unauth`]，403 会被
+/// 当作权限异常跳转回个人中心自身后吞掉，导致区块永久 loading、
+/// 购买弹窗无反馈卡死。
+pub async fn handle_unauth_401_only(
+    err: &ClientError,
+    auth: AuthState,
+    nav: Navigator,
+    log_bus: LogBus,
+) -> bool {
+    if !is_unauth(err) {
+        return false;
+    }
+    handle_unauth(err, auth, nav, log_bus).await
 }
 
 #[cfg(test)]
@@ -452,6 +517,191 @@ mod tests {
             msg,
             "A purchase is already in progress, please try again shortly"
         );
+    }
+
+    #[test]
+    fn humanize_personal_center_403_zh() {
+        // 自助接口的 403 来自租户禁用，不得渲染为“需 admin”。
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "当前租户已禁用，暂不可购买");
+    }
+
+    #[test]
+    fn humanize_personal_center_403_en() {
+        let err = ClientError::Other(403, r#"{"error":"forbidden"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "Your tenant is disabled; purchasing is unavailable");
+    }
+
+    #[test]
+    fn humanize_personal_center_404_zh() {
+        let err = ClientError::Other(404, r#"{"error":"not_found"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "套餐不存在或已下架");
+    }
+
+    #[test]
+    fn humanize_personal_center_404_en() {
+        let err = ClientError::Other(404, r#"{"error":"not_found"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "Plan not found or no longer available");
+    }
+
+    #[test]
+    fn humanize_personal_center_purchase_in_progress_zh() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_in_progress"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "已有一笔购买正在处理中，请稍后再试");
+    }
+
+    #[test]
+    fn humanize_personal_center_purchase_in_progress_en() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_in_progress"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(
+            msg,
+            "A purchase is already in progress, please try again shortly"
+        );
+    }
+
+    #[test]
+    fn humanize_personal_center_401_zh() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "未登录或会话已过期");
+    }
+
+    #[test]
+    fn humanize_personal_center_401_en() {
+        let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "Not logged in or session expired");
+    }
+
+    #[test]
+    fn humanize_personal_center_insufficient_balance_zh() {
+        // 服务端以 400 + insufficient_balance 返回（utils/error.rs）。
+        let err = ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "余额不足，无法购买该套餐");
+    }
+
+    #[test]
+    fn humanize_personal_center_insufficient_balance_en() {
+        let err = ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "Insufficient balance to purchase this plan");
+    }
+
+    #[test]
+    fn humanize_personal_center_no_active_plan_not_shadowed_by_403_zh() {
+        // no_active_plan 服务端以 403 返回（handlers/plan.rs）：必须命中
+        // 专属文案，不得被通用 (403, _) 的“租户禁用”分支遮蔽。
+        let err = ClientError::Other(403, r#"{"error":"no_active_plan"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "没有可用套餐或套餐次数已用尽");
+    }
+
+    #[test]
+    fn humanize_personal_center_no_active_plan_not_shadowed_by_403_en() {
+        let err = ClientError::Other(403, r#"{"error":"no_active_plan"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "No active plan with remaining calls");
+    }
+
+    #[test]
+    fn purchase_code_messages_identical_across_contexts() {
+        // 防漂移守卫：三个购买专属错误码在 PlanManagement 与
+        // PersonalCenter 两语境下必须产生完全一致的文案（共享
+        // purchase_code_message），不随状态码变化（401 除外）。
+        for code in ["no_active_plan", "insufficient_balance", "purchase_in_progress"] {
+            for status in [400u16, 403, 409] {
+                let err = ClientError::Other(status, format!(r#"{{"error":"{code}"}}"#));
+                for lang in [Language::Zh, Language::En] {
+                    let plan_mgmt = humanize_error(&err, ErrorContext::PlanManagement, lang);
+                    let personal = humanize_error(&err, ErrorContext::PersonalCenter, lang);
+                    assert_eq!(
+                        plan_mgmt, personal,
+                        "context drift for code={code} status={status} lang={lang:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn purchase_code_yields_to_401_session_expiry() {
+        // 401 语义优先：即使响应体携带购买错误码，会话失效文案
+        // 仍胜出（共享 helper 不得拦截 401）。
+        let err = ClientError::Other(401, r#"{"error":"insufficient_balance"}"#.into());
+        assert_eq!(
+            humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh),
+            "未登录或会话已过期"
+        );
+        assert_eq!(
+            humanize_error(&err, ErrorContext::PlanManagement, Language::En),
+            "Not logged in or session expired"
+        );
+    }
+
+    #[test]
+    fn humanize_personal_center_validation_error_zh() {
+        let err = ClientError::Other(
+            422,
+            r#"{"error":"validation_error","message":"plan_id is invalid"}"#.into(),
+        );
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "参数错误: plan_id is invalid");
+    }
+
+    #[test]
+    fn humanize_personal_center_validation_error_en() {
+        let err = ClientError::Other(
+            422,
+            r#"{"error":"validation_error","message":"plan_id is invalid"}"#.into(),
+        );
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "Validation error: plan_id is invalid");
+    }
+
+    #[test]
+    fn humanize_personal_center_fallback_exposes_only_parsed_message() {
+        // 兼具兜底臂覆盖与不泄漏验证：未知错误码落入通用文案，
+        // 且仅透出服务端显式提供的 message 字段 —— body 中的其他
+        // 内部字段（如 detail）不得出现在用户可见文案里。
+        // 用 409 + 未知错误码构造：5xx 被 client-api 映射为
+        // ClientError::ServerError（from_status），Other(5xx, _) 实际
+        // 不会出现；兜底臂的真实来源是携未知错误码的 4xx。
+        let err = ClientError::Other(
+            409,
+            r#"{"error":"conflict","message":"Plan operation failed","detail":"db timeout at pool.rs:42"}"#.into(),
+        );
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "请求失败 (HTTP 409): Plan operation failed");
+        assert!(!msg.contains("db timeout"), "internal detail leaked: {msg}");
+
+        let msg_en = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg_en, "Request failed (HTTP 409): Plan operation failed");
+        assert!(
+            !msg_en.contains("pool.rs"),
+            "internal detail leaked: {msg_en}"
+        );
+    }
+
+    #[test]
+    fn humanize_personal_center_404_wins_over_validation_error_code() {
+        // 文档性测试：固定 (404, _) 臂优先于 (_, "validation_error")
+        // 的匹配顺序。服务端目前不会产生 404 + validation_error
+        // 的组合，若未来出现，状态码语义（套餐不存在）优先展示。
+        let err = ClientError::Other(
+            404,
+            r#"{"error":"validation_error","message":"plan_id is invalid"}"#.into(),
+        );
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "套餐不存在或已下架");
+        let msg_en = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg_en, "Plan not found or no longer available");
     }
 
     #[test]

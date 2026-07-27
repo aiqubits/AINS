@@ -397,7 +397,34 @@ translate! {
     // personal_center.rs
     personal_center_title: "Personal Center" => "个人中心",
     personal_center_subtitle: "Manage your plan, balance and billing records" => "管理你的套餐、余额与账单记录",
-    personal_center_empty: "This feature is under construction. Stay tuned." => "功能建设中，敬请期待。",
+    pc_loading: "Loading…" => "正在加载…",
+    pc_retry_btn: "Retry" => "重试",
+    // 余额卡片
+    pc_balance_title: "Account Balance" => "账户余额",
+    pc_balance_topup_hint: "To top up, please contact your administrator" => "如需充值，请联系管理员",
+    // 我的套餐
+    pc_my_plans_title: "My Plans" => "我的套餐",
+    pc_my_plans_empty: "No plans yet — pick one below to get started" => "暂无套餐，从下方选购一个开始使用",
+    pc_col_remaining: "Remaining" => "剩余次数",
+    pc_col_expires: "Expires" => "到期时间",
+    pc_col_source: "Source" => "来源",
+    pc_plan_status_active: "Active" => "生效中",
+    pc_plan_status_expired: "Expired" => "已过期",
+    pc_plan_status_exhausted: "Exhausted" => "已用尽",
+    pc_plan_source_purchase: "Purchased" => "自购",
+    pc_plan_source_admin_grant: "Granted" => "后台授予",
+    // 可购套餐
+    pc_available_title: "Available Plans" => "可购套餐",
+    pc_available_empty: "No plans available for purchase" => "暂无可购套餐",
+    pc_buy_btn: "Buy" => "购买",
+    pc_buy_insufficient: "Insufficient balance" => "余额不足",
+    pc_confirm_title: "Confirm Purchase" => "确认购买",
+    pc_confirm_msg: "Buy \"{name}\" for {price}? Current balance: {balance}" => "以 {price} 购买「{name}」？当前余额：{balance}",
+    pc_confirm_btn: "Confirm" => "确认购买",
+    pc_buy_success: "Purchase successful" => "购买成功",
+    // 账单记录
+    pc_orders_title: "Billing Records" => "账单记录",
+    pc_orders_empty: "No billing records" => "暂无账单记录",
 
     // sidebar.rs — plans & orders
     sidebar_plans_label: "Plan Management" => "套餐管理",

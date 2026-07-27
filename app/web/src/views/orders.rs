@@ -27,6 +27,7 @@ use crate::balance::{format_balance, parse_display_amount};
 use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
+use crate::views::{order_method_label as method_label, order_status_label as status_label};
 
 const ORDER_STATUSES: &[&str] = &["paid", "pending", "refunded", "cancelled"];
 const PAYMENT_METHODS: &[&str] = &["balance", "wechat", "alipay"];
@@ -70,27 +71,6 @@ struct PaginationState {
     total_pages: u64,
     page_signal: Signal<u64>,
     per_page_signal: Signal<u64>,
-}
-
-/// 订单状态 → 本地化文案。
-fn status_label(t: &'static Translations, status: &str) -> &'static str {
-    match status {
-        "paid" => t.orders_status_paid,
-        "pending" => t.orders_status_pending,
-        "refunded" => t.orders_status_refunded,
-        "cancelled" => t.orders_status_cancelled,
-        _ => t.orders_status_pending,
-    }
-}
-
-/// 支付方式 → 本地化文案。
-fn method_label(t: &'static Translations, method: &str) -> &'static str {
-    match method {
-        "balance" => t.orders_method_balance,
-        "wechat" => t.orders_method_wechat,
-        "alipay" => t.orders_method_alipay,
-        _ => t.orders_method_balance,
-    }
 }
 
 #[component]
