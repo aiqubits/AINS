@@ -123,7 +123,8 @@ impl Tool for EchoTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing `text`".into()))?;
         ctx.metadata
-            .insert("echo_calls".into(), json!(ctx.metadata.len() + 1));
+            .extra
+            .insert("echo_calls".into(), json!(ctx.metadata.extra.len() + 1));
         Ok(ToolResult::ok(text))
     }
 
@@ -144,7 +145,7 @@ async fn tool_execute_writes_metadata_and_returns_output() {
     let result = tool.execute(json!({"text": "hi"}), &mut ctx).await.unwrap();
     assert_eq!(result.output, "hi");
     assert!(!result.is_error);
-    assert_eq!(metadata.get("echo_calls"), Some(&json!(1)));
+    assert_eq!(metadata.extra.get("echo_calls"), Some(&json!(1)));
     assert!(tool.is_read_only(&json!({"text": "hi"})));
 }
 

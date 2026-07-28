@@ -15,6 +15,8 @@ serde_yaml = "0.9"
 async-trait.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+# ContextStore 图片附件 → Image content block 的 base64 编码（纯 Rust，双 target）
+base64 = "0.22"
 
 # ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
 # redb / hnsw_rs 等存储实现依赖在 Phase 2 引入（Phase 0 仅定义 trait，偏差记录于

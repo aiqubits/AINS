@@ -47,8 +47,58 @@ impl ToolResult {
     }
 }
 
-/// 跨轮工具状态袋占位；Phase 1.5 收敛为带条数上限的结构化状态袋。
-pub type ToolMetadata = serde_json::Map<String, Value>;
+/// 单个状态袋列表键的条数上限（超限淘汰最旧条目）。
+pub const TOOL_METADATA_LIST_CAP: usize = 50;
+
+/// 跨轮工具状态袋（对齐基线 `_record_tool_carryover` 的 capped-unique 语义）：
+/// 已读文件 / 已调技能 / 用户目标 / 工作日志四个受限键 + 工具自定义 `extra`。
+/// 随会话快照按白名单持久化（快照机制于后续 Phase 落地）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ToolMetadata {
+    pub read_files: Vec<String>,
+    pub invoked_skills: Vec<String>,
+    pub user_goal: Option<String>,
+    pub work_log: Vec<String>,
+    /// 工具自定义键值（无固定 schema，不参与条数上限治理）。
+    #[serde(default)]
+    pub extra: serde_json::Map<String, Value>,
+}
+
+impl ToolMetadata {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 记录已读文件：去重后移到末尾（最近使用在后），超限淘汰最旧。
+    pub fn record_read_file(&mut self, path: impl Into<String>) {
+        Self::push_capped_unique(&mut self.read_files, path.into());
+    }
+
+    /// 记录已调技能：capped-unique，语义同 `record_read_file`。
+    pub fn record_invoked_skill(&mut self, name: impl Into<String>) {
+        Self::push_capped_unique(&mut self.invoked_skills, name.into());
+    }
+
+    pub fn set_user_goal(&mut self, goal: impl Into<String>) {
+        self.user_goal = Some(goal.into());
+    }
+
+    /// 追加工作日志条目：capped-unique，保留最近条目。
+    pub fn append_work_log(&mut self, entry: impl Into<String>) {
+        Self::push_capped_unique(&mut self.work_log, entry.into());
+    }
+
+    fn push_capped_unique(list: &mut Vec<String>, value: String) {
+        if let Some(position) = list.iter().position(|existing| *existing == value) {
+            list.remove(position);
+        }
+        list.push(value);
+        if list.len() > TOOL_METADATA_LIST_CAP {
+            let overflow = list.len() - TOOL_METADATA_LIST_CAP;
+            list.drain(0..overflow);
+        }
+    }
+}
 
 /// 工具执行上下文（对齐基线 `ToolExecutionContext` 的 cwd + metadata；
 /// hooks 通道随 Phase 3 Hook System 加入）。
@@ -87,4 +137,53 @@ pub trait Tool: MaybeSendSync {
     ) -> Result<ToolResult, ToolError>;
 
     fn category(&self) -> ToolCategory;
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_metadata_lists_are_capped_unique() {
+        let mut metadata = ToolMetadata::new();
+        for i in 0..(TOOL_METADATA_LIST_CAP + 10) {
+            metadata.record_read_file(format!("file_{i}"));
+        }
+        assert_eq!(metadata.read_files.len(), TOOL_METADATA_LIST_CAP);
+        // 最旧的 10 条被淘汰，最新条目在末尾
+        assert_eq!(metadata.read_files.first().unwrap(), "file_10");
+        assert_eq!(
+            metadata.read_files.last().unwrap(),
+            &format!("file_{}", TOOL_METADATA_LIST_CAP + 9)
+        );
+
+        // 重复记录移动到末尾而非重复插入
+        metadata.record_read_file("file_20");
+        assert_eq!(metadata.read_files.len(), TOOL_METADATA_LIST_CAP);
+        assert_eq!(metadata.read_files.last().unwrap(), "file_20");
+    }
+
+    #[test]
+    fn tool_metadata_goal_and_work_log() {
+        let mut metadata = ToolMetadata::new();
+        metadata.set_user_goal("整理报表");
+        metadata.append_work_log("解析 CSV");
+        metadata.append_work_log("解析 CSV");
+        metadata.record_invoked_skill("csv-report-workflow");
+        assert_eq!(metadata.user_goal.as_deref(), Some("整理报表"));
+        assert_eq!(metadata.work_log, vec!["解析 CSV"]);
+        assert_eq!(metadata.invoked_skills, vec!["csv-report-workflow"]);
+    }
+
+    #[test]
+    fn tool_metadata_serde_roundtrip_with_extra() {
+        let mut metadata = ToolMetadata::new();
+        metadata.record_read_file("a.txt");
+        metadata
+            .extra
+            .insert("echo_calls".into(), serde_json::json!(1));
+        let json = serde_json::to_value(&metadata).unwrap();
+        let back: ToolMetadata = serde_json::from_value(json).unwrap();
+        assert_eq!(back, metadata);
+    }
 }

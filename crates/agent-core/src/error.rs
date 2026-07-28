@@ -53,5 +53,7 @@ pub enum AgentError {
     #[error("model transport error: {0}")]
     Model(String),
     #[error("max turns exceeded")]
+    /// 预留变体：当前实现中 MaxTurnsExceeded 回 Idle（会话可继续），
+    /// 不使用此变体。Phase 2 若引入严格轮次限制可从此处返回 `Failed`。
     MaxTurnsExceeded,
 }
