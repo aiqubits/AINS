@@ -97,7 +97,8 @@ async fn warm_up_replicas(router: &Arc<AutoRouter>, count: usize) {
     }
 
     // Stabilization delay: let the pool settle all connection state.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Use a longer delay in CI where resource contention can slow pool init.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
 }
 
 /// Run `n` concurrent read queries through the AutoRouter.
@@ -259,7 +260,7 @@ async fn test_concurrent_reads_with_circuit_breaker() {
 
     // ── Phase 1: All replicas healthy ─────────────────────────────
     eprintln!("Phase 1: Warm up both replicas...");
-    warm_up_replicas(&router, 15).await;
+    warm_up_replicas(&router, 30).await;
 
     let healthy_ok = concurrent_reads(&router, 10).await;
     assert!(
