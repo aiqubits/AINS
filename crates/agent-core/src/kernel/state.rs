@@ -49,7 +49,7 @@ pub enum AgentState {
     Querying {
         turn: u32,
     },
-    /// 逐个执行本轮 assistant 请求的 tool_use。
+    /// 执行本轮 assistant 请求的 tool_use（多工具并发）。
     ExecutingTools {
         tool_uses: Vec<ToolUse>,
         turn: u32,

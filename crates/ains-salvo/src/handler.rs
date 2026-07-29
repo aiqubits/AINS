@@ -84,8 +84,9 @@ where
                 }
             }
         };
-        // SAFETY: UnifiedRequest 的 req/depot 指针在此 handle() 调用期间有效
-        let unified_req = unsafe { UnifiedRequest::new(req, depot, cached_body) };
+        // owned 快照 + Depot 所有权移入（UnifiedHandler 是路由终点，
+        // call_next 链上无人在其之后再读 Depot），无 unsafe。
+        let unified_req = UnifiedRequest::new(req, depot, cached_body);
         match (self.0)(unified_req).await {
             Ok(unified_res) => render_response(unified_res, res),
             Err(err) => {

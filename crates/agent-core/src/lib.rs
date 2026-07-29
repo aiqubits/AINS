@@ -5,11 +5,14 @@
 //! 收敛在 cfg 门控的适配文件中，按 target 互斥编译。
 
 pub mod error;
+pub mod fnmatch;
+pub mod hooks;
 pub mod kernel;
 pub mod marker;
 pub mod memory;
 pub mod model_client;
 pub mod platform;
+pub mod policy;
 pub mod runtime_adapter;
 pub mod skills;
 pub mod tools;

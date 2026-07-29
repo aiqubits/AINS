@@ -2,10 +2,10 @@
 //! `engine/query_engine.py` + `query.py`）。
 //!
 //! Kernel 仅负责 Event Receive → State Transition → Service Dispatch，
-//! 不直接操作 Memory / Skill；Phase 1 直接持有 ModelClient 与工具表，
-//! RuntimeServices 聚合与三态权限 / hooks 在 Phase 2/3 接入后收敛。
+//! 不直接操作 Memory / Skill；工具分发经 `ToolRuntime` 管线
+//! （pre/post_tool_use hooks + 三态权限 + 输出预算，Phase 3）。
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,8 +14,10 @@ use std::time::Duration;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures::channel::mpsc;
+use serde_json::{Map, Value};
 
 use crate::error::AgentError;
+use crate::hooks::HookEvent;
 use crate::kernel::context::ContextStore;
 use crate::kernel::fsm;
 use crate::kernel::messages::{
@@ -27,7 +29,7 @@ use crate::model_client::{
     DEFAULT_MAX_OUTPUT_TOKENS, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
 };
 use crate::runtime_adapter::RuntimeAdapter;
-use crate::tools::{Tool, ToolContext, ToolDef, ToolResult};
+use crate::tools::{Tool, ToolDef, ToolRuntime};
 
 /// 事件总线容量（入站 AgentEvent）。
 const EVENT_CHANNEL_CAPACITY: usize = 32;
@@ -66,7 +68,7 @@ pub struct AgentKernel<R: RuntimeAdapter> {
     state: AgentState,
     context: ContextStore,
     model: Arc<dyn ModelClient>,
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: ToolRuntime,
     events: mpsc::Receiver<AgentEvent>,
     stream: mpsc::UnboundedSender<StreamEvent>,
     config: AgentKernelConfig,
@@ -75,6 +77,10 @@ pub struct AgentKernel<R: RuntimeAdapter> {
 
 impl<R: RuntimeAdapter> AgentKernel<R> {
     /// 构造 Kernel，返回（Kernel，事件发送端，UI 流事件接收端）。
+    ///
+    /// 裸工具列表默认装配 `default` 权限模式且不提供确认回调：只读工具可
+    /// 执行，写工具 fail-closed。需要 UI 确认、hooks 或外置存储的宿主应使用
+    /// [`Self::with_runtime`] 显式装配完整 `ToolRuntime`。
     pub fn new(
         model: Arc<dyn ModelClient>,
         tools: Vec<Box<dyn Tool>>,
@@ -84,12 +90,25 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
         mpsc::Sender<AgentEvent>,
         mpsc::UnboundedReceiver<StreamEvent>,
     ) {
+        let mut runtime = ToolRuntime::new();
+        for tool in tools {
+            runtime.register(tool);
+        }
+        Self::with_runtime(model, runtime, config)
+    }
+
+    /// 完整入口：宿主自行装配 ToolRuntime（权限引擎 / hooks / 外置存储）。
+    pub fn with_runtime(
+        model: Arc<dyn ModelClient>,
+        tools: ToolRuntime,
+        config: AgentKernelConfig,
+    ) -> (
+        Self,
+        mpsc::Sender<AgentEvent>,
+        mpsc::UnboundedReceiver<StreamEvent>,
+    ) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let (stream_tx, stream_rx) = mpsc::unbounded();
-        let tools = tools
-            .into_iter()
-            .map(|tool| (tool.definition().name, tool))
-            .collect();
         (
             Self {
                 state: AgentState::Idle,
@@ -175,37 +194,66 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         event = self.events.next() => match event {
                             Some(event) => AgentState::Observing(event),
                             // channel 关闭，优雅退出
-                            None => AgentState::Completed,
+                            None => {
+                                self.run_observational_hook(
+                                    HookEvent::SessionEnd,
+                                    lifecycle_payload(HookEvent::SessionEnd, &self.config.cwd),
+                                )
+                                .await;
+                                AgentState::Completed
+                            }
                         },
                         _ = sleep => AgentState::Waiting,
                     }
                 }
                 AgentState::Observing(AgentEvent::SystemEvent {
                     event_type: SystemEventType::Shutdown,
-                }) => AgentState::Completed,
+                }) => {
+                    self.run_observational_hook(
+                        HookEvent::SessionEnd,
+                        lifecycle_payload(HookEvent::SessionEnd, &self.config.cwd),
+                    )
+                    .await;
+                    AgentState::Completed
+                }
                 AgentState::Observing(AgentEvent::SystemEvent {
                     event_type: SystemEventType::Startup,
-                }) => AgentState::Idle,
+                }) => {
+                    self.run_observational_hook(
+                        HookEvent::SessionStart,
+                        lifecycle_payload(HookEvent::SessionStart, &self.config.cwd),
+                    )
+                    .await;
+                    AgentState::Idle
+                }
                 AgentState::Observing(event) => {
-                    // 历史先 sanitize 再追加新消息（对齐 submit_message 前置处理）
-                    self.context.conversation = sanitize_conversation_messages(std::mem::take(
-                        &mut self.context.conversation,
-                    ));
-                    match self.context.build(&event).await {
-                        Ok(()) => {
-                            if self.context.conversation.is_empty() {
-                                // 空白输入未产生任何消息，无需查询模型
-                                AgentState::Idle
-                            } else {
-                                AgentState::Querying { turn: 0 }
+                    let payload = agent_event_hook_payload(&event, &self.config.cwd);
+                    if self
+                        .run_blocking_hook(HookEvent::UserPromptSubmit, payload)
+                        .await
+                    {
+                        AgentState::Idle
+                    } else {
+                        // 历史先 sanitize 再追加新消息（对齐 submit_message 前置处理）
+                        self.context.conversation = sanitize_conversation_messages(std::mem::take(
+                            &mut self.context.conversation,
+                        ));
+                        match self.context.build(&event).await {
+                            Ok(()) => {
+                                if self.context.conversation.is_empty() {
+                                    // 空白输入未产生任何消息，无需查询模型
+                                    AgentState::Idle
+                                } else {
+                                    AgentState::Querying { turn: 0 }
+                                }
                             }
-                        }
-                        Err(err) => {
-                            self.emit(StreamEvent::Error {
-                                message: format!("Context build failed: {err}"),
-                                recoverable: false,
-                            });
-                            AgentState::Failed(err)
+                            Err(err) => {
+                                self.emit(StreamEvent::Error {
+                                    message: format!("Context build failed: {err}"),
+                                    recoverable: false,
+                                });
+                                AgentState::Failed(err)
+                            }
                         }
                     }
                 }
@@ -233,13 +281,36 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         match self.stream_model_turn(request).await {
                             Some((message, usage)) => {
                                 let tool_uses = message.tool_uses();
-                                self.context.conversation.push(message.clone());
-                                self.emit(StreamEvent::AssistantTurnComplete { message, usage });
-                                if tool_uses.is_empty() {
-                                    // 无工具请求，回答完成
+                                if let Err(reason) = validate_tool_use_ids(&tool_uses) {
+                                    // ID 是 tool_use/tool_result 的唯一配对键；整批先校验
+                                    // 再分发，避免半批已产生副作用后才发现协议违规。
+                                    self.emit(StreamEvent::Error {
+                                        message: format!(
+                                            "Model returned an invalid tool_use batch: {reason}. \
+                                             The turn was ignored to keep the session healthy."
+                                        ),
+                                        recoverable: true,
+                                    });
                                     AgentState::Idle
                                 } else {
-                                    AgentState::ExecutingTools { tool_uses, turn }
+                                    self.context.conversation.push(message.clone());
+                                    self.emit(StreamEvent::AssistantTurnComplete {
+                                        message,
+                                        usage,
+                                    });
+                                    if tool_uses.is_empty() {
+                                        // 无工具请求，回答完成
+                                        let mut payload =
+                                            lifecycle_payload(HookEvent::Stop, &self.config.cwd);
+                                        payload.insert(
+                                            "stop_reason".into(),
+                                            Value::String("tool_uses_empty".into()),
+                                        );
+                                        self.run_observational_hook(HookEvent::Stop, payload).await;
+                                        AgentState::Idle
+                                    } else {
+                                        AgentState::ExecutingTools { tool_uses, turn }
+                                    }
                                 }
                             }
                             // 流错误 / 空 assistant：已上报事件，本轮忽略
@@ -248,23 +319,34 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     }
                 }
                 AgentState::ExecutingTools { tool_uses, turn } => {
-                    let mut results = Vec::with_capacity(tool_uses.len());
                     for tool_use in &tool_uses {
                         self.emit(StreamEvent::ToolExecutionStarted {
                             tool_name: tool_use.name.clone(),
                             tool_input: tool_use.input.clone(),
                         });
-                        let outcome = self.dispatch_tool(tool_use).await;
+                    }
+                    let outcomes = self
+                        .tools
+                        .dispatch_many(
+                            &tool_uses,
+                            &self.config.cwd,
+                            &mut self.context.tool_metadata,
+                        )
+                        .await;
+                    let mut results = Vec::with_capacity(tool_uses.len());
+                    for (tool_use, outcome) in tool_uses.iter().zip(outcomes) {
                         self.emit(StreamEvent::ToolExecutionCompleted {
                             tool_name: tool_use.name.clone(),
                             output: outcome.output.clone(),
                             is_error: outcome.is_error,
+                            metadata: outcome.metadata.clone(),
                         });
                         // 拒绝/失败不中止循环：作为 is_error 的 tool_result 回填
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: tool_use.id.clone(),
                             content: outcome.output,
                             is_error: outcome.is_error,
+                            result_metadata: outcome.metadata,
                         });
                     }
                     // tool_result 以 user 消息回填，进入下一轮模型调用
@@ -275,12 +357,30 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     AgentState::Querying { turn: turn + 1 }
                 }
                 AgentState::Compacting { trigger } => {
-                    // context/compact 于后续 Phase 落地；当前占位直通
-                    self.emit(StreamEvent::CompactProgress {
-                        phase: "compact_failed".into(),
-                        trigger,
-                    });
-                    AgentState::Idle
+                    let mut payload = lifecycle_payload(HookEvent::PreCompact, &self.config.cwd);
+                    payload.insert(
+                        "trigger".into(),
+                        Value::String(format!("{trigger:?}").to_lowercase()),
+                    );
+                    if self.run_blocking_hook(HookEvent::PreCompact, payload).await {
+                        AgentState::Idle
+                    } else {
+                        // context/compact 于后续 Phase 落地；当前占位直通
+                        self.emit(StreamEvent::CompactProgress {
+                            phase: "compact_failed".into(),
+                            trigger,
+                        });
+                        let mut payload =
+                            lifecycle_payload(HookEvent::PostCompact, &self.config.cwd);
+                        payload.insert(
+                            "trigger".into(),
+                            Value::String(format!("{trigger:?}").to_lowercase()),
+                        );
+                        payload.insert("success".into(), Value::Bool(false));
+                        self.run_observational_hook(HookEvent::PostCompact, payload)
+                            .await;
+                        AgentState::Idle
+                    }
                 }
                 AgentState::Waiting => {
                     R::sleep(WAITING_SLEEP).await;
@@ -299,6 +399,32 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
             self.state = next;
         }
         Ok(())
+    }
+
+    async fn run_blocking_hook(&self, event: HookEvent, payload: Map<String, Value>) -> bool {
+        let Some(hooks) = self.tools.hooks().cloned() else {
+            return false;
+        };
+        let result = hooks.execute(event, &payload).await;
+        if !result.blocked() {
+            return false;
+        }
+        let reason = result.reason();
+        self.emit(StreamEvent::Error {
+            message: if reason.is_empty() {
+                format!("{} hook blocked the event", event.as_str())
+            } else {
+                reason
+            },
+            recoverable: true,
+        });
+        true
+    }
+
+    async fn run_observational_hook(&self, event: HookEvent, payload: Map<String, Value>) {
+        if let Some(hooks) = self.tools.hooks().cloned() {
+            let _ = hooks.execute(event, &payload).await;
+        }
     }
 
     /// 流式消费一个模型 turn：delta / retry 转 StreamEvent 推 UI，Complete 返回
@@ -367,35 +493,51 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
         Some((message, usage))
     }
 
-    /// 单个 tool_use 的分发：未知工具与执行异常均归一化为 is_error 的
-    /// ToolResult（对齐基线合成 error tool_result 语义）；pre/post_tool_use
-    /// hooks 与三态权限在 Phase 3 插入本路径。
-    async fn dispatch_tool(&mut self, tool_use: &ToolUse) -> ToolResult {
-        match self.tools.get(&tool_use.name) {
-            None => ToolResult::err(format!("Unknown tool: {}", tool_use.name)),
-            Some(tool) => {
-                let mut ctx = ToolContext {
-                    cwd: &self.config.cwd,
-                    metadata: &mut self.context.tool_metadata,
-                };
-                match tool.execute(tool_use.input.clone(), &mut ctx).await {
-                    Ok(result) => result,
-                    Err(error) => {
-                        ToolResult::err(format!("Tool {} failed: {error}", tool_use.name))
-                    }
-                }
-            }
-        }
-    }
-
     fn api_schemas(&self) -> Vec<ToolDef> {
-        self.tools.values().map(|tool| tool.definition()).collect()
+        self.tools.api_schemas()
     }
 
     fn emit(&self, event: StreamEvent) {
         // UI 侧关闭接收端不影响循环推进
         let _ = self.stream.unbounded_send(event);
     }
+}
+
+/// 在任何工具分发前校验整批协议 ID，保证 tool_result 可唯一回配。
+fn validate_tool_use_ids(tool_uses: &[ToolUse]) -> Result<(), &'static str> {
+    let mut seen = HashSet::with_capacity(tool_uses.len());
+    for tool_use in tool_uses {
+        if tool_use.id.trim().is_empty() {
+            return Err("tool_use IDs must not be empty or whitespace-only");
+        }
+        if !seen.insert(tool_use.id.as_str()) {
+            return Err("tool_use IDs must be unique within an assistant turn");
+        }
+    }
+    Ok(())
+}
+
+fn lifecycle_payload(event: HookEvent, cwd: &std::path::Path) -> Map<String, Value> {
+    let mut payload = Map::new();
+    payload.insert("event".into(), Value::String(event.as_str().into()));
+    payload.insert("cwd".into(), Value::String(cwd.display().to_string()));
+    payload
+}
+
+fn agent_event_hook_payload(event: &AgentEvent, cwd: &std::path::Path) -> Map<String, Value> {
+    let mut payload = lifecycle_payload(HookEvent::UserPromptSubmit, cwd);
+    if let AgentEvent::UserMessage {
+        content,
+        attachments,
+    } = event
+    {
+        payload.insert("prompt".into(), Value::String(content.clone()));
+        payload.insert(
+            "attachment_count".into(),
+            serde_json::json!(attachments.len()),
+        );
+    }
+    payload
 }
 
 /// 传输层错误的用户可读归一化（对齐基线网络启发式分类）。

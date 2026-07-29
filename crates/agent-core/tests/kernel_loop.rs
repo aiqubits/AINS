@@ -13,12 +13,15 @@ use serde_json::{Value, json};
 
 use agent_core::TokioRuntimeAdapter;
 use agent_core::error::ToolError;
+use agent_core::hooks::{
+    HookDefinition, HookEvent, HookExecutor, HookRegistry, PromptHookDefinition,
+};
 use agent_core::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AgentState, ContentBlock, ConversationMessage,
     Role, ScriptedModelClient, StreamEvent, SystemEventType,
 };
 use agent_core::model_client::{ModelStreamEvent, UsageSnapshot};
-use agent_core::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult};
+use agent_core::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult, ToolRuntime};
 
 struct EchoTool;
 
@@ -49,7 +52,11 @@ impl Tool for EchoTool {
             .as_str()
             .ok_or_else(|| ToolError::InvalidInput("missing `text`".into()))?;
         ctx.metadata.append_work_log(format!("echo: {text}"));
-        Ok(ToolResult::ok(format!("echo: {text}")))
+        Ok(ToolResult {
+            output: format!("echo: {text}"),
+            is_error: false,
+            metadata: json!({"echo_length": text.len()}),
+        })
     }
 
     fn category(&self) -> ToolCategory {
@@ -69,6 +76,10 @@ impl Tool for FailingTool {
         }
     }
 
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         _input: Value,
@@ -80,6 +91,123 @@ impl Tool for FailingTool {
     fn category(&self) -> ToolCategory {
         ToolCategory::Compute
     }
+}
+
+/// 只用于验证协议校验一定发生在工具分发之前。
+struct SideEffectTool {
+    executions: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for SideEffectTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "side_effect".into(),
+            description: "increments an execution counter".into(),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        _input: Value,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        self.executions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ToolResult::ok("executed"))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Compute
+    }
+}
+
+struct OverlapTool {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    max_in_flight: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl Tool for OverlapTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "overlap".into(),
+            description: "records whether calls overlap".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"label": {"type": "string"}},
+                "required": ["label"]
+            }),
+        }
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        input: Value,
+        ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        use std::sync::atomic::Ordering;
+
+        let label = input["label"].as_str().unwrap_or_default().to_string();
+        let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(current, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        ctx.metadata.append_work_log(format!("overlap: {label}"));
+        Ok(ToolResult::ok(label))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::Compute
+    }
+}
+
+#[tokio::test]
+async fn default_constructor_denies_mutating_tools_without_permission_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("must-not-exist.txt");
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(
+                None,
+                "tu_write",
+                "write_file",
+                json!({"path": target, "content": "blocked"}),
+            ),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("write was blocked", usage()),
+    ]));
+    let (_kernel, events) = run_kernel(
+        model,
+        vec![Box::new(agent_core::tools::filesystem::FileWriteTool)],
+        AgentKernelConfig {
+            cwd: dir.path().to_path_buf(),
+            ..test_config()
+        },
+        vec![user_message("write a file")],
+    )
+    .await;
+
+    assert!(!target.exists(), "safe constructor must not execute writes");
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::ToolExecutionCompleted {
+            tool_name,
+            output,
+            is_error: true,
+            ..
+        } if tool_name == "write_file" && output.contains("require user confirmation")
+    )));
 }
 
 fn usage() -> UsageSnapshot {
@@ -190,8 +318,10 @@ async fn tool_loop_executes_and_backfills_tool_result() {
     assert_eq!(completed.len(), 1);
     assert!(matches!(
         completed[0],
-        StreamEvent::ToolExecutionCompleted { output, is_error, .. }
-            if output == "echo: ping" && !is_error
+        StreamEvent::ToolExecutionCompleted { output, is_error, metadata, .. }
+            if output == "echo: ping"
+                && !is_error
+                && metadata == &json!({"echo_length": 4})
     ));
 
     // user / assistant+tool_use / user+tool_result / assistant（对齐基线 len==4）
@@ -200,8 +330,11 @@ async fn tool_loop_executes_and_backfills_tool_result() {
     assert_eq!(conversation[2].role, Role::User);
     assert!(matches!(
         &conversation[2].content[0],
-        ContentBlock::ToolResult { tool_use_id, content, is_error }
-            if tool_use_id == "toolu_1" && content == "echo: ping" && !is_error
+        ContentBlock::ToolResult { tool_use_id, content, is_error, result_metadata }
+            if tool_use_id == "toolu_1"
+                && content == "echo: ping"
+                && !is_error
+                && result_metadata == &json!({"echo_length": 4})
     ));
     // 第二次模型请求携带了回填的 tool_result
     let requests = model.recorded_requests();
@@ -273,7 +406,7 @@ async fn unknown_tool_returns_error_result() {
     assert_eq!(conversation[2].role, Role::User);
     assert!(matches!(
         &conversation[2].content[0],
-        ContentBlock::ToolResult { tool_use_id, content, is_error: true }
+        ContentBlock::ToolResult { tool_use_id, content, is_error: true, .. }
             if tool_use_id == "toolu_1" && content == "Unknown tool: ghost"
     ));
 }
@@ -438,6 +571,7 @@ async fn continue_pending_resumes_tool_loop_without_new_user_message() {
                 tool_use_id: "toolu_1".into(),
                 content: "echo: x".into(),
                 is_error: false,
+                result_metadata: Value::Null,
             }],
         },
     ];
@@ -480,6 +614,7 @@ fn has_pending_continuation_returns_false_without_preceding_assistant() {
                 tool_use_id: "orphan".into(),
                 content: "无配对 result".into(),
                 is_error: false,
+                result_metadata: Value::Null,
             }],
         },
     ];
@@ -556,9 +691,118 @@ async fn startup_event_transitions_to_idle() {
 }
 
 #[tokio::test]
-async fn multi_tool_use_executed_sequentially_and_aggregated_into_single_message() {
-    // 单轮 assistant 消息携带两个 tool_use → 顺序执行 → 结果聚合成一条
-    // user 消息（event_loop.rs:229-254），这是与基线并行 gather 的偏差点。
+async fn lifecycle_hooks_fire_for_start_prompt_stop_and_end() {
+    let mut registry = HookRegistry::new();
+    for event in [
+        HookEvent::SessionStart,
+        HookEvent::UserPromptSubmit,
+        HookEvent::Stop,
+        HookEvent::SessionEnd,
+    ] {
+        registry.register(
+            event,
+            HookDefinition::Prompt(PromptHookDefinition {
+                prompt: "$ARGUMENTS".into(),
+                model: None,
+                timeout_seconds: 5,
+                matcher: None,
+                block_on_failure: true,
+                priority: 0,
+            }),
+        );
+    }
+    let hook_model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+    ]));
+    let hooks = Arc::new(
+        HookExecutor::new(registry, std::env::temp_dir())
+            .with_model(Arc::clone(&hook_model) as Arc<_>, None),
+    );
+    let runtime = ToolRuntime::new().with_hooks(hooks);
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let (mut kernel, mut event_tx, _stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(model, runtime, test_config());
+    event_tx
+        .try_send(AgentEvent::SystemEvent {
+            event_type: SystemEventType::Startup,
+        })
+        .unwrap();
+    event_tx.try_send(user_message("hello")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    let requests = hook_model.recorded_requests();
+    assert_eq!(requests.len(), 4);
+    let prompts: Vec<String> = requests
+        .iter()
+        .map(|request| request.messages[0].text())
+        .collect();
+    for event in ["session_start", "user_prompt_submit", "stop", "session_end"] {
+        assert!(
+            prompts.iter().any(|prompt| prompt.contains(event)),
+            "{prompts:?}"
+        );
+    }
+    assert!(prompts.iter().all(|prompt| prompt.contains("\"cwd\"")));
+    let stop_payload = prompts
+        .iter()
+        .find(|prompt| prompt.contains("\"event\":\"stop\""))
+        .expect("stop hook payload");
+    assert!(stop_payload.contains("\"stop_reason\":\"tool_uses_empty\""));
+}
+
+#[tokio::test]
+async fn user_prompt_hook_blocks_before_context_and_model() {
+    let mut registry = HookRegistry::new();
+    registry.register(
+        HookEvent::UserPromptSubmit,
+        HookDefinition::Prompt(PromptHookDefinition {
+            prompt: "$ARGUMENTS".into(),
+            model: None,
+            timeout_seconds: 5,
+            matcher: None,
+            block_on_failure: true,
+            priority: 0,
+        }),
+    );
+    let hook_model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn(r#"{"ok":false,"reason":"blocked prompt"}"#, usage()),
+    ]));
+    let hooks = Arc::new(
+        HookExecutor::new(registry, std::env::temp_dir())
+            .with_model(Arc::clone(&hook_model) as Arc<_>, None),
+    );
+    let runtime = ToolRuntime::new().with_hooks(hooks);
+    let model = Arc::new(ScriptedModelClient::new(vec![]));
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+            Arc::clone(&model) as Arc<_>,
+            runtime,
+            test_config(),
+        );
+    event_tx.try_send(user_message("secret")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    assert!(kernel.context().conversation.is_empty());
+    assert!(model.recorded_requests().is_empty());
+    assert!(matches!(
+        stream_rx.try_recv(),
+        Ok(StreamEvent::Error { message, recoverable: true }) if message == "blocked prompt"
+    ));
+}
+
+#[tokio::test]
+async fn multi_tool_use_executes_concurrently_and_aggregates_in_original_order() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 单轮 assistant 消息携带两个 tool_use → 并发执行 → 结果按原始顺序
+    // 聚合成一条 user 消息（对齐 OpenHarness gather 语义）。
     let assistant = ConversationMessage {
         role: Role::Assistant,
         content: vec![
@@ -567,13 +811,13 @@ async fn multi_tool_use_executed_sequentially_and_aggregated_into_single_message
             },
             ContentBlock::ToolUse {
                 id: "toolu_1".into(),
-                name: "echo".into(),
-                input: json!({"text": "hello"}),
+                name: "overlap".into(),
+                input: json!({"label": "hello"}),
             },
             ContentBlock::ToolUse {
                 id: "toolu_2".into(),
-                name: "echo".into(),
-                input: json!({"text": "world"}),
+                name: "overlap".into(),
+                input: json!({"label": "world"}),
             },
         ],
     };
@@ -581,9 +825,14 @@ async fn multi_tool_use_executed_sequentially_and_aggregated_into_single_message
         ScriptedModelClient::turn(assistant.clone(), usage()),
         ScriptedModelClient::text_turn("两个工具都跑完了", usage()),
     ]));
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
     let (kernel, events) = run_kernel(
         model,
-        vec![Box::new(EchoTool)],
+        vec![Box::new(OverlapTool {
+            in_flight,
+            max_in_flight: Arc::clone(&max_in_flight),
+        })],
         test_config(),
         vec![user_message("run both")],
     )
@@ -603,17 +852,18 @@ async fn multi_tool_use_executed_sequentially_and_aggregated_into_single_message
     assert_eq!(
         started[0],
         &StreamEvent::ToolExecutionStarted {
-            tool_name: "echo".into(),
-            tool_input: json!({"text": "hello"}),
+            tool_name: "overlap".into(),
+            tool_input: json!({"label": "hello"}),
         }
     );
     assert_eq!(
         started[1],
         &StreamEvent::ToolExecutionStarted {
-            tool_name: "echo".into(),
-            tool_input: json!({"text": "world"}),
+            tool_name: "overlap".into(),
+            tool_input: json!({"label": "world"}),
         }
     );
+    assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
 
     // 会话结构：user / assistant(含 tool_use) / user(聚合两个 tool_result) / assistant
     let conversation = &kernel.context().conversation;
@@ -623,11 +873,120 @@ async fn multi_tool_use_executed_sequentially_and_aggregated_into_single_message
     assert_eq!(results_msg.role, Role::User);
     assert_eq!(results_msg.content.len(), 2);
     assert!(matches!(&results_msg.content[0], ContentBlock::ToolResult {
-        tool_use_id, content, is_error: false
-    } if tool_use_id == "toolu_1" && content == "echo: hello"));
+        tool_use_id, content, is_error: false, ..
+    } if tool_use_id == "toolu_1" && content == "hello"));
     assert!(matches!(&results_msg.content[1], ContentBlock::ToolResult {
-        tool_use_id, content, is_error: false
-    } if tool_use_id == "toolu_2" && content == "echo: world"));
+        tool_use_id, content, is_error: false, ..
+    } if tool_use_id == "toolu_2" && content == "world"));
+    assert_eq!(
+        kernel.context().tool_metadata.work_log,
+        vec!["overlap: hello", "overlap: world"]
+    );
+}
+
+async fn assert_invalid_tool_use_batch_is_rejected(ids: &[&str], expected_reason: &str) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let assistant = ConversationMessage {
+        role: Role::Assistant,
+        content: ids
+            .iter()
+            .map(|id| ContentBlock::ToolUse {
+                id: (*id).into(),
+                name: "side_effect".into(),
+                input: json!({}),
+            })
+            .collect(),
+    };
+    let model = Arc::new(ScriptedModelClient::new(vec![ScriptedModelClient::turn(
+        assistant,
+        usage(),
+    )]));
+    let executions = Arc::new(AtomicUsize::new(0));
+    let (kernel, events) = run_kernel(
+        Arc::clone(&model),
+        vec![Box::new(SideEffectTool {
+            executions: Arc::clone(&executions),
+        })],
+        test_config(),
+        vec![user_message("run malformed batch")],
+    )
+    .await;
+
+    assert_eq!(
+        executions.load(Ordering::SeqCst),
+        0,
+        "no tool in an invalid batch may execute"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event,
+        StreamEvent::ToolExecutionStarted { .. }
+            | StreamEvent::ToolExecutionCompleted { .. }
+            | StreamEvent::AssistantTurnComplete { .. }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::Error {
+            message,
+            recoverable: true,
+        } if message.contains("invalid tool_use batch") && message.contains(expected_reason)
+    )));
+    assert_eq!(
+        kernel.context().conversation.len(),
+        1,
+        "the malformed assistant turn must not leave a dangling tool_use"
+    );
+    assert_eq!(model.recorded_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn duplicate_tool_use_ids_reject_entire_batch_before_dispatch() {
+    assert_invalid_tool_use_batch_is_rejected(&["duplicate", "duplicate"], "must be unique").await;
+}
+
+#[tokio::test]
+async fn empty_tool_use_ids_reject_entire_batch_before_dispatch() {
+    assert_invalid_tool_use_batch_is_rejected(&["valid-sibling", ""], "must not be empty").await;
+    assert_invalid_tool_use_batch_is_rejected(&["valid-sibling", " \t"], "must not be empty").await;
+}
+
+#[tokio::test]
+async fn failing_tool_in_parallel_batch_does_not_drop_sibling_result() {
+    let assistant = ConversationMessage {
+        role: Role::Assistant,
+        content: vec![
+            ContentBlock::ToolUse {
+                id: "toolu_fail".into(),
+                name: "boom".into(),
+                input: json!({}),
+            },
+            ContentBlock::ToolUse {
+                id: "toolu_ok".into(),
+                name: "echo".into(),
+                input: json!({"text": "survived"}),
+            },
+        ],
+    };
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(assistant, usage()),
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let (kernel, _) = run_kernel(
+        model,
+        vec![Box::new(FailingTool), Box::new(EchoTool)],
+        test_config(),
+        vec![user_message("run both")],
+    )
+    .await;
+
+    let results = &kernel.context().conversation[2].content;
+    assert_eq!(results.len(), 2);
+    assert!(matches!(&results[0], ContentBlock::ToolResult {
+        tool_use_id, is_error: true, ..
+    } if tool_use_id == "toolu_fail"));
+    assert!(matches!(&results[1], ContentBlock::ToolResult {
+        tool_use_id, content, is_error: false, ..
+    } if tool_use_id == "toolu_ok" && content == "echo: survived"));
 }
 
 #[tokio::test]
@@ -792,6 +1151,7 @@ async fn continuation_resets_turn_counter_after_prepare_continuation() {
                 tool_use_id: "toolu_1".into(),
                 content: "echo: ok".into(),
                 is_error: false,
+                result_metadata: Value::Null,
             }],
         },
     ];

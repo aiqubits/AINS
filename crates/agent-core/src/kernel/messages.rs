@@ -28,6 +28,9 @@ pub enum ContentBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
+        /// 工具特定的结构化结果（对齐 OpenHarness `result_metadata`）。
+        #[serde(default)]
+        result_metadata: Value,
     },
 }
 
@@ -241,6 +244,7 @@ mod tests {
                 tool_use_id: "toolu_1".into(),
                 content: "ok".into(),
                 is_error: false,
+                result_metadata: Value::Null,
             }
         );
     }
@@ -267,6 +271,7 @@ mod tests {
                 tool_use_id: id.into(),
                 content: "ok".into(),
                 is_error: false,
+                result_metadata: Value::Null,
             }],
         }
     }
@@ -349,6 +354,7 @@ mod tests {
                         tool_use_id: "toolu_ghost".into(),
                         content: "orphan".into(),
                         is_error: false,
+                        result_metadata: Value::Null,
                     },
                     ContentBlock::Text {
                         text: "still here".into(),
@@ -381,11 +387,13 @@ mod tests {
                     tool_use_id: "toolu_1".into(),
                     content: "ok".into(),
                     is_error: false,
+                    result_metadata: Value::Null,
                 },
                 ContentBlock::ToolResult {
                     tool_use_id: "toolu_extra".into(),
                     content: "extra".into(),
                     is_error: false,
+                    result_metadata: Value::Null,
                 },
             ],
         };

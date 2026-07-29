@@ -1,8 +1,22 @@
 //! Tool Runtime 统一抽象（对齐 OpenHarness `tools/base.py`）。
 //!
 //! 所有工具（本地 / 远程 MCP / AgentInternal）实现同一 `Tool` trait，经统一
-//! 注册表 + 三态权限 + hooks 分发，Kernel 不感知工具来源；注册表、权限引擎与
-//! hooks 在 Phase 3 落地。
+//! 注册表（`runtime::ToolRuntime`）+ 三态权限（`policy`）+ hooks（`hooks`）
+//! 分发，Kernel 不感知工具来源。
+
+pub mod compute;
+pub mod interact;
+pub mod mcp;
+pub mod network;
+pub mod outputs;
+pub mod runtime;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod filesystem;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod system;
+
+pub use runtime::ToolRuntime;
 
 use std::path::Path;
 
@@ -59,6 +73,10 @@ pub struct ToolMetadata {
     pub invoked_skills: Vec<String>,
     pub user_goal: Option<String>,
     pub work_log: Vec<String>,
+    /// 超长工具输出外置后的活跃工件引用（对齐基线
+    /// `_remember_active_artifact` 的独立记录，不占 work_log 配额）。
+    #[serde(default)]
+    pub active_artifacts: Vec<String>,
     /// 工具自定义键值（无固定 schema，不参与条数上限治理）。
     #[serde(default)]
     pub extra: serde_json::Map<String, Value>,
@@ -86,6 +104,12 @@ impl ToolMetadata {
     /// 追加工作日志条目：capped-unique，保留最近条目。
     pub fn append_work_log(&mut self, entry: impl Into<String>) {
         Self::push_capped_unique(&mut self.work_log, entry.into());
+    }
+
+    /// 记录活跃工件引用：capped-unique，独立于 work_log（review 二轮修复：
+    /// 工件引用不得挤占真实工作日志的 50 条配额）。
+    pub fn record_active_artifact(&mut self, reference: impl Into<String>) {
+        Self::push_capped_unique(&mut self.active_artifacts, reference.into());
     }
 
     fn push_capped_unique(list: &mut Vec<String>, value: String) {
@@ -128,6 +152,14 @@ pub trait Tool: MaybeSendSync {
     /// 由 PermissionChecker 结合 PermissionMode 决策（基线默认 `false`）。
     fn is_read_only(&self, _input: &Value) -> bool {
         false
+    }
+
+    /// 返回必须按调用顺序独占执行的逻辑资源键。一个 assistant turn 中若
+    /// 多个工具声明同一键，Runtime 会回退为共享 metadata 的顺序分发，避免
+    /// 基于同一快照的 read-modify-write 丢失更新。路径类资源键必须用
+    /// `cwd` 锚定后的规范路径，否则相对/绝对路径别名会绕过冲突检测。
+    fn exclusive_execution_key(&self, _input: &Value, _cwd: &Path) -> Option<String> {
+        None
     }
 
     async fn execute(

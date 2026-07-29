@@ -269,3 +269,16 @@ jobs:
     # IndexedDB 等浏览器环境测试仅在 CI 执行（AINS_PLAN Phase 0.5）
     - name: Run wasm tests (headless Chrome)
       run: wasm-pack test --headless --chrome crates/agent-core
+
+  # ========================================
+  # Security - dependency vulnerability audit
+  # ========================================
+  security-audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    # 扫描 Cargo.lock 已知 RUSTSEC 漏洞；豁免项及论证见 .cargo/audit.toml
+    - name: Cargo audit
+      uses: rustsec/audit-check@v2
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}

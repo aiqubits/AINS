@@ -170,6 +170,53 @@ pub fn extract_pdf_text(_bytes: &[u8]) -> Result<String, MemoryError> {
 mod tests {
     use super::{DocumentKind, MAX_CHUNK_CHARS, chunk_document};
 
+    /// 构造最小单页 PDF（Helvetica 单段文本，xref 偏移运行时计算）。
+    #[cfg(not(target_arch = "wasm32"))]
+    fn build_minimal_pdf(text: &str) -> Vec<u8> {
+        let stream = format!("BT /F1 24 Tf 72 720 Td ({text}) Tj ET");
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R \
+             /Resources << /Font << /F1 5 0 R >> >> >>"
+                .to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        let mut pdf = b"%PDF-1.4\n".to_vec();
+        let mut offsets = Vec::new();
+        for (index, body) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.extend(format!("{} 0 obj\n{body}\nendobj\n", index + 1).into_bytes());
+        }
+        let xref_offset = pdf.len();
+        let mut xref = String::from("xref\n0 6\n0000000000 65535 f \n");
+        for offset in &offsets {
+            xref.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.extend(xref.into_bytes());
+        pdf.extend(
+            format!("trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF")
+                .into_bytes(),
+        );
+        pdf
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn pdf_extraction_roundtrip_minimal_document() {
+        // pdf-extract 0.7→0.12（lopdf 0.42，RUSTSEC-2026-0187 修复）升级回归：
+        // 最小单页 PDF 的文本提取行为不得回退。
+        let pdf = build_minimal_pdf("Hello AINS");
+        let text = super::extract_pdf_text(&pdf).unwrap();
+        assert!(text.contains("Hello AINS"), "extracted: {text:?}");
+        // 损坏输入：错误传导为 MemoryError，不得 panic
+        assert!(super::extract_pdf_text(b"%PDF-1.4 broken").is_err());
+    }
+
     #[test]
     fn kind_from_name_by_extension() {
         assert_eq!(DocumentKind::from_name("a.md"), DocumentKind::Markdown);

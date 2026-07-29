@@ -25,6 +25,8 @@ bincode = "1"
 sha2 = "0.10"
 # DocumentStore Markdown 按标题层级切分（跨平台）
 pulldown-cmark = "0.10"
+# Network Tool URL 解析与 SSRF 防护（tools/network.rs，双 target）
+url = "2"
 
 # ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
 
@@ -36,9 +38,18 @@ redb = "2"
 # 供 memory/vector_native.rs 使用：HNSW 近似检索仅 Native（见 AINS_PLAN 4.2）
 hnsw_rs = "0.3"
 # 供 memory/parser.rs 使用：PDF 文本提取仅 Native（见 AINS_PLAN 4.3）
-pdf-extract = "0.7"
+pdf-extract = "0.12"
+# 供 tools/network.rs / tools/mcp.rs 使用：Native HTTP 客户端（重定向手动逐跳复检）
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# 供 tools/filesystem.rs grep 使用：正则内容检索（对齐 grep_tool.py 纯 Python 回退路径）
+regex = "1"
+# 供 tools/filesystem.rs glob/grep 使用：尊重 .gitignore 的目录遍历（对齐 rg --files 语义）
+ignore = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# 供 tools/mcp.rs 使用：浏览器 streamable-http 后端。web_fetch 在 Web 端
+# 因无法可靠校验 DNS/重定向目标而 fail-closed。
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 # 供 runtime_web.rs（WasmRuntimeAdapter）与 memory/kv_web.rs（IndexedDbKvStore）使用
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

@@ -1,0 +1,14 @@
+# cargo-audit 配置（cargo audit 自动读取 .cargo/audit.toml）
+#
+# 豁免清单——每条必须附论证与回收条件，禁止无理由静默豁免。
+
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa 0.9.x Marvin Attack（RSA 私钥时序侧信道）。
+    # 论证：rsa 仅经 sqlx-mysql 进入 Cargo.lock；本项目 sea-orm 只启用
+    # sqlx-postgres feature，sqlx-mysql/rsa 不进入任何编译目标
+    # （`cargo tree -i rsa` 在默认 target 下无结果），运行时不存在攻击面。
+    # 上游至今无修复版本（无 fixed release）。
+    # 回收条件：若未来启用 MySQL 后端，或 rsa 发布修复版，移除本条并升级。
+    "RUSTSEC-2023-0071",
+]

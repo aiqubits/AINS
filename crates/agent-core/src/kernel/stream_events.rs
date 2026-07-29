@@ -20,12 +20,12 @@ pub enum StreamEvent {
         tool_name: String,
         tool_input: Value,
     },
-    /// 工具执行结束（基线 ToolExecutionCompleted；metadata 字段随 Phase 3 工具
-    /// 输出预算引入）。
+    /// 工具执行结束（对齐基线 ToolExecutionCompleted）。
     ToolExecutionCompleted {
         tool_name: String,
         output: String,
         is_error: bool,
+        metadata: Value,
     },
     /// 错误上报（基线 ErrorEvent）；`recoverable = false` 表示会话已不可续。
     Error { message: String, recoverable: bool },

@@ -692,15 +692,86 @@ pub fn parse_iso_utc(text: &str) -> Option<i64> {
     let text = text.trim().strip_suffix('Z')?;
     let (date, time) = text.split_once('T')?;
     let mut date_parts = date.split('-');
-    let y: i64 = date_parts.next()?.parse().ok()?;
-    let m: i64 = date_parts.next()?.parse().ok()?;
-    let d: i64 = date_parts.next()?.parse().ok()?;
+    let year_text = date_parts.next()?;
+    let month_text = date_parts.next()?;
+    let day_text = date_parts.next()?;
+    if date_parts.next().is_some()
+        || !is_fixed_ascii_digits(year_text, 4)
+        || !is_fixed_ascii_digits(month_text, 2)
+        || !is_fixed_ascii_digits(day_text, 2)
+    {
+        return None;
+    }
+    let y: i64 = year_text.parse().ok()?;
+    let m: u32 = month_text.parse().ok()?;
+    let d: u32 = day_text.parse().ok()?;
+    if !(1..=12).contains(&m) {
+        return None;
+    }
+    let max_day = days_in_month(y, m);
+    if !(1..=max_day).contains(&d) {
+        return None;
+    }
     let mut time_parts = time.split(':');
-    let h: i64 = time_parts.next()?.parse().ok()?;
-    let mi: i64 = time_parts.next()?.parse().ok()?;
-    let s: f64 = time_parts.next()?.parse().ok()?;
-    let days = days_from_civil(y, m as u32, d as u32);
-    Some((days * 86_400 + h * 3600 + mi * 60) * 1000 + (s * 1000.0) as i64)
+    let hour_text = time_parts.next()?;
+    let minute_text = time_parts.next()?;
+    let second_text = time_parts.next()?;
+    if time_parts.next().is_some()
+        || !is_fixed_ascii_digits(hour_text, 2)
+        || !is_fixed_ascii_digits(minute_text, 2)
+    {
+        return None;
+    }
+    let h: i64 = hour_text.parse().ok()?;
+    let mi: i64 = minute_text.parse().ok()?;
+    let (whole_second_text, fraction_text) = match second_text.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (second_text, None),
+    };
+    if !is_fixed_ascii_digits(whole_second_text, 2)
+        || fraction_text.is_some_and(|fraction| {
+            fraction.is_empty()
+                || fraction.len() > 3
+                || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&mi)
+    {
+        return None;
+    }
+    let s: i64 = whole_second_text.parse().ok()?;
+    if !(0..=59).contains(&s) {
+        return None;
+    }
+    let fractional_ms = match fraction_text {
+        Some(fraction) => fraction.parse::<i64>().ok()? * 10i64.pow(3 - fraction.len() as u32),
+        None => 0,
+    };
+    let days = days_from_civil(y, m, d);
+    let whole_seconds = days
+        .checked_mul(86_400)?
+        .checked_add(h.checked_mul(3600)?)?
+        .checked_add(mi.checked_mul(60)?)?
+        .checked_add(s)?;
+    whole_seconds.checked_mul(1000)?.checked_add(fractional_ms)
+}
+
+fn is_fixed_ascii_digits(text: &str, length: usize) -> bool {
+    text.len() == length && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year.rem_euclid(400) == 0
+            || (year.rem_euclid(4) == 0 && year.rem_euclid(100) != 0) =>
+        {
+            29
+        }
+        2 => 28,
+        _ => 0,
+    }
 }
 
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -745,6 +816,7 @@ mod tests {
         assert_eq!(format_iso_utc(-1_000), "1969-12-31T23:59:59Z");
 
         assert_eq!(parse_iso_utc("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(parse_iso_utc("1970-01-01T00:00:00.123Z"), Some(123));
         assert_eq!(parse_iso_utc("2000-02-29T00:00:00Z"), Some(951_782_400_000));
     }
 
@@ -775,6 +847,20 @@ mod tests {
             "2020-02-29",
             "2020-02-29 12:34:56Z",
             "2020-02-29T12:34:56",
+            "2021-02-29T12:34:56Z",
+            "2020-00-01T00:00:00Z",
+            "2020-13-01T00:00:00Z",
+            "2020-01-00T00:00:00Z",
+            "2020-01-01T24:00:00Z",
+            "2020-01-01T00:60:00Z",
+            "2020-01-01T00:00:60Z",
+            "20-01-01T00:00:00Z",
+            "2020-1-01T00:00:00Z",
+            "2020-01-01T0:00:00Z",
+            "2020-01-01T00:00:1e1Z",
+            "2020-01-01T00:00:00.1234Z",
+            "2020-01-01T00:00:00:extraZ",
+            "10000-01-01T00:00:00Z",
             "not-a-date",
         ] {
             assert_eq!(parse_iso_utc(bad), None, "should reject {bad:?}");

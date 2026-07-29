@@ -526,10 +526,12 @@ fn image_and_tool_result_blocks_wire_shape() {
         tool_use_id: "toolu_1".into(),
         content: "boom".into(),
         is_error: true,
+        result_metadata: json!({"returncode": 1}),
     };
     let value = serde_json::to_value(&tool_result).unwrap();
     assert_eq!(value["type"], "tool_result");
     assert_eq!(value["is_error"], json!(true));
+    assert_eq!(value["result_metadata"], json!({"returncode": 1}));
     assert_eq!(
         serde_json::from_value::<ContentBlock>(value).unwrap(),
         tool_result
