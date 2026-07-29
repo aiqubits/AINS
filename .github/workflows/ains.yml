@@ -275,6 +275,10 @@ jobs:
   # ========================================
   security-audit:
     runs-on: ubuntu-latest
+    # audit-check 需要通过 Checks API 创建 Check Run 展示审计结果
+    permissions:
+      contents: read
+      checks: write
     steps:
     - uses: actions/checkout@v4
     # 扫描 Cargo.lock 已知 RUSTSEC 漏洞；豁免项及论证见 .cargo/audit.toml
