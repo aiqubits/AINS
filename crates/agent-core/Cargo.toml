@@ -15,19 +15,31 @@ serde_yaml = "0.9"
 async-trait.workspace = true
 thiserror.workspace = true
 futures.workspace = true
+# 索引加载跳过损坏行等静默降级路径的可观测性（facade，双 target）
+tracing.workspace = true
 # ContextStore 图片附件 → Image content block 的 base64 编码（纯 Rust，双 target）
 base64 = "0.22"
+# 记忆存储信封（TTL + JSON 载荷）的二进制序列化（跨平台，见 AINS_PLAN 附录 A）
+bincode = "1"
+# 记忆去重签名 / memdir 条目 ID（sha256，跨平台）
+sha2 = "0.10"
+# DocumentStore Markdown 按标题层级切分（跨平台）
+pulldown-cmark = "0.10"
 
 # ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
-# redb / hnsw_rs 等存储实现依赖在 Phase 2 引入（Phase 0 仅定义 trait，偏差记录于
-# docs/alignment/phase0-core-traits.md）
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # 供 runtime_native.rs（TokioRuntimeAdapter）使用
 tokio.workspace = true
+# 供 memory/kv_native.rs（RedbKvStore）使用
+redb = "2"
+# 供 memory/vector_native.rs 使用：HNSW 近似检索仅 Native（见 AINS_PLAN 4.2）
+hnsw_rs = "0.3"
+# 供 memory/parser.rs 使用：PDF 文本提取仅 Native（见 AINS_PLAN 4.3）
+pdf-extract = "0.7"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-# 供 runtime_web.rs（WasmRuntimeAdapter）与 IndexedDB 可行性验证使用
+# 供 runtime_web.rs（WasmRuntimeAdapter）与 memory/kv_web.rs（IndexedDbKvStore）使用
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
@@ -42,7 +54,12 @@ web-sys = { version = "0.3", features = [
     "IdbTransaction",
     "IdbTransactionMode",
     "IdbRequest",
+    "IdbKeyRange",
 ] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Phase 2 记忆系统集成测试：redb 临时数据库目录
+tempfile = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

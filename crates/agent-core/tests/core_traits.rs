@@ -370,10 +370,9 @@ impl VectorIndexManager for MapIndexManager {
     }
 
     async fn remove_index(&mut self, namespace: MemoryNamespace) -> Result<(), MemoryError> {
-        self.indexes
-            .remove(&namespace)
-            .map(|_| ())
-            .ok_or(MemoryError::NamespaceNotFound(namespace))
+        // 契约要求幂等（ensure-absent）
+        self.indexes.remove(&namespace);
+        Ok(())
     }
 }
 

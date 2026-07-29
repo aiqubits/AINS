@@ -16,5 +16,5 @@ pub trait RuntimeAdapter {
         F: Future<Output = ()> + MaybeSend + 'static;
 
     /// 平台无阻塞休眠。
-    fn sleep(duration: Duration) -> impl Future<Output = ()>;
+    fn sleep(duration: Duration) -> impl Future<Output = ()> + MaybeSend;
 }
