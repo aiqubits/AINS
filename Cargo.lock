@@ -56,9 +56,11 @@ dependencies = [
 name = "agent-core"
 version = "0.1.0"
 dependencies = [
+ "async-stream",
  "async-trait",
  "base64",
  "bincode",
+ "client-api",
  "futures",
  "hnsw_rs",
  "ignore",
@@ -81,6 +83,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "wiremock",
 ]
 
 [[package]]
@@ -1140,7 +1143,10 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 name = "client-api"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "bytes",
  "chrono",
+ "futures",
  "gloo-timers",
  "reqwest 0.12.28",
  "serde",

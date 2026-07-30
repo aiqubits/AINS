@@ -249,6 +249,28 @@ pub fn humanize_error(err: &ClientError, ctx: ErrorContext, lang: Language) -> S
                 },
             }
         }
+        ClientError::Api {
+            status,
+            code,
+            message,
+        } => {
+            // AI 网关失败信封：优先复用购买链路共享错误码文案（如 no_active_plan），
+            // 否则按语言给出带状态码/消息的通用提示。
+            if let Some(shared) = purchase_code_message(code, lang) {
+                shared
+            } else {
+                match lang {
+                    Language::En if message.is_empty() => {
+                        format!("AI request failed (HTTP {status}) [{code}]")
+                    }
+                    Language::En => format!("AI request failed (HTTP {status}): {message}"),
+                    Language::Zh if message.is_empty() => {
+                        format!("AI 请求失败 (HTTP {status}) [{code}]")
+                    }
+                    Language::Zh => format!("AI 请求失败 (HTTP {status}): {message}"),
+                }
+            }
+        }
         ClientError::RateLimited(_) => match lang {
             Language::En => "Too many requests, please try again later".to_string(),
             Language::Zh => "请求过于频繁，请稍后再试".to_string(),
@@ -388,6 +410,41 @@ mod tests {
         let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
         let msg = humanize_error(&err, ErrorContext::Auth, Language::En);
         assert_eq!(msg, "Invalid email or password");
+    }
+
+    // ── humanize_error: AI 网关 (ClientError::Api) ────
+
+    #[test]
+    fn humanize_api_error_known_code_localized() {
+        let err = ClientError::Api {
+            status: 403,
+            code: "no_active_plan".into(),
+            message: "No active plan with remaining calls".into(),
+        };
+        // 复用购买链路共享错误码文案（不受 ctx 影响）
+        assert_eq!(
+            humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh),
+            "没有可用套餐或套餐次数已用尽"
+        );
+        assert_eq!(
+            humanize_error(&err, ErrorContext::Auth, Language::En),
+            "No active plan with remaining calls"
+        );
+    }
+
+    #[test]
+    fn humanize_api_error_unknown_code_generic() {
+        let err = ClientError::Api {
+            status: 502,
+            code: "upstream_rejected".into(),
+            message: "AI provider rejected the request".into(),
+        };
+        let zh = humanize_error(&err, ErrorContext::Auth, Language::Zh);
+        assert!(zh.contains("AI 请求失败"));
+        assert!(zh.contains("502"));
+        let en = humanize_error(&err, ErrorContext::Auth, Language::En);
+        assert!(en.contains("AI request failed"));
+        assert!(en.contains("provider rejected"));
     }
 
     #[test]

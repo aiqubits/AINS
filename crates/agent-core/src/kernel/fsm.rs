@@ -10,8 +10,9 @@ use crate::kernel::state::StateKind;
 
 /// 判定 `from → to` 是否为 Agent Loop 状态图中的合法转换。
 ///
-/// 终态（Completed / Failed）无出边；`Compacting → Idle` 为 Phase 1 占位
-/// 出口（压缩实现落地后收敛为 `Compacting → Querying`）。
+/// 终态（Completed / Failed）无出边；`Compacting → Querying` 为压缩成功
+/// 主出边（Phase 5.5 已落地），`Compacting → Idle` 为 PreCompact hook 阻断
+/// 或未发生压缩时的回退出口。
 pub fn is_valid_transition(from: StateKind, to: StateKind) -> bool {
     use StateKind::*;
     match from {

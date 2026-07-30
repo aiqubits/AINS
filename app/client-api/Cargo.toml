@@ -13,13 +13,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+# AI 传输层 SSE 流式解析（Phase 5.1，双 target）
+futures = { workspace = true }
+bytes = { workspace = true }
+# stt/tts 音频字节的 base64 编解码（Phase 5.1，纯 Rust 双 target）
+base64 = "0.22"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "cookies", "rustls-tls", "stream"] }
 tokio = { version = "1", features = ["time"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 gloo-timers = { version = "0.3", features = ["futures"] }
 web-sys = { version = "0.3", features = ["Window", "Location"] }
 

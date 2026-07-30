@@ -28,6 +28,18 @@ pub enum ClientError {
     /// 其他 HTTP 错误（4xx 客户端错误等）
     #[error("HTTP {0}: {1}")]
     Other(u16, String),
+
+    /// AI 网关失败信封（`POST /api/ai/response` 的 `status="failed"` +
+    /// `error{code,message}`，见服务端 `ai_response_error_body`）。
+    ///
+    /// `code` 常见取值：`unauthorized`、`no_active_plan`、`upstream_rejected`、
+    /// `rate_limited` 等；`status` 为 HTTP 状态码。
+    #[error("AI gateway error HTTP {status} [{code}]: {message}")]
+    Api {
+        status: u16,
+        code: String,
+        message: String,
+    },
 }
 
 impl ClientError {
@@ -46,6 +58,7 @@ impl ClientError {
     pub fn status_or_label(&self) -> String {
         match self {
             Self::Other(s, _) | Self::ServerError(s, _) => s.to_string(),
+            Self::Api { status, .. } => status.to_string(),
             _ => "ERR".to_string(),
         }
     }

@@ -27,6 +27,10 @@ sha2 = "0.10"
 pulldown-cmark = "0.10"
 # Network Tool URL 解析与 SSRF 防护（tools/network.rs，双 target）
 url = "2"
+# Phase 5.2 GatewayModelClient：底层复用 client-api AI 传输层（双 target）
+client-api = { workspace = true }
+# Phase 5.2 流式重试状态机的 stream! 生成器（纯 Rust，双 target）
+async-stream = "0.3"
 
 # ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
 
@@ -71,6 +75,8 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 # Phase 2 记忆系统集成测试：redb 临时数据库目录
 tempfile = "3"
+# Phase 5 模型传输层集成测试：Mock AI Gateway
+wiremock = "0.6"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

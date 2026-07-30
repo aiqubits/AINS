@@ -8,7 +8,8 @@ use crate::error::ClientError;
 use crate::types::*;
 
 /// 指数退避延迟的最大位移量（shift 范围 0..=2），延迟序列：500ms, 1s, 2s
-const MAX_BACKOFF_SHIFT: u32 = 2;
+/// （`ai.rs` 流式建连重试复用同一序列）
+pub(crate) const MAX_BACKOFF_SHIFT: u32 = 2;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
@@ -783,7 +784,7 @@ impl Client {
     /// 构建带认证头的请求。
     ///
     /// 优先使用传入的 `token` 参数；如果未传入，使用内部存储的 token。
-    fn request_with_auth(
+    pub(crate) fn request_with_auth(
         &self,
         method: Method,
         url: &str,
@@ -871,7 +872,7 @@ impl Client {
     /// **退避策略**：指数退避，初始延迟 500ms，每次翻倍，最大 2s
     ///
     /// 延迟序列（第 i 次重试）：500ms × 2^(i-1)，即 500ms, 1s, 2s（上限）
-    async fn send_and_parse<T: DeserializeOwned>(
+    pub(crate) async fn send_and_parse<T: DeserializeOwned>(
         &self,
         builder: reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {

@@ -4,6 +4,7 @@
 //! 业务逻辑只依赖 trait 抽象；平台特定实现（tokio / wasm-bindgen / redb / IndexedDB）
 //! 收敛在 cfg 门控的适配文件中，按 target 互斥编译。
 
+pub mod context;
 pub mod error;
 pub mod fnmatch;
 pub mod hooks;
@@ -11,6 +12,8 @@ pub mod kernel;
 pub mod marker;
 pub mod memory;
 pub mod model_client;
+pub mod model_service;
+pub mod perception;
 pub mod platform;
 pub mod policy;
 pub mod runtime_adapter;

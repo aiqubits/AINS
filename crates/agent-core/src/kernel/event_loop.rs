@@ -16,6 +16,9 @@ use futures::StreamExt;
 use futures::channel::mpsc;
 use serde_json::{Map, Value};
 
+use crate::context::compact::{
+    AutoCompactState, DEFAULT_PRESERVE_RECENT, auto_compact_if_needed, should_autocompact,
+};
 use crate::error::AgentError;
 use crate::hooks::HookEvent;
 use crate::kernel::context::ContextStore;
@@ -23,7 +26,7 @@ use crate::kernel::fsm;
 use crate::kernel::messages::{
     ContentBlock, ConversationMessage, Role, ToolUse, sanitize_conversation_messages,
 };
-use crate::kernel::state::{AgentEvent, AgentState, SystemEventType};
+use crate::kernel::state::{AgentEvent, AgentState, CompactTrigger, SystemEventType};
 use crate::kernel::stream_events::StreamEvent;
 use crate::model_client::{
     DEFAULT_MAX_OUTPUT_TOKENS, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
@@ -72,6 +75,8 @@ pub struct AgentKernel<R: RuntimeAdapter> {
     events: mpsc::Receiver<AgentEvent>,
     stream: mpsc::UnboundedSender<StreamEvent>,
     config: AgentKernelConfig,
+    /// 跨轮自动压缩状态（连续失败熔断计数等，Phase 5.5）。
+    compact_state: AutoCompactState,
     _runtime: PhantomData<fn() -> R>,
 }
 
@@ -118,6 +123,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                 events: event_rx,
                 stream: stream_tx,
                 config,
+                compact_state: AutoCompactState::default(),
                 _runtime: PhantomData,
             },
             event_tx,
@@ -271,6 +277,15 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         });
                         AgentState::Idle
                     } else {
+                        // 自动压缩：进入模型轮前检查上下文预算（对齐基线查询循环
+                        // 起始的 auto_compact_if_needed），达阈值则先压缩再续轮。
+                        if should_autocompact(
+                            &self.context.conversation,
+                            self.config.model.as_deref(),
+                            &self.compact_state,
+                        ) {
+                            self.run_compaction(CompactTrigger::Auto, false).await;
+                        }
                         let request = ModelRequest {
                             model: self.config.model.clone(),
                             messages: self.context.conversation.clone(),
@@ -357,28 +372,18 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     AgentState::Querying { turn: turn + 1 }
                 }
                 AgentState::Compacting { trigger } => {
-                    let mut payload = lifecycle_payload(HookEvent::PreCompact, &self.config.cwd);
-                    payload.insert(
-                        "trigger".into(),
-                        Value::String(format!("{trigger:?}").to_lowercase()),
-                    );
-                    if self.run_blocking_hook(HookEvent::PreCompact, payload).await {
-                        AgentState::Idle
+                    // 手动/反应式压缩入口（auto 在 Querying 起始内联触发）；真实降级链
+                    // 与生命周期 hook 由 run_compaction 统一处理。压缩成功后回 Querying
+                    // 重置轮数预算续轮；PreCompact hook 阻断或未发生压缩时回 Idle
+                    // 等待后续输入，不重发模型请求（FSM 备用出边 Compacting → Idle）。
+                    let force = matches!(trigger, CompactTrigger::Manual);
+                    if self.run_compaction(trigger, force).await {
+                        AgentState::Querying { turn: 0 }
                     } else {
-                        // context/compact 于后续 Phase 落地；当前占位直通
-                        self.emit(StreamEvent::CompactProgress {
-                            phase: "compact_failed".into(),
-                            trigger,
+                        self.emit(StreamEvent::Status {
+                            message: "Compaction skipped (blocked by hook or nothing to compact)."
+                                .into(),
                         });
-                        let mut payload =
-                            lifecycle_payload(HookEvent::PostCompact, &self.config.cwd);
-                        payload.insert(
-                            "trigger".into(),
-                            Value::String(format!("{trigger:?}").to_lowercase()),
-                        );
-                        payload.insert("success".into(), Value::Bool(false));
-                        self.run_observational_hook(HookEvent::PostCompact, payload)
-                            .await;
                         AgentState::Idle
                     }
                 }
@@ -457,10 +462,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     delay_secs,
                 } => {
                     self.emit(StreamEvent::Status {
-                        message: format!(
-                            "Request failed; retrying in {delay_secs:.1}s \
-                             (attempt {attempt} of {max_attempts}): {message}"
-                        ),
+                        message: format_retry_status(&message, attempt, max_attempts, delay_secs),
                     });
                 }
                 ModelStreamEvent::Complete { message, usage, .. } => {
@@ -491,6 +493,54 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
             return None;
         }
         Some((message, usage))
+    }
+
+    /// 执行上下文压缩（PreCompact hook → 四级降级链 → CompactProgress →
+    /// PostCompact hook），返回是否发生压缩。auto 由 Querying 起始内联调用，
+    /// manual/reactive 经 Compacting 状态进入。
+    async fn run_compaction(&mut self, trigger: CompactTrigger, force: bool) -> bool {
+        let mut payload = lifecycle_payload(HookEvent::PreCompact, &self.config.cwd);
+        payload.insert(
+            "trigger".into(),
+            Value::String(format!("{trigger:?}").to_lowercase()),
+        );
+        if self.run_blocking_hook(HookEvent::PreCompact, payload).await {
+            return false; // PreCompact hook 阻断压缩
+        }
+
+        // 降级链接受 messages 所有权并返回新列表。克隆 UI 流发送端供进度
+        // 回调实时上报（而非批量后发），回调只捕获克隆端不借用 self
+        // （self.model / &mut self.compact_state 已在同一调用中借用）。
+        let messages = std::mem::take(&mut self.context.conversation);
+        let progress_tx = self.stream.clone();
+        let (compacted_messages, compacted) = auto_compact_if_needed(
+            messages,
+            self.model.as_ref(),
+            self.config.model.as_deref(),
+            &mut self.compact_state,
+            trigger,
+            DEFAULT_PRESERVE_RECENT,
+            force,
+            &mut |phase| {
+                // UI 侧关闭接收端不影响压缩推进
+                let _ = progress_tx.unbounded_send(StreamEvent::CompactProgress {
+                    phase: phase.to_string(),
+                    trigger,
+                });
+            },
+        )
+        .await;
+        self.context.conversation = compacted_messages;
+
+        let mut payload = lifecycle_payload(HookEvent::PostCompact, &self.config.cwd);
+        payload.insert(
+            "trigger".into(),
+            Value::String(format!("{trigger:?}").to_lowercase()),
+        );
+        payload.insert("success".into(), Value::Bool(compacted));
+        self.run_observational_hook(HookEvent::PostCompact, payload)
+            .await;
+        compacted
     }
 
     fn api_schemas(&self) -> Vec<ToolDef> {
@@ -540,6 +590,20 @@ fn agent_event_hook_payload(event: &AgentEvent, cwd: &std::path::Path) -> Map<St
     payload
 }
 
+/// 渲染流内 Retry 事件的状态文案。ModelClient 协议约定：真实重试的
+/// `attempt < max_attempts`；终态失败（不可重试/重试耗尽）以
+/// `attempt == max_attempts` 承载，不得渲染为“重试中”误导 UI。
+fn format_retry_status(message: &str, attempt: u32, max_attempts: u32, delay_secs: f32) -> String {
+    if attempt >= max_attempts {
+        format!("Model request failed: {message}")
+    } else {
+        format!(
+            "Request failed; retrying in {delay_secs:.1}s \
+             (attempt {attempt} of {max_attempts}): {message}"
+        )
+    }
+}
+
 /// 传输层错误的用户可读归一化（对齐基线网络启发式分类）。
 ///
 /// TODO: 替换为结构化错误变体（`AgentError::Model { is_transport: bool }`），
@@ -551,5 +615,31 @@ fn transport_error_message(error: &AgentError) -> String {
         format!("Network error: {text}. Check your internet connection and try again.")
     } else {
         format!("API error: {text}")
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_retry_status_renders_genuine_retry_with_delay() {
+        let status = format_retry_status("boom", 1, 4, 2.5);
+        assert!(status.contains("retrying in 2.5s"));
+        assert!(status.contains("attempt 1 of 4"));
+        assert!(status.contains("boom"));
+    }
+
+    #[test]
+    fn format_retry_status_terminal_failure_not_rendered_as_retrying() {
+        // 回归：终态事件（attempt == max_attempts，delay 0.0）曾被渲染为
+        // "retrying in 0.0s (attempt 4 of 4)"，误导 UI 显示“重试中”
+        let status = format_retry_status("request failed: [no_active_plan] x", 4, 4, 0.0);
+        assert!(
+            !status.contains("retrying"),
+            "terminal failure must not say retrying: {status}"
+        );
+        assert!(status.contains("Model request failed"));
+        assert!(status.contains("no_active_plan"));
     }
 }

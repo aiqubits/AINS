@@ -36,11 +36,17 @@
 //! let client = Client::new(config).expect("valid config");
 //! ```
 
+pub mod ai;
 mod client;
 pub mod config;
 pub mod error;
 pub mod types;
 
+pub use ai::{
+    AI_RESPONSE_PATH, AiAudioInput, AiAudioOutput, AiContent, AiContentPart, AiErrorBody,
+    AiEventStream, AiInput, AiInputMessage, AiRequest, AiResponse, AiStreamEvent, AiUsage,
+    ChatOptions, TtsOptions,
+};
 pub use client::Client;
 pub use config::ClientConfig;
 pub use error::ClientError;
