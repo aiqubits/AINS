@@ -1,0 +1,50 @@
+/* NoticeToast —— 轻量非阻塞提示（对齐 tokens.css 浅色主题设计变量） */
+
+.ains-notice {
+  position: fixed;
+  top: 76px;
+  right: 24px;
+  z-index: 1000;
+  max-width: 320px;
+  padding: 10px 14px;
+  border-radius: var(--radius-lg);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  box-shadow: var(--shadow-lg);
+  pointer-events: none;
+  animation: ains-notice-in 0.2s ease;
+}
+
+@keyframes ains-notice-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.ains-notice--info {
+  background: var(--color-accent-indigo-soft-bg);
+  border: 1px solid var(--color-accent-indigo-soft-border);
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-notice--success {
+  background: var(--color-success-bg);
+  border: 1px solid var(--color-success-border);
+  color: var(--color-success-text);
+}
+
+.ains-notice--warning {
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
+.ains-notice__text {
+  display: block;
+}

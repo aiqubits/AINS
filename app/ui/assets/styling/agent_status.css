@@ -1,0 +1,49 @@
+/* AgentStatus —— Phase 6.5（对齐 tokens.css 浅色主题） */
+
+.ains-agent-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-secondary);
+}
+
+.ains-agent-status__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.ains-agent-status__dot--idle {
+  background: var(--color-text-muted-soft);
+}
+.ains-agent-status__dot--thinking {
+  background: var(--color-brand-indigo);
+}
+.ains-agent-status__dot--running {
+  background: var(--color-warning-text);
+}
+.ains-agent-status__dot--compacting {
+  background: var(--color-brand-purple);
+}
+.ains-agent-status__dot--error {
+  background: var(--color-error-text);
+}
+
+.ains-agent-status__dot--pulse {
+  animation: ains-agent-status-pulse 1.3s ease-in-out infinite;
+}
+
+@keyframes ains-agent-status-pulse {
+  0%, 100% { opacity: 0.4; transform: scale(0.85); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+.ains-agent-status__label {
+  white-space: nowrap;
+}

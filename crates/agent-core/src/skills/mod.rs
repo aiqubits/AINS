@@ -10,6 +10,15 @@ use crate::error::SkillsError;
 use crate::marker::MaybeSendSync;
 use crate::platform::Platform;
 
+pub mod store;
+
+pub use store::{
+    AUTO_ROLLBACK_CONSECUTIVE_FAILURES, DEFAULT_MAX_RETAINED_VERSIONS, KvSkillStore,
+    MAX_SKILL_CONTENT_BYTES, SKILL_KEY_PREFIX, SKILL_META_KEY_PREFIX, SkillEntry, SkillHead,
+    SkillMeta, SkillPruner, SkillScore, SkillStatus, SkillTrust, SkillVersion, VersionRecord,
+    skill_checksum, split_frontmatter,
+};
+
 /// Skill 门控上下文：`list` 阶段即过滤，不匹配的 skill 完全不可见。
 #[derive(Debug, Clone)]
 pub struct SkillContext {

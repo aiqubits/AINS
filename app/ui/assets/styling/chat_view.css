@@ -1,0 +1,349 @@
+/* ChatView / ChatInput —— Phase 6.3（对齐 tokens.css 浅色主题设计变量） */
+
+.ains-chat__scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+}
+
+.ains-chat__empty {
+  margin: auto;
+  max-width: 420px;
+  text-align: center;
+  color: var(--color-text-muted);
+  font-size: 14px;
+}
+
+.ains-chat__msg {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 78%;
+  padding: 10px 14px;
+  border-radius: var(--radius-xl);
+  font-size: 14px;
+  line-height: 1.55;
+}
+
+.ains-chat__msg--user {
+  align-self: flex-end;
+  background: var(--color-brand-gradient);
+  color: #fff;
+  box-shadow: var(--shadow-sm);
+}
+
+.ains-chat__msg--assistant {
+  align-self: flex-start;
+  background: #ffffff;
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-text-primary);
+  box-shadow: var(--shadow-sm);
+}
+
+.ains-chat__msg--system {
+  align-self: center;
+  background: transparent;
+  color: var(--color-text-muted);
+  font-size: 12px;
+}
+
+.ains-chat__role {
+  font-size: 11px;
+  font-weight: 600;
+  opacity: 0.75;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ains-chat__text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+}
+
+.ains-chat__thinking {
+  align-self: flex-start;
+  color: var(--color-text-muted);
+  font-size: 13px;
+  animation: ains-chat-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes ains-chat-pulse {
+  0%, 100% { opacity: 0.45; }
+  50% { opacity: 1; }
+}
+
+.ains-chat__note {
+  align-self: center;
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+  padding: 4px 12px;
+  border-radius: var(--radius-full);
+  background: var(--color-border-light);
+}
+
+.ains-chat__note--compact {
+  color: var(--color-brand-indigo-deep);
+  background: var(--color-accent-indigo-soft-bg);
+}
+
+.ains-chat__note--error {
+  color: var(--color-error-text);
+  background: var(--color-accent-pink-soft-bg);
+  border: 1px solid var(--color-error-border);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ains-chat__error-label {
+  font-weight: 600;
+}
+
+/* ── 工具调用卡片 ── */
+
+.ains-chat__tool {
+  align-self: stretch;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.ains-chat__tool-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 12px;
+  background: var(--color-accent-indigo-soft-bg);
+  border: none;
+  cursor: pointer;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+
+.ains-chat__tool-chevron {
+  width: 14px;
+  height: 14px;
+  flex-shrink: 0;
+}
+
+.ains-chat__tool-name {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+.ains-chat__tool-badge {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+}
+
+.ains-chat__tool-badge--running {
+  color: var(--color-brand-indigo-deep);
+  background: var(--color-accent-indigo-soft-bg);
+  animation: ains-chat-pulse 1.4s ease-in-out infinite;
+}
+
+.ains-chat__tool-badge--done {
+  color: var(--color-success-text);
+  background: var(--color-success-bg);
+}
+
+.ains-chat__tool-badge--failed {
+  color: var(--color-error-text);
+  background: var(--color-accent-pink-soft-bg);
+}
+
+.ains-chat__tool-body {
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ains-chat__tool-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ains-chat__tool-pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-base);
+  background: var(--color-border-light);
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+/* ── 输入区 ── */
+
+.ains-chat__composer {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Slash 命令建议下拉（Phase 6.12） */
+.ains-chat__slash {
+  margin: 0 16px 6px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  background: #ffffff;
+  box-shadow: var(--shadow-md);
+  overflow: hidden;
+}
+
+.ains-chat__slash-hint {
+  padding: 4px 12px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--color-text-muted);
+  background: var(--color-border-light);
+}
+
+.ains-chat__slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 12px;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.ains-chat__slash-item:hover {
+  background: var(--color-surface-hover);
+}
+
+.ains-chat__slash-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-chat__slash-desc {
+  font-size: 12px;
+  color: var(--color-text-tertiary);
+}
+
+.ains-chat__input-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--color-border-subtle);
+}
+
+.ains-chat__textarea {
+  flex: 1;
+  resize: none;
+  padding: 12px 16px;
+  border-radius: var(--radius-xl);
+  border: 1px solid rgba(226, 232, 240, 0.6);
+  background: var(--color-input-bg);
+  color: var(--color-text-primary);
+  font-size: 14px;
+  font-family: var(--font-family);
+  line-height: 1.5;
+  transition: border-color 0.15s ease, background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.ains-chat__textarea::placeholder {
+  color: var(--color-text-muted);
+}
+
+.ains-chat__textarea:hover:not(:disabled) {
+  border-color: var(--color-text-muted-soft);
+}
+
+.ains-chat__textarea:focus,
+.ains-chat__textarea:focus-visible {
+  outline: none;
+  border-color: var(--color-brand-indigo-light);
+  background: #ffffff;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.12);
+}
+
+.ains-chat__textarea:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ains-chat__btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 20px;
+  min-width: 88px;
+  border-radius: var(--radius-xl);
+  border: none;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: box-shadow 0.2s ease, opacity 0.15s ease;
+}
+
+.ains-chat__btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.ains-chat__btn--send {
+  background: var(--color-brand-gradient);
+  color: #fff;
+}
+
+.ains-chat__btn--send:hover {
+  box-shadow: var(--shadow-brand-hover);
+}
+
+.ains-chat__btn--stop {
+  background: var(--color-accent-pink-soft-bg);
+  color: var(--color-error-text);
+  border: 1px solid var(--color-error-border);
+}
+
+/* Mobile 适配（Phase 6.10） */
+@media (max-width: 640px) {
+  .ains-chat__msg {
+    max-width: 90%;
+  }
+  .ains-chat__input-row {
+    padding: 10px 12px;
+    gap: 8px;
+  }
+  .ains-chat__btn {
+    min-width: 64px;
+    padding: 0 12px;
+  }
+  .ains-chat__btn span {
+    display: none;
+  }
+  .ains-chat__slash {
+    margin: 0 12px 6px;
+  }
+}

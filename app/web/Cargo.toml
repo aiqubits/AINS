@@ -8,6 +8,13 @@ dioxus = { workspace = true, features = ["router"] }
 ui = { workspace = true }
 dioxus-icons = { workspace = true }
 client-api = { workspace = true }
+# Agent Runtime 嵌入（Phase 6.1）
+agent-core = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+# Skills 详情 frontmatter 展示（与 agent-core 公开 API 同版本）
+serde_yaml = "0.9"
 chrono = { workspace = true }
 base64 = "0.22"
 serde = { workspace = true }
@@ -22,6 +29,10 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["time"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# agent 桥接层单测（permission_bridge 异步契约）
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["web"]

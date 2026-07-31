@@ -34,14 +34,13 @@ impl I18nContext {
         self.lang.set(lang);
         #[cfg(target_arch = "wasm32")]
         {
-            if let Some(window) = web_sys::window() {
-                if let Ok(Some(storage)) = window.local_storage() {
-                    if let Err(e) = storage.set_item("ains_lang_v1", lang.as_str()) {
-                        // 类型由 web_sys::console::warn_2 签名中的 &JsValue 推断
-                        let msg = "ains i18n: localStorage write failed:".into();
-                        web_sys::console::warn_2(&msg, &e);
-                    }
-                }
+            if let Some(window) = web_sys::window()
+                && let Ok(Some(storage)) = window.local_storage()
+                && let Err(e) = storage.set_item("ains_lang_v1", lang.as_str())
+            {
+                // 类型由 web_sys::console::warn_2 签名中的 &JsValue 推断
+                let msg = "ains i18n: localStorage write failed:".into();
+                web_sys::console::warn_2(&msg, &e);
             }
         }
     }

@@ -32,6 +32,10 @@ pub fn AppShellLayout() -> Element {
     let route = use_route::<Route>();
     let active_nav = match route {
         Route::PersonalCenter {} => NavKey::PersonalCenter,
+        Route::AgentChat {} => NavKey::AgentChat,
+        Route::Skills {} => NavKey::Skills,
+        Route::Memory {} => NavKey::Memory,
+        Route::Tools {} => NavKey::Tools,
         Route::Dashboard {} => NavKey::Dashboard,
         Route::Users {} => NavKey::Users,
         Route::Tenants {} => NavKey::Tenants,
@@ -74,6 +78,10 @@ pub fn AppShellLayout() -> Element {
                     on_select: move |key| {
                         let target = match key {
                             NavKey::PersonalCenter => Route::PersonalCenter {},
+                            NavKey::AgentChat => Route::AgentChat {},
+                            NavKey::Skills => Route::Skills {},
+                            NavKey::Memory => Route::Memory {},
+                            NavKey::Tools => Route::Tools {},
                             NavKey::Dashboard => Route::Dashboard {},
                             NavKey::Users => Route::Users {},
                             NavKey::Tenants => Route::Tenants {},

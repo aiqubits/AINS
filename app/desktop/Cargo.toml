@@ -7,8 +7,20 @@ edition.workspace = true
 dioxus = { workspace = true, features = ["router"] }
 ui = { workspace = true }
 i18n = { workspace = true }
+# Agent Runtime 嵌入（Phase 6.2，Native）
+agent-core = { workspace = true }
+client-api = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+chrono = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = ["desktop"]
 desktop = ["dioxus/desktop"]
-

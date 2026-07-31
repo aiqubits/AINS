@@ -17,6 +17,9 @@ pub fn Modal(
     on_close: EventHandler<MouseEvent>,
     #[props(default = true)] open: bool,
     #[props(default = false)] disable_backdrop: bool,
+    /// 隐藏标题栏右上角的关闭×（确认类弹窗已有显式取消按钮时，避免冗余）。
+    #[props(default = false)]
+    hide_close: bool,
     children: Element,
 ) -> Element {
     let i18n = try_use_context::<I18nContext>();
@@ -40,12 +43,14 @@ pub fn Modal(
             div { class: "ains-modal__card",
                 header { class: "ains-modal__header",
                     h3 { class: "ains-modal__title", "{title}" }
-                    button {
-                        class: "ains-modal__close",
-                        r#type: "button",
-                        aria_label: t.modal_close,
-                        onclick: move |e| on_close.call(e),
-                        X {}
+                    if !hide_close {
+                        button {
+                            class: "ains-modal__close",
+                            r#type: "button",
+                            aria_label: t.modal_close,
+                            onclick: move |e| on_close.call(e),
+                            X {}
+                        }
                     }
                 }
                 div { class: "ains-modal__body", {children} }

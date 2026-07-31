@@ -1,0 +1,124 @@
+/* ToolPanel —— Phase 6.7（对齐 tokens.css 浅色主题） */
+
+.ains-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.ains-tools__header {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ains-tools__title {
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--color-text-primary);
+}
+
+.ains-tools__subtitle {
+  margin: 0;
+  font-size: 13px;
+  color: var(--color-text-muted);
+}
+
+.ains-tools__empty {
+  margin: 24px 0;
+  text-align: center;
+  font-size: 14px;
+  color: var(--color-text-muted);
+}
+
+.ains-tools__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 12px;
+}
+
+.ains-tools__card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-xl);
+  background: #ffffff;
+  box-shadow: var(--shadow-sm);
+}
+
+.ains-tools__card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ains-tools__card-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-tools__badge {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 8px;
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+}
+
+/* 分类徽标：能力工具用中性/语义软色；元工具（权限/交互）用琥珀警示色
+   与 Plan 徽标同调，一眼区分“会改变 Agent 行为”的工具。 */
+.ains-tools__badge--compute {
+  background: var(--color-border-light);
+  color: var(--color-text-tertiary);
+}
+
+.ains-tools__badge--fs {
+  background: var(--color-accent-indigo-soft-bg);
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-tools__badge--system {
+  background: var(--color-border-light);
+  color: var(--color-text-secondary);
+}
+
+.ains-tools__badge--network {
+  background: var(--color-success-bg);
+  color: var(--color-success-text);
+}
+
+.ains-tools__badge--browser {
+  background: var(--color-accent-pink-soft-bg);
+  color: var(--color-error-text);
+}
+
+.ains-tools__badge--meta {
+  background: var(--color-warning-bg);
+  border: 1px solid var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
+.ains-tools__badge--mcp {
+  background: var(--color-accent-purple-soft-bg);
+  color: var(--color-brand-purple);
+}
+
+.ains-tools__card-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-text-tertiary);
+}
+
+/* Mobile 适配（Phase 6.10） */
+@media (max-width: 640px) {
+  .ains-tools__grid {
+    grid-template-columns: 1fr;
+  }
+}

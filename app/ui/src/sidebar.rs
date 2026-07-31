@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{
-    Activity, ChartPie, CreditCard, ExternalLink, Layers, Package, Route, Server, UserCog, Wallet,
-    X,
+    Activity, Bot, ChartPie, CreditCard, Database, ExternalLink, Layers, Package, Route, Server,
+    Sparkles, UserCog, Wallet, Wrench, X,
 };
 
 use crate::I18nContext;
@@ -61,6 +61,43 @@ pub fn Sidebar(
                         label: t.sidebar_personal_center_label.to_string(),
                         active: active == NavKey::PersonalCenter,
                         onclick: move |_| on_select.call(NavKey::PersonalCenter),
+                    }
+                }
+
+                // AI Agent（所有角色可见，Phase 6）
+                div { class: "ains-sidebar__group",
+                    div { class: "ains-sidebar__group-caption", {t.sidebar_group_agent} }
+                    SidebarItem {
+                        icon: rsx! {
+                            Bot {}
+                        },
+                        label: t.sidebar_agent_chat_label.to_string(),
+                        active: active == NavKey::AgentChat,
+                        onclick: move |_| on_select.call(NavKey::AgentChat),
+                    }
+                    SidebarItem {
+                        icon: rsx! {
+                            Sparkles {}
+                        },
+                        label: t.sidebar_skills_label.to_string(),
+                        active: active == NavKey::Skills,
+                        onclick: move |_| on_select.call(NavKey::Skills),
+                    }
+                    SidebarItem {
+                        icon: rsx! {
+                            Database {}
+                        },
+                        label: t.sidebar_memory_label.to_string(),
+                        active: active == NavKey::Memory,
+                        onclick: move |_| on_select.call(NavKey::Memory),
+                    }
+                    SidebarItem {
+                        icon: rsx! {
+                            Wrench {}
+                        },
+                        label: t.sidebar_tools_label.to_string(),
+                        active: active == NavKey::Tools,
+                        onclick: move |_| on_select.call(NavKey::Tools),
                     }
                 }
 
@@ -169,6 +206,10 @@ pub fn Sidebar(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavKey {
     PersonalCenter,
+    AgentChat,
+    Skills,
+    Memory,
+    Tools,
     Dashboard,
     Users,
     Tenants,

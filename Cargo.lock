@@ -1865,8 +1865,17 @@ dependencies = [
 name = "desktop"
 version = "0.1.0"
 dependencies = [
+ "agent-core",
+ "async-trait",
+ "chrono",
+ "client-api",
  "dioxus",
+ "futures",
  "i18n",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
  "ui",
 ]
 
@@ -8952,17 +8961,22 @@ dependencies = [
 name = "web"
 version = "0.1.0"
 dependencies = [
+ "agent-core",
+ "async-trait",
  "base64",
  "chrono",
  "client-api",
  "dioxus",
  "dioxus-icons",
+ "futures",
  "gloo-timers",
  "i18n",
  "js-sys",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tokio",
+ "tracing",
  "ui",
  "web-sys",
 ]

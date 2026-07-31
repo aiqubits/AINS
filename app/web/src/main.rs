@@ -5,10 +5,12 @@ use components::{AppShellLayout, LogBus, RequireAuth};
 use i18n::Language;
 use ui::I18nContext;
 use views::{
-    Auth, Channels, Dashboard, ForgotPassword, LoginLanding, Metering, NotFound, Orders,
-    PersonalCenter, Plans, ResetPassword, Settings, Tenants, Users, VerifyEmail,
+    AgentChat, Auth, Channels, Dashboard, ForgotPassword, LoginLanding, Memory, Metering, NotFound,
+    Orders, PersonalCenter, Plans, ResetPassword, Settings, Skills, Tenants, Tools, Users,
+    VerifyEmail,
 };
 
+mod agent;
 mod api;
 mod auth;
 mod balance;
@@ -35,6 +37,14 @@ enum Route {
         #[layout(AppShellLayout)]
             #[route("/personal")]
             PersonalCenter {},
+            #[route("/agent")]
+            AgentChat {},
+            #[route("/skills")]
+            Skills {},
+            #[route("/memory")]
+            Memory {},
+            #[route("/tools")]
+            Tools {},
             #[route("/settings")]
             Settings {},
             #[layout(crate::components::RequireAdmin)]
@@ -95,10 +105,10 @@ fn init_language() -> Language {
             let languages = window.navigator().languages();
             if languages.length() > 0 {
                 let first = languages.get(0);
-                if let Some(lang_str) = first.as_string() {
-                    if lang_str.starts_with("zh") {
-                        return Language::Zh;
-                    }
+                if let Some(lang_str) = first.as_string()
+                    && lang_str.starts_with("zh")
+                {
+                    return Language::Zh;
                 }
             }
         }
@@ -115,6 +125,9 @@ fn App() -> Element {
     // LogBus 仍需提供给 Dashboard 的服务链路追踪控制台使用（右上角 Toast 提示已移除）。
     use_context_provider(LogBus::new);
     let auth = use_context::<AuthState>();
+    // Agent 视图（/agent）直接消费 Client 上下文（token 跨 clone 共享），
+    // 使 agent_chat 视图可被 desktop 端复用。
+    use_context_provider(|| auth.client.clone());
 
     // 应用启动时一次性恢复 localStorage 中的会话并拉取真实用户资料。
     // 必须放在路由挂载之前——这样无论首屏路由是 /、/users、/settings 还是 /auth，

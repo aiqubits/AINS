@@ -58,6 +58,37 @@ pub use code_console::{CodeConsole, ConsoleKind, ConsoleLine};
 mod global_styles;
 pub use global_styles::GlobalStyles;
 
+// Agent UI（Phase 6）—— 纯展示组件，视图模型由宿主从 agent-core 映射。
+mod chat_view;
+pub use chat_view::{
+    ChatInput, ChatItem, ChatRole, ChatView, ChatViewState, SlashCommandView, ToolCallCard,
+    ToolCallStatus,
+};
+
+mod permission_dialog;
+pub use permission_dialog::{PermissionChoice, PermissionDialog, PermissionRequestView};
+
+mod permission_controls;
+pub use permission_controls::{PermissionModeSwitcher, PermissionModeView, PlanModeIndicator};
+
+mod skills_panel;
+pub use skills_panel::{SkillCard, SkillDetailView, SkillTrustView, SkillsPanel};
+
+mod notice_toast;
+pub use notice_toast::{NoticeItem, NoticeKind, NoticeToast};
+
+mod agent_status;
+pub use agent_status::{AgentStatus, AgentStatusView};
+
+mod tool_panel;
+pub use tool_panel::{ToolCardView, ToolCategoryView, ToolPanel};
+
+mod memory_viewer;
+pub use memory_viewer::{MemoryCard, MemoryViewer};
+
+mod todo_list;
+pub use todo_list::{TodoItemView, TodoList, parse_todo_markdown};
+
 // i18n
 pub use i18n::{EN, I18nContext, Language, Translations, ZH, tf};
 

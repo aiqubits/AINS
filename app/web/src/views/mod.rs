@@ -1,8 +1,10 @@
+mod agent_chat;
 mod auth;
 mod channels;
 mod dashboard;
 mod forgot_password;
 mod login_landing;
+mod memory;
 mod metering;
 mod not_found;
 mod orders;
@@ -10,18 +12,22 @@ mod personal_center;
 mod plans;
 mod reset_password;
 mod settings;
+mod skills;
 mod tenant_select;
 mod tenants;
+mod tools;
 mod users;
 mod verify_email;
 
 use ui::Translations;
 
+pub use agent_chat::AgentChat;
 pub use auth::Auth;
 pub use channels::Channels;
 pub use dashboard::Dashboard;
 pub use forgot_password::ForgotPassword;
 pub use login_landing::LoginLanding;
+pub use memory::Memory;
 pub use metering::Metering;
 pub use not_found::NotFound;
 pub use orders::Orders;
@@ -29,7 +35,9 @@ pub use personal_center::PersonalCenter;
 pub use plans::Plans;
 pub use reset_password::ResetPassword;
 pub use settings::Settings;
+pub use skills::Skills;
 pub use tenants::Tenants;
+pub use tools::Tools;
 pub use users::Users;
 pub use verify_email::VerifyEmail;
 

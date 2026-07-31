@@ -24,10 +24,10 @@ const EXPIRY_COOKIE: &str = "ains_exp";
 pub fn save_jwt(token: &str) {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.session_storage() {
-                let _ = storage.set_item(JWT_STORAGE_KEY, token);
-            }
+        if let Some(window) = web_sys::window()
+            && let Ok(Some(storage)) = window.session_storage()
+        {
+            let _ = storage.set_item(JWT_STORAGE_KEY, token);
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
@@ -57,10 +57,10 @@ pub fn load_jwt() -> Option<String> {
 pub fn clear_jwt() {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
-            if let Ok(Some(storage)) = window.session_storage() {
-                let _ = storage.remove_item(JWT_STORAGE_KEY);
-            }
+        if let Some(window) = web_sys::window()
+            && let Ok(Some(storage)) = window.session_storage()
+        {
+            let _ = storage.remove_item(JWT_STORAGE_KEY);
         }
     }
     #[cfg(not(target_arch = "wasm32"))]

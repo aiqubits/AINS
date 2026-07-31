@@ -318,8 +318,9 @@ async fn tool_loop_executes_and_backfills_tool_result() {
     assert_eq!(completed.len(), 1);
     assert!(matches!(
         completed[0],
-        StreamEvent::ToolExecutionCompleted { output, is_error, metadata, .. }
-            if output == "echo: ping"
+        StreamEvent::ToolExecutionCompleted { tool_use_id, output, is_error, metadata, .. }
+            if tool_use_id == "toolu_1"
+                && output == "echo: ping"
                 && !is_error
                 && metadata == &json!({"echo_length": 4})
     ));
@@ -852,6 +853,7 @@ async fn multi_tool_use_executes_concurrently_and_aggregates_in_original_order()
     assert_eq!(
         started[0],
         &StreamEvent::ToolExecutionStarted {
+            tool_use_id: "toolu_1".into(),
             tool_name: "overlap".into(),
             tool_input: json!({"label": "hello"}),
         }
@@ -859,6 +861,7 @@ async fn multi_tool_use_executes_concurrently_and_aggregates_in_original_order()
     assert_eq!(
         started[1],
         &StreamEvent::ToolExecutionStarted {
+            tool_use_id: "toolu_2".into(),
             tool_name: "overlap".into(),
             tool_input: json!({"label": "world"}),
         }
@@ -1179,4 +1182,133 @@ async fn continuation_resets_turn_counter_after_prepare_continuation() {
     );
     // 最终 Idle（channel 关闭 → Completed）
     assert!(matches!(kernel.state(), AgentState::Completed));
+}
+
+#[tokio::test]
+async fn system_prompt_carries_live_permission_mode_section() {
+    use agent_core::policy::{PermissionEngine, PermissionMode, PermissionSettings};
+    use agent_core::tools::interact::EnterPlanModeTool;
+
+    // 引擎 Default 起步；模型第一轮调用 enter_plan_mode（只读、免确认）
+    let engine = PermissionEngine::new(PermissionMode::Default, PermissionSettings::default());
+    let mut runtime = ToolRuntime::new();
+    runtime.register(Box::new(EnterPlanModeTool::new(Arc::clone(&engine))));
+    let runtime = runtime.with_permissions(Arc::clone(&engine), None);
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(None, "tu_plan", "enter_plan_mode", json!({})),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("planning now", usage()),
+    ]));
+
+    let (mut kernel, mut event_tx, _stream_rx) = AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+        model.clone(),
+        runtime,
+        AgentKernelConfig {
+            system_prompt: Some("base instructions".into()),
+            ..test_config()
+        },
+    );
+    event_tx
+        .try_send(user_message("please plan first"))
+        .unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    let requests = model.recorded_requests();
+    assert_eq!(requests.len(), 2);
+    // 第一轮：宿主基础提示在前 + Default 模式段动态拼接
+    let first = requests[0].system_prompt.as_deref().unwrap();
+    assert!(first.starts_with("base instructions"));
+    assert!(first.contains("Default permission mode is enabled"));
+    // enter_plan_mode 于第一轮执行后，第二轮请求即携带 Plan 段（事先指引，
+    // 减少"试错→被拒→再退出"轮次）
+    let second = requests[1].system_prompt.as_deref().unwrap();
+    assert!(second.contains("Plan mode is enabled"));
+    assert!(second.contains("Do not call mutating tools"));
+}
+
+#[tokio::test]
+async fn snapshot_with_dangling_tool_use_roundtrips_and_next_query_succeeds() {
+    use agent_core::context::{SessionSaveInput, SessionStore};
+    use agent_core::memory::{KvStore, RedbBackend, TABLE_KV};
+
+    // 崩溃现场端到端：宿主在 AssistantTurnComplete 时持久化快照，
+    // 此时工具尚未完成 → 快照含未配对 tool_use。重启后
+    // load_latest 必须给出已 sanitize 的历史，种子进 Kernel 后
+    // 续问仍能正常完成（此前仅有 save/load 与 kernel 各自的分段覆盖）。
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("session.redb"))
+            .expect("open redb")
+            .table(TABLE_KV),
+    );
+    let store = SessionStore::new(Arc::clone(&kv));
+    let crash_scene = vec![
+        ConversationMessage::from_user_text("run echo for me"),
+        ConversationMessage {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "让我调用工具".into(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_crash".into(),
+                    name: "echo".into(),
+                    input: json!({"text": "x"}),
+                },
+            ],
+        },
+    ];
+    store
+        .save(SessionSaveInput {
+            cwd: "/proj/crash".into(),
+            messages: crash_scene,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 回载：悬空 tool_use 整轮剪除，仅剩 user 消息
+    let snapshot = store.load_latest("/proj/crash").await.unwrap().unwrap();
+    assert_eq!(snapshot.messages.len(), 1);
+    assert_eq!(snapshot.messages[0].role, Role::User);
+
+    // 种子进 Kernel（宿主恢复路径）后续问成功
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn("recovered", usage()),
+    ]));
+    let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(EchoTool)],
+        test_config(),
+    );
+    kernel.context_mut().conversation = snapshot.messages;
+    event_tx.try_send(user_message("continue please")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|e| matches!(
+        e,
+        StreamEvent::AssistantTurnComplete { message, .. } if message.text() == "recovered"
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::Error { .. })),
+        "restored history must not trip protocol validation: {events:?}"
+    );
+    // 旧 user + 新 user + assistant；无悬空 tool_use 残留
+    assert_eq!(kernel.context().conversation.len(), 3);
+    assert!(!kernel.context().conversation.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "toolu_crash"))
+    }));
 }

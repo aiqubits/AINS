@@ -19,6 +19,7 @@ use serde_json::{Map, Value};
 use crate::context::compact::{
     AutoCompactState, DEFAULT_PRESERVE_RECENT, auto_compact_if_needed, should_autocompact,
 };
+use crate::context::prompt_pipeline::permission_mode_section;
 use crate::error::AgentError;
 use crate::hooks::HookEvent;
 use crate::kernel::context::ContextStore;
@@ -289,7 +290,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         let request = ModelRequest {
                             model: self.config.model.clone(),
                             messages: self.context.conversation.clone(),
-                            system_prompt: self.config.system_prompt.clone(),
+                            system_prompt: self.effective_system_prompt(),
                             max_output_tokens: self.config.max_output_tokens,
                             tools: self.api_schemas(),
                         };
@@ -336,6 +337,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                 AgentState::ExecutingTools { tool_uses, turn } => {
                     for tool_use in &tool_uses {
                         self.emit(StreamEvent::ToolExecutionStarted {
+                            tool_use_id: tool_use.id.clone(),
                             tool_name: tool_use.name.clone(),
                             tool_input: tool_use.input.clone(),
                         });
@@ -351,6 +353,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     let mut results = Vec::with_capacity(tool_uses.len());
                     for (tool_use, outcome) in tool_uses.iter().zip(outcomes) {
                         self.emit(StreamEvent::ToolExecutionCompleted {
+                            tool_use_id: tool_use.id.clone(),
                             tool_name: tool_use.name.clone(),
                             output: outcome.output.clone(),
                             is_error: outcome.is_error,
@@ -545,6 +548,20 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
 
     fn api_schemas(&self) -> Vec<ToolDef> {
         self.tools.api_schemas()
+    }
+
+    /// 每轮生效的 system prompt：宿主基础提示（可选）+ 当前权限模式段。
+    ///
+    /// 模式段必须每轮动态拼接而非固化在 config：会话中模式会经 UI
+    /// 开关或 enter/exit_plan_mode 工具改变，Plan 下模型需要事先收到
+    /// “勿调写工具”的指引，减少“试错→被拒→再退出”的多余轮次
+    /// （权限引擎仍是硬边界，本段仅为提前引导）。
+    fn effective_system_prompt(&self) -> Option<String> {
+        let mode_section = permission_mode_section(self.tools.permissions().mode());
+        Some(match &self.config.system_prompt {
+            Some(base) => format!("{base}\n\n{mode_section}"),
+            None => mode_section,
+        })
     }
 
     fn emit(&self, event: StreamEvent) {

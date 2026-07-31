@@ -1,0 +1,173 @@
+/* PermissionDialog / PermissionModeSwitcher / PlanModeIndicator —— Phase 6.11
+   对齐 tokens.css 浅色主题设计变量 */
+
+.ains-perm__body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ains-perm__field {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.ains-perm__field--block {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+}
+
+.ains-perm__label {
+  flex-shrink: 0;
+  min-width: 64px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--color-text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.ains-perm__value {
+  font-size: 13px;
+  color: var(--color-text-primary);
+  word-break: break-all;
+}
+
+.ains-perm__value--tool {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-perm__pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-base);
+  background: var(--color-border-light);
+  border: 1px solid var(--color-border-subtle);
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.ains-perm__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.ains-perm__btn {
+  padding: 8px 16px;
+  border-radius: var(--radius-lg);
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: box-shadow 0.2s ease, background-color 0.15s ease;
+}
+
+.ains-perm__btn--allow {
+  background: var(--color-brand-gradient);
+  color: #fff;
+}
+
+.ains-perm__btn--allow:hover {
+  box-shadow: var(--shadow-brand-hover);
+}
+
+.ains-perm__btn--always {
+  background: var(--color-accent-indigo-soft-bg);
+  border-color: var(--color-accent-indigo-soft-border);
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-perm__btn--deny {
+  background: var(--color-accent-pink-soft-bg);
+  border-color: var(--color-error-border);
+  color: var(--color-error-text);
+}
+
+.ains-perm__btn--secondary {
+  background: var(--color-border-light);
+  border-color: var(--color-border-default);
+  color: var(--color-text-secondary);
+}
+
+.ains-perm__btn--secondary:hover {
+  background: var(--color-surface-hover);
+}
+
+/* ── 模式切换器 ── */
+
+.ains-perm-mode {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ains-perm-mode__label {
+  font-size: 12px;
+  color: var(--color-text-muted);
+}
+
+.ains-perm-mode__group {
+  display: inline-flex;
+  border: 1px solid var(--color-border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: #ffffff;
+}
+
+.ains-perm-mode__seg {
+  padding: 6px 12px;
+  border: none;
+  background: transparent;
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 0.15s ease, color 0.15s ease;
+}
+
+.ains-perm-mode__seg:hover {
+  background: var(--color-surface-hover);
+}
+
+.ains-perm-mode__seg--active {
+  background: var(--color-accent-indigo-soft-bg);
+  color: var(--color-brand-indigo-deep);
+}
+
+.ains-perm-mode__plan-icon {
+  width: 12px;
+  height: 12px;
+  margin-right: 4px;
+}
+
+/* full_auto 模态二次确认（渲入 Modal 内，标题由 Modal header 提供） */
+
+.ains-perm-mode__confirm-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ains-perm-mode__confirm-msg {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--color-text-secondary);
+}
+
+.ains-perm-mode__confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
