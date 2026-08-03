@@ -207,7 +207,11 @@ impl ToolRuntime {
                 &tool_use.name
             };
             let decision = if let Some(path) = file_path.as_deref()
-                && tool_use.name == "edit_file"
+                // edit_file 与 todo_write 都是先读旧内容再写的复合操作：
+                // 写象限之外还必须过读象限（deny_read 区域的 read-modify-write
+                // 实际发生读取；review 修复：历史 todo_write 只走写象限，
+                // 与 edit_file 保护不对称）。
+                && matches!(tool_use.name.as_str(), "edit_file" | "todo_write")
                 && !engine.file_access_allowed(path, true)
             {
                 PermissionDecision::deny(format!(
@@ -262,15 +266,16 @@ impl ToolRuntime {
                         resolved_file_path: file_path.clone(),
                         command: command.clone(),
                     };
+                    let mut always_allow_persist = false;
                     match prompt.confirm(&request, self.current_query_cancel()).await {
                         PermissionReply::Allow => {}
                         PermissionReply::AlwaysAllow => {
                             // `background_task/run` shares shell_command's
                             // permission identity.  Persist the identity
                             // actually evaluated; storing the display tool
-                            // name made “Always allow” ineffective for every
+                            // name made "Always allow" ineffective for every
                             // later background run.
-                            engine.allow_for_session(permission_tool_name);
+                            always_allow_persist = true;
                         }
                         PermissionReply::Deny => {
                             let result = ToolResult::err(permission_denied_message(
@@ -285,6 +290,12 @@ impl ToolRuntime {
                     // Do not let that stale approval authorize a mutation.
                     if self.query_is_cancelled() {
                         return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
+                    }
+                    // Stop 竞态下“总是允许”不得静默持久化：取消检查通过后
+                    // 才写会话放行集，避免用户以为未生效、实际已放行
+                    // （review 修复：历史在取消检查前持久化）。
+                    if always_allow_persist {
+                        engine.allow_for_session(permission_tool_name);
                     }
                 } else {
                     let result = ToolResult::err(permission_denied_message(
@@ -620,6 +631,8 @@ mod tests {
 
     struct CancelThenAllowPrompt(Arc<AtomicBool>);
 
+    struct CancelThenAlwaysAllowPrompt(Arc<AtomicBool>);
+
     struct CountingMutatingTool(Arc<AtomicUsize>);
 
     #[async_trait::async_trait]
@@ -643,6 +656,18 @@ mod tests {
         ) -> PermissionReply {
             self.0.store(true, Ordering::Release);
             PermissionReply::Allow
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionPrompt for CancelThenAlwaysAllowPrompt {
+        async fn confirm(
+            &self,
+            _request: &PermissionRequest,
+            _cancel: Option<Arc<AtomicBool>>,
+        ) -> PermissionReply {
+            self.0.store(true, Ordering::Release);
+            PermissionReply::AlwaysAllow
         }
     }
 
@@ -971,6 +996,112 @@ mod tests {
         assert!(result.is_error);
         assert!(result.output.contains("interrupted by user"));
         assert_eq!(executed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_always_allow_does_not_persist_session_allow() {
+        // review 修复回归：Stop 竞态下用户点"总是允许"时，工具不执行
+        // （取消检查拦截），但会话放行集不得被静默持久化——否则下一次
+        // 查询该工具直接放行，用户以为"没生效"实际已授权。
+        let cancel = Arc::new(AtomicBool::new(false));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::Default,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(
+            Arc::clone(&engine),
+            Some(Arc::new(CancelThenAlwaysAllowPrompt(Arc::clone(&cancel)))),
+        );
+        runtime.set_query_cancel(Some(Arc::clone(&cancel)));
+        runtime.register(Box::new(CountingMutatingTool(Arc::clone(&executed))));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+
+        let result = runtime
+            .dispatch(&tool_use("counting_mutator", Value::Null), &mut ctx)
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("interrupted by user"));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+        // 会话放行集未被污染：取消清除后再次 dispatch 仍需走确认（弹窗
+        // 再次出现）并真正执行——证明第一次的 AlwaysAllow 未持久化。
+        runtime.set_query_cancel(None);
+        let second = runtime
+            .dispatch(&tool_use("counting_mutator", Value::Null), &mut ctx)
+            .await;
+        assert!(
+            !second.is_error,
+            "second dispatch must re-confirm and execute: {second:?}"
+        );
+        assert_eq!(executed.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn todo_write_respects_deny_read_quadrant() {
+        // review 修复回归：todo_write 是 read-modify-write 复合操作（Native
+        // 端读全文再写），deny_read 区域的 TODO 文件不得被读取——历史只走
+        // 写象限，与 edit_file 的读象限保护不对称（侧信道 + 配置预期违背）。
+        use crate::policy::sandbox_policy::FilesystemPolicy;
+        use crate::tools::interact::TodoWriteTool;
+        let engine = crate::policy::PermissionEngine::with_filesystem_policy(
+            PermissionMode::Default,
+            PermissionSettings::default(),
+            FilesystemPolicy {
+                deny_read: vec!["/tmp/secret/*".into()],
+                ..Default::default()
+            },
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, None);
+        runtime.register(Box::new(TodoWriteTool));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp/secret"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(
+                &tool_use(
+                    "todo_write",
+                    serde_json::json!({"item": "x", "path": "TODO.md"}),
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("not readable under the sandbox filesystem policy"),
+            "{result:?}"
+        );
+        // 控制组：无 deny_read 时 todo_write 正常执行（读象限放行；
+        // FullAuto 免确认）。
+        let open_engine = crate::policy::PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+        );
+        let mut open_runtime = ToolRuntime::new().with_permissions(open_engine, None);
+        open_runtime.register(Box::new(TodoWriteTool));
+        let temp_cwd = std::env::temp_dir();
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: &temp_cwd,
+            metadata: &mut metadata,
+        };
+        let ok = open_runtime
+            .dispatch(
+                &tool_use(
+                    "todo_write",
+                    serde_json::json!({"item": "x", "path": "ains-todo-test.md"}),
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(!ok.is_error, "unrestricted todo_write must succeed: {ok:?}");
     }
 
     #[tokio::test]

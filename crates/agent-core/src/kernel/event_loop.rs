@@ -302,6 +302,12 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         self.emit(StreamEvent::Status {
                             message: QUERY_INTERRUPTED_STATUS.into(),
                         });
+                        // 与自然完成对称：中断中止回合同样触发 Stop hook（观察性），
+                        // 供宿主做轮次收尾（计费/日志/状态持久化）；review 修复：
+                        // 历史三条中断路径均不执行 Stop hook，中断轮收尾缺失。
+                        let mut payload = lifecycle_payload(HookEvent::Stop, &self.config.cwd);
+                        payload.insert("stop_reason".into(), Value::String("interrupted".into()));
+                        self.run_observational_hook(HookEvent::Stop, payload).await;
                         AgentState::Idle
                     } else if turn >= self.config.max_turns {
                         self.emit(StreamEvent::Error {
@@ -403,6 +409,10 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         self.emit(StreamEvent::Status {
                             message: QUERY_INTERRUPTED_STATUS.into(),
                         });
+                        // 中断回填后同样触发 Stop hook（观察性；见 Querying 中断路径）。
+                        let mut payload = lifecycle_payload(HookEvent::Stop, &self.config.cwd);
+                        payload.insert("stop_reason".into(), Value::String("interrupted".into()));
+                        self.run_observational_hook(HookEvent::Stop, payload).await;
                         AgentState::Idle
                     } else {
                         // 注入查询级取消标志（review 接线）：UI 中断置位后，
@@ -451,7 +461,9 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                             role: Role::User,
                             content: results,
                         });
-                        AgentState::Querying { turn: turn + 1 }
+                        AgentState::Querying {
+                            turn: turn.saturating_add(1),
+                        }
                     }
                 }
                 AgentState::Compacting { trigger } => {
@@ -461,6 +473,10 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         self.emit(StreamEvent::Status {
                             message: QUERY_INTERRUPTED_STATUS.into(),
                         });
+                        // 中断中止回合同样触发 Stop hook（观察性；见 Querying 中断路径）。
+                        let mut payload = lifecycle_payload(HookEvent::Stop, &self.config.cwd);
+                        payload.insert("stop_reason".into(), Value::String("interrupted".into()));
+                        self.run_observational_hook(HookEvent::Stop, payload).await;
                         AgentState::Idle
                     } else {
                         // 真实降级链与生命周期 hook 由 run_compaction 统一处理。
@@ -717,7 +733,15 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
 }
 
 /// 在任何工具分发前校验整批协议 ID，保证 tool_result 可唯一回配。
+/// 单批数量同样受限：模型输出是协议信任面内的不可信输入，无上限批次
+/// 会同时派生同数量 hook 进程 / 并发 execute 与事件洪泛（资源耗尽面）。
+/// 超限与 ID 违规同口径：整批拒绝 + turn 忽略（review 修复）。
+const MAX_TOOL_USE_BATCH: usize = 64;
+
 fn validate_tool_use_ids(tool_uses: &[ToolUse]) -> Result<(), &'static str> {
+    if tool_uses.len() > MAX_TOOL_USE_BATCH {
+        return Err("tool_use batch exceeds the maximum size (64)");
+    }
     let mut seen = HashSet::with_capacity(tool_uses.len());
     for tool_use in tool_uses {
         if tool_use.id.trim().is_empty() {

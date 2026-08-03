@@ -128,10 +128,10 @@ fn is_bogus_ip(value: &str) -> bool {
 /// 从用户文本中排除凭据，避免把会话里的 secret 变成跨会话持久化数据或 Prompt。
 ///
 /// 这不是 secret 检测器；它只覆盖最常见、应当零容忍的形态：显式赋值、Bearer
-/// 值、URL userinfo，以及**自然语言凭据陈述**（敏感关键词后跟空格分隔的值，如
-/// `"my password hunter2"` / `"use the token abcdef"`）。宁可放弃一条偏好
-/// （误杀如 `"password managers"` 的正常陈述），也不能把凭据写入
-/// `PreferenceStore`。
+/// 值、URL userinfo，以及**自然语言凭据陈述**（敏感关键词后跟空白或常见标点
+/// 分隔的值，如 `"my password hunter2"` / `"use the token abcdef"` /
+/// `"password, hunter2"`）。宁可放弃一条偏好（误杀如 `"password managers"`
+/// 的正常陈述），也不能把凭据写入 `PreferenceStore`。
 fn contains_secret_material(value: &str) -> bool {
     static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
@@ -150,9 +150,14 @@ fn contains_secret_material(value: &str) -> bool {
     // password/passwd/secret/api key/access token 后的任意单词均视为凭据
     // （误杀正常陈述可接受）；token 单独出现太宽泛（"token in the file"），
     // 仅当其值呈密钥样式（≥6 位字母数字）时拒绝。
+    // 分隔符覆盖空白与常见标点（`,` `;` `/` `\` `|`）及换行：
+    // `"password, hunter2"` / `"secret/passw0rd"` 等形态此前只要求空白
+    // 分隔，标点紧贴敏感词时会绕过过滤进入偏好事实（跨会话持久化 + 注入
+    // System Prompt）。换行同样按分隔处理（rule/preference 捕获层以换行
+    // 截断，此处为纵深防御）。
     static LOOSE_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)\b(?:password|passwd|secret|api[ _-]?key|access[ _-]?token)\b[^\S\n]+\S+|(?i)\btoken\b[^\S\n]+[A-Za-z0-9._~+/=-]{6,}",
+            r"(?i)\b(?:password|passwd|secret|api[ _-]?key|access[ _-]?token)\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*\S+|(?i)\btoken\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*[A-Za-z0-9._~+/=-]{6,}",
         )
         .expect("valid regex")
     });
@@ -206,6 +211,9 @@ fn fact_is_safe(fact: &PreferenceFact) -> bool {
     canonical_label(&fact.kind).is_some()
         && !fact.value.is_empty()
         && !contains_secret_material(&fact.value)
+        // 控制字符（\n/\r/\t 等）会破坏 `- {value}` 的 markdown 行结构，
+        // 让外部同步数据成为 Prompt 结构内容；偏好值不应含控制字符。
+        && !fact.value.chars().any(|character| character.is_control())
         && match fact.kind.as_str() {
             "ssh_host" => is_safe_ssh_target(&fact.value),
             "api_endpoint" => is_safe_api_endpoint(&fact.value),
@@ -552,6 +560,85 @@ mod tests {
         );
         assert!(kept.iter().any(|f| f.kind == "preference"));
         assert!(kept.iter().any(|f| f.kind == "rule"));
+    }
+
+    #[test]
+    fn extraction_rejects_punctuation_separated_credentials() {
+        // review 修复回归：敏感词后跟常见标点（`,` `;` `/` `\` `|`）的凭据
+        // 形态（如 `"password, hunter2"`）此前只要求空白分隔、可绕过
+        // LOOSE_CREDENTIAL，作为偏好/规则持久化并注入后续会话的 System Prompt。
+        let facts = extract_facts_from_text(
+            "Always use password, hunter2. \
+             I prefer token; abcdef123. \
+             Never use secret/passw0rd. \
+             Always set api key|xyz98765.",
+        );
+        assert!(
+            facts.iter().all(|fact| fact.kind != "preference"),
+            "preference facts must reject punctuation-separated credentials: {facts:?}"
+        );
+        assert!(
+            facts.iter().all(|fact| fact.kind != "rule"),
+            "rule facts must reject punctuation-separated credentials: {facts:?}"
+        );
+
+        // 无敏感关键词的标点分隔正常陈述不受影响。
+        let kept = extract_facts_from_text("I prefer dark mode, concise answers.");
+        assert!(kept.iter().any(|f| f.kind == "preference"));
+    }
+
+    #[test]
+    fn contains_secret_material_covers_punctuation_and_newline_separators() {
+        // 直接门面断言：标点/换行分隔的凭据形态必须被识别。
+        for value in [
+            "use password, hunter2",
+            "use password; hunter2",
+            "use password/hunter2",
+            "use password\\hunter2",
+            "use password|hunter2",
+            "use secret/passw0rd",
+            "use api key|xyz98765",
+            "use token; abcdef123",
+            "password\nhunter2",
+            "use token\nabcdef123",
+        ] {
+            assert!(
+                contains_secret_material(value),
+                "credential separator bypass: {value:?}"
+            );
+        }
+        // 空白分隔原有行为不回退；无敏感词的值不受影响。
+        assert!(contains_secret_material("use password hunter2"));
+        assert!(!contains_secret_material("use dark mode, concise answers"));
+        assert!(!contains_secret_material("token in the file"));
+    }
+
+    #[test]
+    fn normalize_fact_rejects_control_characters() {
+        // review 修复回归：含 \n 等控制字符的值会破坏 `- {value}` 的
+        // markdown 行结构（外部同步数据注入 Prompt 结构内容），必须拒绝。
+        let fact = PreferenceFact {
+            kind: "preference".into(),
+            label: "Stated preferences".into(),
+            value: "line one\n- injected list item".into(),
+            confidence: 0.7,
+        };
+        assert!(normalize_fact(fact).is_none());
+        let tabbed = PreferenceFact {
+            kind: "rule".into(),
+            label: "Rules".into(),
+            value: "always\tdo the thing".into(),
+            confidence: 0.7,
+        };
+        assert!(normalize_fact(tabbed).is_none());
+        // 正常值不受影响。
+        let normal = PreferenceFact {
+            kind: "preference".into(),
+            label: "Stated preferences".into(),
+            value: "dark mode, concise answers".into(),
+            confidence: 0.7,
+        };
+        assert!(normalize_fact(normal).is_some());
     }
 
     #[test]

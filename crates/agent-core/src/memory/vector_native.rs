@@ -199,6 +199,14 @@ impl HnswVectorIndex {
         self.len() == 0
     }
 
+    /// 物理槽位是否已饱和：槽位全占且**无墓碑可回收**。饱和时新增/更新
+    /// 在物理上都必须插入新节点（hnsw_rs 无真更新，同 id 更新也墓碑旧节点
+    /// 并插入新节点），重建也无法回收任何槽位——管理器应确定性拒绝而非
+    /// 走「写→重建→仍满→写」的 O(N) 每写全量重建循环（review 修复）。
+    pub(crate) fn is_physically_saturated(&self) -> bool {
+        self.tombstones.is_empty() && self.ids.len() >= self.max_slots
+    }
+
     fn insert_internal(&mut self, node_id: &str, vector: &[f32]) -> Result<(), MemoryError> {
         if vector.len() != self.config.dimension as usize {
             return Err(MemoryError::Storage(format!(
@@ -320,6 +328,10 @@ impl VectorIndex for HnswVectorIndex {
         std::mem::take(&mut self.rebuild_required)
     }
 
+    fn is_physically_saturated(&self) -> bool {
+        HnswVectorIndex::is_physically_saturated(self)
+    }
+
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<(String, f32)>, MemoryError> {
         if top_k == 0 || self.is_empty() {
             return Ok(Vec::new());
@@ -434,6 +446,34 @@ mod tests {
         recovered.insert_internal("first", &[0.5, 0.5]).unwrap();
         assert_eq!(recovered.len(), 1);
         assert!(!recovered.take_rebuild_required());
+    }
+
+    #[tokio::test]
+    async fn physical_saturation_is_only_when_no_tombstones_remain() {
+        // review 修复回归：物理饱和 = 槽位全占**且无墓碑可回收**。有墓碑时
+        // 重建可回收槽位（管理器应走重建自愈）；无墓碑时重建无益（管理器
+        // 确定性拒绝，避免 O(N) 每写重建循环）。
+        let config = VectorIndexConfig {
+            dimension: 2,
+            distance_metric: Metric::Cosine,
+            m: 16,
+            ef: 50,
+        };
+        let mut index =
+            HnswVectorIndex::new(MemoryNamespace::Personal, config.clone()).with_max_slots(2);
+        // 空索引未饱和。
+        assert!(!index.is_physically_saturated());
+        // 填满（无墓碑）→ 饱和。
+        index.insert_internal("a", &[1.0, 0.0]).unwrap();
+        index.insert_internal("b", &[0.0, 1.0]).unwrap();
+        assert!(index.is_physically_saturated());
+        // 移除一条（墓碑化）→ 不再饱和（重建可回收槽位）。
+        index.remove("a").await.unwrap();
+        assert!(!index.is_physically_saturated());
+        // 未满但无墓碑 → 不饱和。
+        let mut partial = HnswVectorIndex::new(MemoryNamespace::Personal, config).with_max_slots(4);
+        partial.insert_internal("a", &[1.0, 0.0]).unwrap();
+        assert!(!partial.is_physically_saturated());
     }
 
     #[tokio::test]

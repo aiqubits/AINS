@@ -388,6 +388,9 @@ impl MemoryEngine {
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<(MemoryEntry, f32)>, MemoryError> {
+        // 与写入路径同口径：查询向量分量必须全部有限（NaN/Inf 会让 i8 量化
+        // 静默映射 0 / L2 得 -Inf 分数，检索结果失真；review 修复）。
+        ensure_finite(query)?;
         let hits = self.vector.search(namespace, query, top_k).await?;
         let mut results = Vec::with_capacity(hits.len());
         for (id, score) in hits {

@@ -42,9 +42,14 @@ static ALL_PLACEHOLDER_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// 命令名合法性：非空且不含空白（与 skill command_name 同口径）。
-fn is_valid_name(name: &str) -> bool {
+pub(crate) fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(char::is_whitespace)
 }
+
+/// 命令参数展开上限（64 KiB，字节）。参数来自用户输入（slash 命令调用），
+/// 超限展开会生成超大 prompt（token 计费 + 上下文膨胀）。按 UTF-8 字符边界
+/// 截断保持有界（与 tasks/personalization 的输出预算同哲学）。
+pub const MAX_COMMAND_ARGS_BYTES: usize = 64 * 1024;
 
 /// 命令内部名称不带调用前缀 `/`。接受用户常见的 `/review` 写法并规范化，
 /// 使其与 [`CommandRegistry::lookup`] 去前缀后的查找键一致。
@@ -197,8 +202,18 @@ impl SlashCommand {
     /// 单遍替换（review 修复）：组合正则一次扫描完成位置参数与
     /// `$ARGUMENTS` 全文替换，`$10`/`${10}` 保持字面；插入的参数字面量
     /// （args 中的 `$N` / `$ARGUMENTS` 字样）不被二次改写。
+    /// 参数超 [`MAX_COMMAND_ARGS_BYTES`] 时按字符边界截断（防超大 prompt）。
     pub fn expand(&self, args: &str) -> String {
         let raw = args.trim();
+        let raw = if raw.len() > MAX_COMMAND_ARGS_BYTES {
+            let mut end = MAX_COMMAND_ARGS_BYTES;
+            while !raw.is_char_boundary(end) {
+                end -= 1;
+            }
+            &raw[..end]
+        } else {
+            raw
+        };
         let had_placeholder = self.has_placeholder();
         let positional: Vec<&str> = raw.split_whitespace().collect();
         let mut out = ALL_PLACEHOLDER_RE
@@ -550,5 +565,41 @@ mod tests {
         reg.register_markdown("a", "A").unwrap();
         let names: Vec<&str> = reg.list().iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn expand_caps_oversized_arguments_at_char_boundary() {
+        // review 修复回归：超大 args 会生成超大 prompt（token 计费 + 上下文
+        // 膨胀）；必须按 UTF-8 字符边界截断，不得切出半个多字节字符。
+        let cmd = SlashCommand::from_markdown("big", "Body: $ARGUMENTS").unwrap();
+        let huge = "x".repeat(MAX_COMMAND_ARGS_BYTES + 1024);
+        let expanded = cmd.expand(&huge);
+        assert!(
+            expanded.len() <= MAX_COMMAND_ARGS_BYTES + "Body: ".len(),
+            "expanded prompt must stay bounded: {}",
+            expanded.len()
+        );
+        // 多字节内容：截断后必须落在字符边界（不得含半个字符 → 非法 UTF-8）。
+        let huge_utf8 = "中".repeat(MAX_COMMAND_ARGS_BYTES / 3 + 100);
+        let expanded = cmd.expand(&huge_utf8);
+        assert!(std::str::from_utf8(expanded.as_bytes()).is_ok());
+        // 未超限的常规参数不受影响。
+        assert_eq!(cmd.expand("hello world"), "Body: hello world");
+    }
+
+    #[test]
+    fn bare_positional_word_boundary_behavior_is_fixed() {
+        // 固化已知权衡（模块文档 L24-27）：regex 无 look-around，裸 `$N` 以
+        // `\b` 词边界结尾——`$10` 中 `$1` 后跟数字（词字符）无边界，保持字面；
+        // Unicode 词字符（如 `界`）同样无 `\b` 边界，`$1界` 不替换，而长形式
+        // `${1}界` 无边界要求、正常替换。两种写法在同一模板中结果不同是
+        // 有意设计：模板作者应优先使用 `${N}` 长形式。
+        let cmd = SlashCommand::from_markdown("u", "a=$1界 b=${1}界").unwrap();
+        assert_eq!(cmd.expand("x"), "a=$1界 b=x界");
+        // `$10` 保持字面（词字符边界防御）；模板无占位 → 追加 Arguments。
+        let digits = SlashCommand::from_markdown("d", "$1").unwrap();
+        assert_eq!(digits.expand("1 2"), "1");
+        let tens = SlashCommand::from_markdown("t", "$10").unwrap();
+        assert_eq!(tens.expand("1 2"), "$10\n\nArguments: 1 2");
     }
 }

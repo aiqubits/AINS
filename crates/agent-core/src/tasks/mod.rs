@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;
 
+use futures::FutureExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -64,6 +65,17 @@ fn cap_task_output(mut output: String) -> String {
         output.truncate(end);
     }
     output
+}
+
+/// 将 `bytes[..len]` 回退到 UTF-8 字符边界（`len` 可能落在多字节字符中间）。
+/// 全部回退时返回空切片。预算已按 `len` 预留，少推送至多 3 字节为保守方向
+/// （与 [`cap_task_output`] 的 `is_char_boundary` 口径一致）。
+fn utf8_prefix_at_boundary(bytes: &[u8], len: usize) -> &[u8] {
+    let mut end = len.min(bytes.len());
+    while end > 0 && std::str::from_utf8(&bytes[..end]).is_err() {
+        end -= 1;
+    }
+    &bytes[..end]
 }
 
 /// 后台任务执行的异常兑底超时（7 天）。后台任务原则上由 `stop` 取消；
@@ -281,10 +293,27 @@ impl BackgroundTaskManager {
         let task_id = id.clone();
         let done = Arc::new(Notify::new());
         let streamed_bytes = Arc::new(AtomicUsize::new(0));
-        let output_state = Arc::clone(&state);
-        let output_task_id = id.clone();
+        // sink 回调只做有界计数 + UTF-8 边界回退 + FIFO 投递；实际写入由
+        // 专用 consumer 任务串行执行——review 修复：历史实现对每个 chunk
+        // 独立 tokio::spawn，多线程 runtime 下锁获取顺序无保证（preview
+        // 乱序）且高频小 chunk 产生调度风暴；unbounded channel 的 send 为
+        // 同步 O(1)，FIFO 保证投递顺序。consumer 在 exec_shell 返回（sink
+        // 随 ShellRequest drop）后 drain 剩余消息并随 channel 关闭退出。
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let sink_consumer_state = Arc::clone(&state);
+        let sink_consumer_id = id.clone();
+        tokio::spawn(async move {
+            while let Some(text) = sink_rx.recv().await {
+                let mut st = sink_consumer_state.lock().await;
+                if let Some(task) = st.tasks.get_mut(&sink_consumer_id)
+                    && task.status == TaskStatus::Running
+                {
+                    task.output.push_str(&text);
+                }
+            }
+        });
         let output_bytes_for_sink = Arc::clone(&streamed_bytes);
-        let output_sink = ShellOutputSink::new(move |chunk| {
+        let output_sink = ShellOutputSink::new(move |chunk: &[u8]| {
             // The backend already applies this cap.  Enforce it again here so
             // a custom Sandbox implementation cannot make task state unbounded.
             let accepted_len = loop {
@@ -305,17 +334,14 @@ impl BackgroundTaskManager {
                     break accepted_len;
                 }
             };
-            let accepted = &chunk[..accepted_len];
-            let text = String::from_utf8_lossy(accepted).into_owned();
-            let output_state = Arc::clone(&output_state);
-            let output_task_id = output_task_id.clone();
-            tokio::spawn(async move {
-                if let Some(task) = output_state.lock().await.tasks.get_mut(&output_task_id)
-                    && task.status == TaskStatus::Running
-                {
-                    task.output.push_str(&text);
-                }
-            });
+            // 回退到 UTF-8 字符边界：accepted_len 可能落在多字节字符中间，
+            // 直接 from_utf8_lossy 会注入 U+FFFD（与终态 cap_task_output 的
+            // is_char_boundary 口径一致）。计数已按 accepted_len 预留，
+            // 少推送 ≤3 字节为保守方向，可接受。
+            let accepted = utf8_prefix_at_boundary(chunk, accepted_len);
+            if !accepted.is_empty() {
+                let _ = sink_tx.send(String::from_utf8_lossy(accepted).into_owned());
+            }
         });
 
         // 锁内检查配额并插入 tasks + order + cancels。检查和登记不可分离，
@@ -359,18 +385,43 @@ impl BackgroundTaskManager {
         }
 
         let handle = tokio::spawn(async move {
-            let outcome = sandbox
-                .exec_shell(ShellRequest {
-                    command,
-                    cwd,
-                    // 后台任务原则上不设硬性时限（由 stop 取消）；超时仅作
-                    // 沙箱实现异常的兜底。
-                    timeout: TASK_RUNTIME_TIMEOUT,
-                    max_output_bytes: TASK_OUTPUT_MAX_BYTES,
-                    cancel: Some(Arc::clone(&cancel)),
-                    output_sink: Some(output_sink),
-                })
-                .await;
+            // 兜底：自定义沙箱实现 panic 时把任务归一化为 Failed 并完成通知，
+            // 否则任务永久卡在 Running（done 不触发、等待方挂起、
+            // MAX_ACTIVE_TASKS 配额被死任务占满）。catch_unwind 仅对 unwind
+            // 生效；panic=abort 部署下进程本就终止，任务状态无意义。
+            let outcome = std::panic::AssertUnwindSafe(async {
+                sandbox
+                    .exec_shell(ShellRequest {
+                        command,
+                        cwd,
+                        // 后台任务原则上不设硬性时限（由 stop 取消）；超时仅作
+                        // 沙箱实现异常的兜底。
+                        timeout: TASK_RUNTIME_TIMEOUT,
+                        max_output_bytes: TASK_OUTPUT_MAX_BYTES,
+                        cancel: Some(Arc::clone(&cancel)),
+                        output_sink: Some(output_sink),
+                    })
+                    .await
+            })
+            .catch_unwind()
+            .await;
+            let outcome = match outcome {
+                Ok(result) => result,
+                Err(_) => {
+                    let mut st = state.lock().await;
+                    if let Some(task) = st.tasks.get_mut(&task_id) {
+                        if task.status != TaskStatus::Killed {
+                            task.status = TaskStatus::Failed;
+                            task.status_note =
+                                Some("background task panicked inside sandbox execution".into());
+                        }
+                        st.handles.remove(&task_id);
+                        st.cancels.remove(&task_id);
+                    }
+                    done.notify_waiters();
+                    return;
+                }
+            };
             let mut st = state.lock().await;
             if let Some(task) = st.tasks.get_mut(&task_id) {
                 // 完成回写守卫：被 stop 抢占（Killed）的任务不被覆盖。
@@ -1189,6 +1240,157 @@ mod tests {
         let record = mgr.wait(&id).await.unwrap();
         assert_eq!(record.status, TaskStatus::Completed);
         assert_eq!(record.output, "first chunk\\nsecond chunk\\n");
+    }
+
+    /// 同步连续推送多个带序号 chunk 后保持任务 Running——专测 sink 投递顺序：
+    /// 历史实现对每个 chunk 独立 tokio::spawn，多线程 runtime 下锁获取顺序
+    /// 无保证，preview 可能乱序；channel FIFO 保证推送序 = 投递序。
+    struct OrderedChunksSandbox {
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl Sandbox for OrderedChunksSandbox {
+        fn name(&self) -> &'static str {
+            "test-ordered-chunks"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities {
+                shell: true,
+                ..Default::default()
+            }
+        }
+
+        async fn exec_shell(&self, request: ShellRequest) -> Result<ShellOutcome, SandboxError> {
+            let sink = request
+                .output_sink
+                .expect("background tasks install an output sink");
+            for i in 0..64 {
+                sink.push(format!("chunk-{i:02}\n").as_bytes());
+            }
+            self.release.notified().await;
+            Ok(ShellOutcome {
+                output: String::new(),
+                exit_code: Some(0),
+                timed_out: false,
+                cancelled: false,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_chunks_keep_push_order() {
+        let release = Arc::new(Notify::new());
+        let mgr = BackgroundTaskManager::with_sandbox_in_workspace(
+            Arc::new(OrderedChunksSandbox {
+                release: Arc::clone(&release),
+            }),
+            PathBuf::from("/tmp"),
+        );
+        let id = mgr
+            .spawn_shell("order", "echo ignored", Path::new("/tmp"))
+            .await
+            .unwrap();
+        // 任务仍 Running 时轮询 preview，断言 64 个 chunk 按推送序出现。
+        let preview = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = mgr.output(&id).await.unwrap();
+                if output.matches("chunk-").count() >= 64 {
+                    break output;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all 64 chunks should arrive");
+        let positions: Vec<usize> = (0..64)
+            .map(|i| {
+                preview
+                    .find(&format!("chunk-{i:02}"))
+                    .expect("chunk present")
+            })
+            .collect();
+        let mut sorted = positions.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            positions, sorted,
+            "streamed chunks must keep push order (preview: {preview:?})"
+        );
+        release.notify_waiters();
+        let _ = mgr.wait(&id).await.unwrap();
+    }
+
+    /// 在 `exec_shell` 内部 panic 的沙箱——专测 panic 兜底：任务必须归一化
+    /// 为 Failed（而非永久 Running），`done` 通知必须触发（等待方不挂起），
+    /// handles/cancels 必须清理（不残留内存累积）。
+    struct PanickingSandbox;
+
+    #[async_trait::async_trait]
+    impl Sandbox for PanickingSandbox {
+        fn name(&self) -> &'static str {
+            "test-panicking"
+        }
+
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities {
+                shell: true,
+                ..Default::default()
+            }
+        }
+
+        async fn exec_shell(&self, _request: ShellRequest) -> Result<ShellOutcome, SandboxError> {
+            panic!("custom sandbox exploded");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn panicking_sandbox_fails_task_instead_of_stuck_running() {
+        // review 修复回归：自定义沙箱 exec_shell panic 时，任务闭包整体
+        // panic → done 不通知、状态卡 Running、MAX_ACTIVE_TASKS 配额被
+        // 死任务占满。
+        let mgr = BackgroundTaskManager::with_sandbox_in_workspace(
+            Arc::new(PanickingSandbox),
+            PathBuf::from("/tmp"),
+        );
+        let id = mgr
+            .spawn_shell("panic", "should-not-run", Path::new("/tmp"))
+            .await
+            .unwrap();
+        // wait 必须返回（兜底缺失时 done 不触发，此处超时失败）。
+        let record = tokio::time::timeout(Duration::from_secs(5), mgr.wait(&id))
+            .await
+            .expect("panicking sandbox must still notify waiters")
+            .unwrap();
+        assert_eq!(record.status, TaskStatus::Failed);
+        assert!(
+            record
+                .status_note
+                .as_deref()
+                .is_some_and(|note| note.contains("panicked")),
+            "{record:?}"
+        );
+        // handles/cancels 已清理（防长期运行的内存累积）。
+        let st = mgr.state.lock().await;
+        assert!(!st.handles.contains_key(&id));
+        assert!(!st.cancels.contains_key(&id));
+    }
+
+    #[test]
+    fn utf8_prefix_at_boundary_never_splits_characters() {
+        // 回归：截断落在多字节字符中间时直接 from_utf8_lossy 会注入 U+FFFD
+        // （与终态 cap_task_output 的 is_char_boundary 口径不一致）。
+        let bytes = "ab中c".as_bytes(); // 中 = 3 字节
+        assert_eq!(utf8_prefix_at_boundary(bytes, 0), b"");
+        assert_eq!(utf8_prefix_at_boundary(bytes, 3), "ab".as_bytes());
+        assert_eq!(utf8_prefix_at_boundary(bytes, 4), "ab".as_bytes());
+        assert_eq!(utf8_prefix_at_boundary(bytes, 5), "ab中".as_bytes());
+        // 边界恰好完整时原样保留；超长 len 钳制到切片长度。
+        assert_eq!(utf8_prefix_at_boundary(bytes, 6), bytes);
+        assert_eq!(utf8_prefix_at_boundary(bytes, 100), bytes);
+        assert_eq!(utf8_prefix_at_boundary(b"", 5), b"");
+        // 纯 ASCII 内容不受影响。
+        assert_eq!(utf8_prefix_at_boundary(b"hello", 3), b"hel");
     }
 
     struct OversizedOutputSandbox;

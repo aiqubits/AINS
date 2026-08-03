@@ -18,7 +18,7 @@
 //! 另：与 `tasks/`（后台任务）共享进程级单例时，需先补齐任务归属校验
 //! （见 `tasks` 模块文档）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -143,22 +143,24 @@ fn inbox_prefix(scope: &str, agent: &str) -> String {
 }
 
 /// 校验参与信箱 key 分层的 agent 名称。所有读取和写入入口都必须使用它：
-/// 空名会退化为共享 `swarm/mbox/` 前缀，`/` 会改变收件箱层级。
+/// 空名会退化为共享 `swarm/mbox/` 前缀，`/` 会改变收件箱层级，`.` / `..`
+/// 会让 key 前缀含路径语义段（未来 KV 后端对 key 做路径解释时扩大操作面）。
 fn validate_agent_name(agent: &str, field: &str) -> Result<(), MemoryError> {
-    if agent.is_empty() || agent.contains('/') {
+    if agent.is_empty() || agent.contains('/') || matches!(agent, "." | "..") {
         return Err(MemoryError::Storage(format!(
-            "mailbox {field} must be non-empty and contain no '/'"
+            "mailbox {field} must be non-empty, contain no '/', and not be '.' or '..'"
         )));
     }
     Ok(())
 }
 
 /// 消息 ID 由 [`KvMailbox::post`] 生成且不含路径分隔符。拒绝调用方注入
-/// 分隔符，避免未来 KV 后端对 key 做路径语义解释时扩大操作范围。
+/// 分隔符与 `.` / `..` 段，避免未来 KV 后端对 key 做路径语义解释时扩大操作范围。
 fn validate_message_id(message_id: &str) -> Result<(), MemoryError> {
-    if message_id.is_empty() || message_id.contains('/') {
+    if message_id.is_empty() || message_id.contains('/') || matches!(message_id, "." | "..") {
         return Err(MemoryError::Storage(
-            "mailbox message id must be non-empty and contain no '/'".to_string(),
+            "mailbox message id must be non-empty, contain no '/', and not be '.' or '..'"
+                .to_string(),
         ));
     }
     Ok(())
@@ -222,6 +224,10 @@ pub struct KvMailbox {
     /// 同一逻辑 swarm（或会话）共享的稳定 scope；防止同一持久化 KV 内
     /// 不同 swarm 使用相同 agent 名称时混读信箱。
     scope: String,
+    /// 串行化"读-改-写"（[`Self::mark_read`]）与删除（[`Self::clear_recipient`] /
+    /// [`Self::prune_read`]），防止并发下已删除的消息被 `mark_read` 的
+    /// get→set 重新写回（"复活"）。双 target 通用（futures 锁可跨 await）。
+    maintenance: futures::lock::Mutex<()>,
 }
 
 impl KvMailbox {
@@ -231,15 +237,20 @@ impl KvMailbox {
         Self {
             kv,
             scope: new_mailbox_scope(),
+            maintenance: futures::lock::Mutex::new(()),
         }
     }
 
     /// 创建 / 重连指定逻辑 swarm 的信箱。`scope` 是存储 key 的一个路径段，
-    /// 因此不能为空且不能包含 `/`。
+    /// 因此不能为空且不能包含 `/`（也不能为 `.` / `..`）。
     pub fn with_scope(kv: Arc<dyn KvStore>, scope: impl Into<String>) -> Result<Self, MemoryError> {
         let scope = scope.into();
         validate_agent_name(&scope, "scope")?;
-        Ok(Self { kv, scope })
+        Ok(Self {
+            kv,
+            scope,
+            maintenance: futures::lock::Mutex::new(()),
+        })
     }
 
     /// 当前信箱的逻辑 swarm/session scope。
@@ -331,6 +342,10 @@ impl KvMailbox {
     pub async fn mark_read(&self, recipient: &str, message_id: &str) -> Result<(), MemoryError> {
         validate_agent_name(recipient, "recipient")?;
         validate_message_id(message_id)?;
+        // 与删除路径互斥：并发 clear_recipient / prune_read 期间，get→set
+        // 会把已删除的消息重新写回（"复活"）；持锁后删除要么整体先于读，
+        // 要么整体后于写，最终状态一致（review 修复）。
+        let _guard = self.maintenance.lock().await;
         let key = format!("{}{message_id}", inbox_prefix(&self.scope, recipient));
         let Some(value) = self.kv.get(&key).await? else {
             return Err(MemoryError::NotFound(message_id.to_string()));
@@ -350,6 +365,8 @@ impl KvMailbox {
     /// 历史实现无任何删除路径）。
     pub async fn clear_recipient(&self, recipient: &str) -> Result<u64, MemoryError> {
         validate_agent_name(recipient, "recipient")?;
+        // 与 mark_read 的 get→set 互斥，防止已删除消息被重新写回（见 mark_read）。
+        let _guard = self.maintenance.lock().await;
         self.kv
             .delete_prefix(&inbox_prefix(&self.scope, recipient))
             .await
@@ -360,6 +377,8 @@ impl KvMailbox {
     /// 读取已读标记需解析载荷：损坏行跳过（不误删）。
     pub async fn prune_read(&self, recipient: &str) -> Result<u64, MemoryError> {
         validate_agent_name(recipient, "recipient")?;
+        // 与 mark_read 的 get→set 互斥，防止已删除消息被重新写回（见 mark_read）。
+        let _guard = self.maintenance.lock().await;
         let mut removed = 0;
         for key in self
             .kv
@@ -409,11 +428,19 @@ pub trait TeammateRunner: MaybeSendSync {
 pub struct InProcessExecutor {
     registry: AgentRegistry,
     runner: Arc<dyn TeammateRunner>,
+    /// 运行中集合：同一子代理名并发派发时拒绝后到者（fail-fast，防止
+    /// 副作用类任务双跑）。宿主如需要队列/并发配额语义，可在 runner 接线层
+    /// 自行扩展（review 修复：历史实现无并发保护，同名 agent 可双跑）。
+    running: std::sync::Mutex<HashSet<String>>,
 }
 
 impl InProcessExecutor {
     pub fn new(registry: AgentRegistry, runner: Arc<dyn TeammateRunner>) -> Self {
-        Self { registry, runner }
+        Self {
+            registry,
+            runner,
+            running: std::sync::Mutex::new(HashSet::new()),
+        }
     }
 
     pub fn registry(&self) -> &AgentRegistry {
@@ -421,12 +448,24 @@ impl InProcessExecutor {
     }
 
     /// 派发任务：查定义 → 交 runner 运行 → 归一化为 [`TeammateResult`]。
-    /// 未注册的子代理返回 `NotFound`。
+    /// 未注册的子代理返回 `NotFound`；同一子代理并发派发返回 `Storage`
+    /// 错误（防双跑）。
     pub async fn dispatch(&self, task: TeammateTask) -> Result<TeammateResult, MemoryError> {
+        let agent = task.agent.clone();
         let def = self
             .registry
             .get(&task.agent)
             .ok_or_else(|| MemoryError::NotFound(task.agent.clone()))?;
+        {
+            let mut running = self.running.lock().unwrap();
+            if !running.insert(task.agent.clone()) {
+                return Err(MemoryError::Storage(format!(
+                    "sub-agent '{}' is already running; concurrent dispatch refused",
+                    task.agent
+                )));
+            }
+        }
+        // 运行中集合必须与 runner 的执行生命周期一致（成功/失败均清理）。
         let result = match self.runner.run(def, &task).await {
             Ok(output) => TeammateResult {
                 agent: task.agent,
@@ -439,6 +478,7 @@ impl InProcessExecutor {
                 success: false,
             },
         };
+        self.running.lock().unwrap().remove(&agent);
         Ok(result)
     }
 }
@@ -455,6 +495,8 @@ mod tests {
     use std::sync::Mutex;
     #[cfg(not(target_arch = "wasm32"))]
     use std::time::Duration;
+    #[cfg(not(target_arch = "wasm32"))]
+    use tokio::sync::Notify;
 
     /// 轻量内存 KvStore mock（信箱测试用；真实 redb 集成见 memory_native.rs）。
     /// 仅 native 测试使用（信箱投递测试依赖 tokio）。
@@ -781,5 +823,170 @@ mod tests {
             })
             .await;
         assert!(matches!(missing, Err(MemoryError::NotFound(_))));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn mailbox_rejects_dot_path_segment_abuse() {
+        // review 修复回归：`.` / `..` 作为 scope / agent / message id 会让
+        // key 前缀含路径语义段（未来 KV 后端对 key 做路径解释时扩大操作面）。
+        let shared = Arc::new(MockKvStore::new());
+        for invalid in [".", ".."] {
+            assert!(
+                matches!(
+                    KvMailbox::with_scope(Arc::clone(&shared) as Arc<_>, invalid),
+                    Err(MemoryError::Storage(_))
+                ),
+                "scope {invalid:?} must be rejected"
+            );
+        }
+        let mbox = KvMailbox::new(Arc::new(MockKvStore::new()));
+        for field in [".", ".."] {
+            assert!(matches!(
+                mbox.post(field, "lead", "x").await,
+                Err(MemoryError::Storage(_))
+            ));
+            assert!(matches!(
+                mbox.post("lead", field, "x").await,
+                Err(MemoryError::Storage(_))
+            ));
+            assert!(matches!(
+                mbox.inbox(field).await,
+                Err(MemoryError::Storage(_))
+            ));
+            assert!(matches!(
+                mbox.mark_read("lead", field).await,
+                Err(MemoryError::Storage(_))
+            ));
+            assert!(matches!(
+                mbox.clear_recipient(field).await,
+                Err(MemoryError::Storage(_))
+            ));
+            assert!(matches!(
+                mbox.prune_read(field).await,
+                Err(MemoryError::Storage(_))
+            ));
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_clear_and_mark_read_does_not_resurrect_messages() {
+        // review 修复回归：mark_read 的 get→set 与 clear_recipient 并发时，
+        // 已删除的消息可能被重新写回（"复活"）。邮箱级锁串行化两类操作后，
+        // 无论交错顺序如何，删除必须"赢"：最终收件箱为空。
+        let mbox = Arc::new(KvMailbox::new(Arc::new(MockKvStore::new())));
+        let mut ids = Vec::new();
+        for i in 0..8 {
+            ids.push(
+                mbox.post("researcher", "lead", &format!("msg-{i}"))
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let mbox = Arc::clone(&mbox);
+            let id = ids[0].clone();
+            handles.push(tokio::spawn(async move {
+                let _ = mbox.mark_read("lead", &id).await;
+            }));
+        }
+        let clear_mbox = Arc::clone(&mbox);
+        handles.push(tokio::spawn(async move {
+            let _ = clear_mbox.clear_recipient("lead").await;
+        }));
+        for handle in handles {
+            let _ = handle.await;
+        }
+        assert!(
+            mbox.inbox("lead").await.unwrap().is_empty(),
+            "cleared messages must not be resurrected by concurrent mark_read"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    struct BlockingRunner {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[async_trait::async_trait]
+    impl TeammateRunner for BlockingRunner {
+        async fn run(&self, _def: &AgentDefinition, task: &TeammateTask) -> Result<String, String> {
+            self.started.notify_waiters();
+            self.release.notified().await;
+            Ok(format!("done: {}", task.prompt))
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_dispatch_to_same_agent_is_refused() {
+        // review 修复回归：历史实现无并发保护，同名子代理可被并发派发
+        // （副作用类任务双跑）。运行中集合门拒绝后到者，完成后再放行。
+        let mut reg = AgentRegistry::new();
+        reg.register(AgentDefinition::new("worker", "works"));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let exec = Arc::new(InProcessExecutor::new(
+            reg,
+            Arc::new(BlockingRunner {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+            }),
+        ));
+        // 先以 enable 模式注册 started waiter（Notify::notify_waiters 不保留
+        // permit，晚注册会错过通知导致测试挂起），再派发第一个任务。
+        let ready = started.notified();
+        tokio::pin!(ready);
+        ready.as_mut().enable();
+        let first = {
+            let exec = Arc::clone(&exec);
+            tokio::spawn(async move {
+                exec.dispatch(TeammateTask {
+                    agent: "worker".into(),
+                    prompt: "one".into(),
+                })
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), &mut ready)
+            .await
+            .expect("first dispatch should block inside the runner");
+        let second = {
+            let exec = Arc::clone(&exec);
+            tokio::spawn(async move {
+                exec.dispatch(TeammateTask {
+                    agent: "worker".into(),
+                    prompt: "two".into(),
+                })
+                .await
+            })
+        };
+        // 后到者必须被拒（fail-fast，防双跑）。
+        let err = second.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, MemoryError::Storage(_)),
+            "concurrent dispatch must be refused: {err:?}"
+        );
+        // 释放第一个：正常运行完成，且运行中集合被清理（可再次派发）。
+        release.notify_waiters();
+        let ok = first.await.unwrap().unwrap();
+        assert!(ok.success);
+        assert_eq!(ok.output, "done: one");
+        // 再次派发：runner 会再次等待 release。notify_one 在无 waiter 时
+        // 保留 permit，预先通知使 retry 的等待立即完成（notify_waiters
+        // 不保留 permit，此处不能复用）。
+        release.notify_one();
+        let retry = exec
+            .dispatch(TeammateTask {
+                agent: "worker".into(),
+                prompt: "three".into(),
+            })
+            .await
+            .unwrap();
+        assert!(retry.success);
     }
 }

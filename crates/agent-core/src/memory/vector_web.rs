@@ -164,7 +164,9 @@ impl VectorIndex for LinearVectorIndex {
             .collect();
         // `total_cmp` 而非 `partial_cmp`：分数经 ensure_finite 保证无 NaN，
         // 但 total_cmp 让排序确定性不依赖 NaN 边界语义（防御性）。
-        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // 分数并列时按 node_id 升序二次排序：HashMap 迭代序无保证，
+        // 双键排序保证同输入同结果（review 修复）。
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         scored.truncate(top_k);
         Ok(scored)
     }

@@ -147,6 +147,7 @@ impl Plugin {
         spec: PluginSpec,
         enabled_override: Option<bool>,
     ) -> Result<Self, CommandError> {
+        validate_plugin_names(&spec)?;
         let commands = spec
             .commands
             .iter()
@@ -168,6 +169,52 @@ impl Plugin {
             mcp_servers: spec.mcp_servers,
         })
     }
+}
+
+/// 校验清单中参与注册 / 汇总的名称（与 commands 的 `is_valid_name` 同口径）：
+/// 空名 / 含空白名会作为空 key 或冲突条目透出到上层注册面（SkillStore、
+/// MCP 子系统等），必须在解析期拒绝（review 修复）。命令名由
+/// [`SlashCommand::from_markdown`] 自校验，不在此重复。
+fn validate_plugin_names(spec: &PluginSpec) -> Result<(), CommandError> {
+    if !crate::commands::is_valid_name(&spec.name) {
+        return Err(CommandError::InvalidFormat(format!(
+            "plugin name {:?} must be non-empty and contain no whitespace",
+            spec.name
+        )));
+    }
+    for skill in &spec.skills {
+        if !crate::commands::is_valid_name(&skill.name) {
+            return Err(CommandError::InvalidFormat(format!(
+                "plugin skill name {:?} must be non-empty and contain no whitespace",
+                skill.name
+            )));
+        }
+    }
+    for tool in &spec.tools {
+        if !crate::commands::is_valid_name(&tool.name) {
+            return Err(CommandError::InvalidFormat(format!(
+                "plugin tool name {:?} must be non-empty and contain no whitespace",
+                tool.name
+            )));
+        }
+        if let PluginToolSource::Mcp { server } = &tool.source
+            && !crate::commands::is_valid_name(server)
+        {
+            return Err(CommandError::InvalidFormat(format!(
+                "plugin tool mcp server {:?} must be non-empty and contain no whitespace",
+                server
+            )));
+        }
+    }
+    for mcp in &spec.mcp_servers {
+        if !crate::commands::is_valid_name(&mcp.name) {
+            return Err(CommandError::InvalidFormat(format!(
+                "plugin mcp server name {:?} must be non-empty and contain no whitespace",
+                mcp.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 五注册面统一注入的汇总：命令 / hooks 已直接注入既有注册表；
@@ -434,5 +481,29 @@ mod tests {
                 server: "docs".into()
             }
         );
+    }
+
+    #[test]
+    fn invalid_registration_names_reject_plugin() {
+        // review 修复回归：空名 / 含空白名会作为空 key 或冲突条目透出到
+        // 上层注册面（SkillStore / MCP 子系统），必须在解析期拒绝。
+        let bad_names = [
+            r#"{"name":""}"#,
+            r#"{"name":"has space"}"#,
+            r#"{"name":"ok","skills":[{"name":"","content":"x"}]}"#,
+            r#"{"name":"ok","skills":[{"name":"bad skill","content":"x"}]}"#,
+            r#"{"name":"ok","tools":[{"name":"","description":"d","source":{"kind":"builtin"}}]}"#,
+            r#"{"name":"ok","tools":[{"name":"t","description":"d","source":{"kind":"mcp","server":""}}]}"#,
+            r#"{"name":"ok","mcp_servers":[{"name":"bad server","transport":"http","url":"https://x"}]}"#,
+        ];
+        for manifest in bad_names {
+            let error = Plugin::from_json(manifest, None).unwrap_err();
+            assert!(
+                matches!(error, CommandError::InvalidFormat(_)),
+                "{manifest} must be rejected: {error:?}"
+            );
+        }
+        // 合法清单不受影响。
+        assert!(Plugin::from_json(MANIFEST, None).is_ok());
     }
 }

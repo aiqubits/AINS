@@ -121,7 +121,18 @@ pub fn AgentChat() -> Element {
             if let Some(mut question_rx) = bridge.interaction_rx.take() {
                 spawn(async move {
                     while let Some(msg) = question_rx.next().await {
-                        pending_question.set(Some(msg));
+                        // 与权限泵同口径：中断置位时不再弹窗（Kernel 在批内
+                        // 不检查中断，迟到的弹窗会让用户多关一次；空回复即
+                        // 中止该交互，review 修复）。
+                        if interrupt_sig
+                            .read()
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                        {
+                            let _ = msg.respond.send(String::new());
+                        } else {
+                            pending_question.set(Some(msg));
+                        }
                     }
                 });
             }

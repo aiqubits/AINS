@@ -1821,3 +1821,116 @@ async fn snapshot_with_dangling_tool_use_roundtrips_and_next_query_succeeds() {
             .any(|b| matches!(b, ContentBlock::ToolUse { id, .. } if id == "toolu_crash"))
     }));
 }
+
+#[tokio::test]
+async fn oversized_tool_batch_is_rejected_whole() {
+    // review 修复回归：无上限工具批会让模型（协议信任面内不可信输入）
+    // 单轮派生同数量 hook 进程 / 并发 execute 与事件洪泛（资源耗尽面）。
+    // 超限批次整批拒绝 + turn 忽略，不执行任何工具。
+    let content: Vec<ContentBlock> = (0..65)
+        .map(|i| ContentBlock::ToolUse {
+            id: format!("tu_{i:02}"),
+            name: "echo".into(),
+            input: json!({}),
+        })
+        .collect();
+    let model = Arc::new(ScriptedModelClient::new(vec![ScriptedModelClient::turn(
+        ConversationMessage {
+            role: Role::Assistant,
+            content,
+        },
+        usage(),
+    )]));
+    let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(EchoTool)],
+        test_config(),
+    );
+    event_tx.try_send(user_message("big batch")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    // 整批拒绝：错误事件 + 无任何工具执行
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Error { message, .. } if message.contains("invalid tool_use batch")
+        )),
+        "oversized batch must be rejected: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolExecutionStarted { .. })),
+        "no tool may execute from an oversized batch: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn interrupt_at_tool_boundary_fires_stop_hook() {
+    // review 修复回归：中断中止回合同样必须触发 Stop hook（与自然完成
+    // 对称，stop_reason=interrupted），供宿主做轮次收尾（计费/日志/状态
+    // 持久化）；历史三条中断路径均不执行 Stop hook，中断轮收尾缺失。
+    let mut registry = HookRegistry::new();
+    registry.register(
+        HookEvent::Stop,
+        HookDefinition::Prompt(PromptHookDefinition {
+            prompt: "$ARGUMENTS".into(),
+            model: None,
+            timeout_seconds: 5,
+            matcher: None,
+            block_on_failure: true,
+            priority: 0,
+        }),
+    );
+    let hook_model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+    ]));
+    let hooks = Arc::new(
+        HookExecutor::new(registry, std::env::temp_dir())
+            .with_model(Arc::clone(&hook_model) as Arc<_>, None),
+    );
+    let runtime = ToolRuntime::new().with_hooks(hooks);
+    let model = Arc::new(InterruptAfterToolTurnClient {
+        message: ScriptedModelClient::assistant_tool_use(None, "tu_1", "echo", json!({})),
+        interrupt: Arc::new(std::sync::Mutex::new(None)),
+    });
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+            Arc::clone(&model) as Arc<_>,
+            runtime,
+            test_config(),
+        );
+    // 模型流在 Complete 后置中断：工具批分发前命中 ExecutingTools 中断分支。
+    *model.interrupt.lock().unwrap() = Some(kernel.interrupt_handle());
+    event_tx.try_send(user_message("run")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    // 中断 Status 已发出（回合被中止）
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS
+        )),
+        "{events:?}"
+    );
+    // Stop hook 已触发且 stop_reason=interrupted
+    let requests = hook_model.recorded_requests();
+    let stop_payload = requests
+        .iter()
+        .find(|request| request.messages[0].text().contains("\"event\":\"stop\""))
+        .expect("interrupt must fire the Stop hook");
+    assert!(
+        stop_payload.messages[0]
+            .text()
+            .contains("\"stop_reason\":\"interrupted\""),
+        "{stop_payload:?}"
+    );
+}

@@ -173,7 +173,15 @@ pub fn quantize_i8(vector: &[f32]) -> QuantizedVector {
             m
         }
     });
-    let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+    let scale = if max_abs > 0.0 {
+        let scale = max_abs / 127.0;
+        // subnormal 级 max_abs（< ~1.78e-43）除以 127 会下溢为 0 → v/0 = ±Inf
+        // → round/clamp 饱和为 ±127，Euclidean 反量化（dequantize_i8）严重失真。
+        // 下溢时回退 1.0（分量映射为 ±1，方向保留，Cosine 尺度不变性不受影响）。
+        if scale == 0.0 { 1.0 } else { scale }
+    } else {
+        1.0
+    };
     let data = vector
         .iter()
         .map(|&v| {
@@ -282,6 +290,14 @@ pub trait VectorIndex: MaybeSendSync {
         false
     }
 
+    /// 物理槽位是否已饱和（槽位全占且无墓碑可回收）。默认实现保守返回
+    /// `false`（线性表后端无独立物理槽位概念）；Native HNSW 覆盖为真实
+    /// 判定——饱和时管理器确定性拒绝写入，避免"写→重建→仍满→写"的
+    /// O(N) 每写全量重建（review 修复）。
+    fn is_physically_saturated(&self) -> bool {
+        false
+    }
+
     /// 相似度检索，返回 `(node_id, score)`，score 方向与 Metric 语义一致。
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<(String, f32)>, MemoryError>;
 
@@ -386,6 +402,24 @@ mod tests {
         assert_eq!(q.scale, 1.0);
         assert!(q.data.iter().all(|&d| d == 0));
         assert_eq!(cosine_similarity_i8(&q.data, &q.data), 0.0);
+    }
+
+    #[test]
+    fn subnormal_scale_does_not_underflow_to_zero() {
+        // review 修复回归：subnormal 级 max_abs（< ~1.78e-43）除以 127 会
+        // 下溢为 0 → v/0 = ±Inf → round/clamp 饱和为 ±127（虚假大幅值）且
+        // scale 字段为 0（调用方除零风险）。下溢时回退 scale=1.0。
+        let tiny = f32::from_bits(1); // 最小正 subnormal（~1.4e-45）
+        let q = quantize_i8(&[tiny, -tiny, 0.0]);
+        assert_eq!(q.scale, 1.0, "scale must not underflow to zero");
+        // subnormal 值无法在 i8 网格中表示（round 到 0），但不得产生
+        // 虚假的饱和 ±127；反量化结果必须有限。
+        assert!(q.data.iter().all(|&d| d == 0), "{:?}", q.data);
+        let rebuilt = dequantize_i8(&q);
+        assert!(rebuilt.iter().all(|x| x.is_finite()));
+        // 正常量级不受影响。
+        let normal = quantize_i8(&[1.0, -2.0, 0.5]);
+        assert!(normal.scale > 0.0 && normal.scale.is_finite());
     }
 
     #[test]
