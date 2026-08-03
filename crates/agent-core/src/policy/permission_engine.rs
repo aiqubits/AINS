@@ -11,6 +11,7 @@
 //! - `always allow` 会话级放行集（对应 6.11 权限交互 UI 的"总是允许"）。
 
 use std::collections::HashSet;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -18,6 +19,7 @@ use serde_json::Value;
 
 use crate::fnmatch::fnmatch;
 use crate::marker::MaybeSendSync;
+use crate::policy::sandbox_policy::FilesystemPolicy;
 
 /// 权限模式（对齐 `permissions/modes.py`；acceptEdits 等属子代理范畴，不在此）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,7 +88,7 @@ impl PermissionDecision {
         }
     }
 
-    fn deny(reason: impl Into<String>) -> Self {
+    pub(crate) fn deny(reason: impl Into<String>) -> Self {
         Self {
             allowed: false,
             requires_confirmation: false,
@@ -122,13 +124,27 @@ pub struct PermissionRequest {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait PermissionPrompt: MaybeSendSync {
-    async fn confirm(&self, request: &PermissionRequest) -> PermissionReply;
+    /// Ask the user to authorize an operation.  A supplied cancellation flag
+    /// means the surrounding query has been stopped; implementations must
+    /// fail closed rather than enqueueing a stale prompt once they observe it.
+    ///
+    /// The flag is intentionally advisory (a prompt may already be visible),
+    /// so [`ToolRuntime`](crate::tools::ToolRuntime) re-checks it after this
+    /// future resolves before it executes the tool.
+    async fn confirm(
+        &self,
+        request: &PermissionRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> PermissionReply;
 }
 
 /// 权限引擎：规则不可变，模式与会话级放行集内部可变
 /// （enter/exit_plan_mode 工具与"总是允许"答复经共享句柄写入）。
 pub struct PermissionEngine {
     settings: PermissionSettings,
+    /// 文件系统四象限策略（sandbox 策略；空 = 全放行，保持未配置时行为）。
+    /// 与用户配置的 [`PathRule`] 叠加：任一 deny 即拒。
+    filesystem: FilesystemPolicy,
     mode: RwLock<PermissionMode>,
     /// "总是允许"累积的会话级工具放行集（不持久化）。
     session_allowed: RwLock<HashSet<String>>,
@@ -136,6 +152,15 @@ pub struct PermissionEngine {
 
 impl PermissionEngine {
     pub fn new(mode: PermissionMode, settings: PermissionSettings) -> Arc<Self> {
+        Self::with_filesystem_policy(mode, settings, FilesystemPolicy::default())
+    }
+
+    /// 带文件系统四象限策略构造（sandbox 策略层注入；空策略 = 全放行）。
+    pub fn with_filesystem_policy(
+        mode: PermissionMode,
+        settings: PermissionSettings,
+        filesystem: FilesystemPolicy,
+    ) -> Arc<Self> {
         // 空/全空白 pattern 的规则丢弃（对齐基线加载告警语义）
         let mut settings = settings;
         settings.path_rules.retain(|rule| {
@@ -150,6 +175,7 @@ impl PermissionEngine {
         }
         Arc::new(Self {
             settings,
+            filesystem,
             mode: RwLock::new(mode),
             session_allowed: RwLock::new(HashSet::new()),
         })
@@ -170,6 +196,38 @@ impl PermissionEngine {
             .write()
             .expect("session allowlist lock poisoned")
             .insert(tool_name.to_string());
+    }
+
+    /// Check an additional read performed by a compound tool (for example
+    /// `edit_file`, which reads the old file before writing it).  This keeps
+    /// the read quadrant from being bypassed by a write-oriented tool.
+    pub fn file_access_allowed(&self, path: &str, is_read_only: bool) -> bool {
+        if sensitive_path_pattern(path).is_some() {
+            return false;
+        }
+        let permitted = if is_read_only {
+            self.filesystem.can_read(path)
+        } else {
+            self.filesystem.can_write(path)
+        };
+        if !permitted {
+            return false;
+        }
+        !self.settings.path_rules.iter().any(|rule| {
+            !rule.allow
+                && policy_match_paths(path)
+                    .iter()
+                    .any(|candidate| policy_path_matches(candidate, &rule.pattern))
+        })
+    }
+
+    /// Recursive traversal tools cannot soundly enforce a deny subtree from a
+    /// single root check.  Fail closed whenever deny rules exist; callers can
+    /// later add a per-entry authorizer without weakening the boundary.
+    pub fn recursive_read_allowed(&self, root: &str) -> bool {
+        self.filesystem.deny_read.is_empty()
+            && !self.settings.path_rules.iter().any(|rule| !rule.allow)
+            && self.file_access_allowed(root, true)
     }
 
     /// 三态决策：返回 允许 / 询问（requires_confirmation）/ 拒绝。
@@ -201,6 +259,23 @@ impl PermissionEngine {
             return PermissionDecision::deny(format!("{tool_name} is explicitly denied"));
         }
 
+        // 2.5 文件系统四象限（sandbox 策略）：敏感路径之后、PathRule 之前。
+        //     空策略 = 全放行（no-op）；与用户 PathRule 叠加，任一 deny 即拒。
+        //     读/写象限由 is_read_only 区分。
+        if let Some(path) = file_path {
+            let permitted = if is_read_only {
+                self.filesystem.can_read(path)
+            } else {
+                self.filesystem.can_write(path)
+            };
+            if !permitted {
+                return PermissionDecision::deny(format!(
+                    "Access denied: {path} is outside the sandbox filesystem {} policy",
+                    if is_read_only { "read" } else { "write" }
+                ));
+            }
+        }
+
         // 3. 命令 deny glob：显式命令黑名单是不可被工具白名单、
         //    AlwaysAllow 或 shell cwd 的 PathRule allow 覆盖的安全边界。
         if let Some(command) = command {
@@ -212,6 +287,13 @@ impl PermissionEngine {
                 }
             }
         }
+
+        // 3.5 敏感操作二次确认（Phase 7.2）：破坏性命令 / 隐私工具在后续
+        //     任何放行路径（PathRule allow / allowed_tools / 会话级放行 /
+        //     full_auto）之前求值。只提升确认要求，从不放宽权限（review 修复：
+        //     历史实现把本检查放在 PathRule 之后，allow 规则命中 cwd 时
+        //     短路返回，破坏性命令绕过二次确认）。
+        let sensitive = sensitive_operation(tool_name, command);
 
         // 4. PathRule glob 规则：按序求值、首个命中生效。路径规则
         //    必须先于工具白名单，避免广义的 `write_file` 授权覆盖目录 deny。
@@ -228,7 +310,16 @@ impl PermissionEngine {
                                 rule.pattern
                             ));
                         }
-                        // allow 规则命中：跳过模式门控直接放行
+                        // allow 规则命中：跳过模式门控直接放行；敏感操作除外
+                        // （破坏性命令 / 隐私工具即使被路径规则显式放行也
+                        // 必须二次确认——与 allowed_tools 分支同口径）。
+                        if let Some(reason) = sensitive {
+                            return PermissionDecision {
+                                allowed: false,
+                                requires_confirmation: true,
+                                reason: reason.into(),
+                            };
+                        }
                         return PermissionDecision::allow(format!(
                             "Path {path} matches allow rule: {}",
                             rule.pattern
@@ -238,7 +329,8 @@ impl PermissionEngine {
             }
         }
 
-        // 5. 工具显式 allow（配置级 + 会话级"总是允许"）。
+        // 5. 工具显式 allow（配置级），先做敏感操作门控：即使宿主显式授权
+        //    破坏性 shell 命令也必须二次确认，与会话级"总是允许"对齐。
         //    敏感路径与 PathRule deny 仍不可被覆盖。
         if self
             .settings
@@ -246,12 +338,22 @@ impl PermissionEngine {
             .iter()
             .any(|allowed| allowed == tool_name)
         {
+            if let Some(reason) = sensitive_operation(tool_name, command) {
+                return PermissionDecision {
+                    allowed: false,
+                    requires_confirmation: true,
+                    reason: reason.into(),
+                };
+            }
             return PermissionDecision::allow(format!("{tool_name} is explicitly allowed"));
         }
-        // 会话级"总是允许"在 plan 模式下挂起（review 十二轮修复）：早前
-        // default 模式下的 AlwaysAllow 答复不得削弱 plan 的只读保证；
-        // 放行集本身保留，退出 plan 后恢复生效。配置级 allowed_tools 是
-        // 宿主显式静态授权，仍按基线序先于模式门控。
+
+        // 5.5 敏感操作二次确认（Phase 7.2）：破坏性命令 / 隐私读取即使在
+        //     full_auto 与会话级"总是允许"下亦强制确认（类比 exit_plan_mode
+        //     的 full_auto 不可绕过）。仅提升确认要求，从不放宽权限。
+        //     判定值已在 3.5 提前求值（PathRule 之前的放行路径同源复用）。
+
+        // 会话级"总是允许"在 plan 模式下挂起；敏感操作覆盖会话放行。
         if self.mode() != PermissionMode::Plan
             && self
                 .session_allowed
@@ -259,16 +361,40 @@ impl PermissionEngine {
                 .expect("session allowlist lock poisoned")
                 .contains(tool_name)
         {
+            if let Some(reason) = sensitive {
+                return PermissionDecision {
+                    allowed: false,
+                    requires_confirmation: true,
+                    reason: reason.into(),
+                };
+            }
             return PermissionDecision::allow(format!("{tool_name} is allowed for this session"));
         }
 
-        // 6. full_auto：全部放行
+        // 6. full_auto：全部放行；敏感操作除外（强制确认）。
         if self.mode() == PermissionMode::FullAuto {
+            if let Some(reason) = sensitive {
+                return PermissionDecision {
+                    allowed: false,
+                    requires_confirmation: true,
+                    reason: reason.into(),
+                };
+            }
             return PermissionDecision::allow("Auto mode allows all tools");
         }
 
-        // 7. 只读工具恒放行
+        // 7. 只读工具恒放行；敏感工具（隐私读取）除外——即使只读也必须确认
+        //    （review 修复：历史实现只读快路径位于敏感门控之后，未来注册
+        //    `is_read_only()=true` 的隐私工具会绕过强制确认；当前 clipboard /
+        //    screenshot 恒 `is_read_only()=false` 受既有测试保护）。
         if is_read_only {
+            if let Some(reason) = sensitive {
+                return PermissionDecision {
+                    allowed: false,
+                    requires_confirmation: true,
+                    reason: reason.into(),
+                };
+            }
             return PermissionDecision::allow("read-only tools are allowed");
         }
 
@@ -379,12 +505,180 @@ fn bash_permission_hint(command: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// 隐私敏感工具（无论读写均暴露用户隐私）：即使 full_auto 也强制确认。
+const SENSITIVE_TOOLS: &[&str] = &["clipboard", "screenshot"];
+
+/// 破坏性 / 不可逆 shell 命令模式（fnmatch，小写比较）：full_auto 下亦
+/// 强制确认。宁可误报（多一次确认）也不错放。
+///
+/// **安全边界说明**：本模式表是启发式 UX 确认（可被变体绕过，如 `\rm`、
+/// 多空格、参数重排）；它不是安全边界——shell 真正的安全边界是
+/// Phase 7.1 Layer 2 平台沙箱（bwrap 容器内 `rm -rf /` 只破坏沙箱视图，
+/// 且隔离不可用时 shell 整体拒绝执行）。不要依赖本表做安全裁决。
+const SENSITIVE_COMMAND_PATTERNS: &[&str] = &[
+    "*rm -rf*",
+    "*rm -fr*",
+    "*rm -r *",
+    "*rm --recursive*",
+    "sudo *",
+    "*| sudo *",
+    "* sudo *",
+    "*mkfs*",
+    "*dd if=*",
+    "*of=/dev/*",
+    "*> /dev/sd*",
+    "*shutdown*",
+    "*reboot*",
+    "*chmod -r*",
+    "*chown -r*",
+    "*git push*--force*",
+    "*git push*-f *",
+    "*:(){*",
+    "*curl*|*sh*",
+    "*wget*|*sh*",
+];
+
+/// 敏感操作判定（Phase 7.2）：命中时返回确认理由（即使 full_auto
+/// 也强制确认）；否则 `None`。
+fn sensitive_operation(tool_name: &str, command: Option<&str>) -> Option<&'static str> {
+    if SENSITIVE_TOOLS.contains(&tool_name) {
+        return Some(
+            "This tool accesses potentially private data and always requires confirmation.",
+        );
+    }
+    if let Some(command) = command {
+        let lowered = command.to_lowercase();
+        if SENSITIVE_COMMAND_PATTERNS
+            .iter()
+            .any(|pattern| fnmatch(&lowered, pattern))
+        {
+            return Some(
+                "This command is potentially destructive and always requires confirmation, \
+                 even in full-auto mode.",
+            );
+        }
+    }
+    None
+}
+
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use crate::policy::sandbox_policy::FilesystemPolicy;
 
     fn engine(mode: PermissionMode) -> Arc<PermissionEngine> {
         PermissionEngine::new(mode, PermissionSettings::default())
+    }
+
+    #[test]
+    fn full_auto_still_confirms_destructive_shell_command() {
+        let engine = engine(PermissionMode::FullAuto);
+        let decision =
+            engine.evaluate("shell_command", false, Some("/work"), Some("rm -rf /tmp/x"));
+        assert!(!decision.allowed, "full_auto 下破坏性命令不得直接放行");
+        assert!(decision.requires_confirmation);
+        assert!(decision.reason.contains("destructive"));
+    }
+
+    #[test]
+    fn full_auto_allows_ordinary_command_without_confirmation() {
+        let engine = engine(PermissionMode::FullAuto);
+        let decision = engine.evaluate("shell_command", false, Some("/work"), Some("echo hi"));
+        assert!(decision.allowed);
+        assert!(!decision.requires_confirmation);
+    }
+
+    #[test]
+    fn full_auto_confirms_privacy_tools() {
+        let engine = engine(PermissionMode::FullAuto);
+        for tool in ["clipboard", "screenshot"] {
+            let decision = engine.evaluate(tool, false, None, None);
+            assert!(!decision.allowed, "{tool} 应在 full_auto 下仍确认");
+            assert!(decision.requires_confirmation);
+        }
+    }
+
+    #[test]
+    fn read_only_privacy_tool_still_confirms_in_default_and_plan() {
+        // review 修复回归：只读快路径不得绕过敏感工具门控。若未来某隐私
+        // 工具被注册为 is_read_only=true（如"读取剪贴板历史"），default / plan
+        // 模式下仍必须确认（full_auto 已由既有测试覆盖，此处验证其余模式）。
+        for mode in [PermissionMode::Default, PermissionMode::Plan] {
+            let engine = engine(mode);
+            for tool in ["clipboard", "screenshot"] {
+                let decision = engine.evaluate(tool, true, None, None);
+                assert!(
+                    !decision.allowed && decision.requires_confirmation,
+                    "mode {mode:?} read-only {tool} must confirm: {decision:?}"
+                );
+                assert!(
+                    decision.reason.contains("private data"),
+                    "{}",
+                    decision.reason
+                );
+            }
+        }
+        // 非敏感只读工具不受影响：default 下仍直接放行。
+        let engine = engine(PermissionMode::Default);
+        let decision = engine.evaluate("read_file", true, None, None);
+        assert!(decision.allowed, "{decision:?}");
+    }
+
+    #[test]
+    fn session_always_allow_cannot_bypass_sensitive_command() {
+        let engine = engine(PermissionMode::FullAuto);
+        engine.allow_for_session("shell_command");
+        let decision = engine.evaluate("shell_command", false, Some("/work"), Some("sudo rm x"));
+        assert!(decision.requires_confirmation, "会话放行不得绕过敏感操作");
+    }
+
+    #[test]
+    fn filesystem_quadrant_denies_write_outside_allow() {
+        let engine = PermissionEngine::with_filesystem_policy(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+            FilesystemPolicy {
+                allow_write: vec!["/work".into()],
+                ..Default::default()
+            },
+        );
+        // 写 allow_write 内→放行
+        let ok = engine.evaluate("write_file", false, Some("/work/src/a.rs"), None);
+        assert!(ok.allowed);
+        // 写名单外→拒绝（四象限白名单模式）
+        let denied = engine.evaluate("write_file", false, Some("/etc/passwd"), None);
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("sandbox filesystem write policy"));
+        // 读象限为空→默认放行
+        let read = engine.evaluate("read_file", true, Some("/etc/hosts"), None);
+        assert!(read.allowed);
+    }
+
+    #[test]
+    fn empty_filesystem_policy_is_noop() {
+        // 默认构造（空四象限）不影响现有行为
+        let engine = engine(PermissionMode::FullAuto);
+        assert!(
+            engine
+                .evaluate("write_file", false, Some("/anywhere/x"), None)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn compound_and_recursive_file_access_cannot_bypass_quadrants() {
+        let engine = PermissionEngine::with_filesystem_policy(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+            FilesystemPolicy {
+                allow_read: vec!["/work".into()],
+                allow_write: vec!["/work".into()],
+                deny_read: vec!["/work/secrets/*".into()],
+                ..Default::default()
+            },
+        );
+        assert!(!engine.file_access_allowed("/work/secrets/key", true));
+        assert!(!engine.recursive_read_allowed("/work"));
     }
 
     #[test]
@@ -673,5 +967,120 @@ mod tests {
                 .evaluate("read_file", true, Some("/any/path"), None)
                 .allowed
         );
+    }
+
+    #[test]
+    fn path_allow_rule_cannot_bypass_destructive_command_confirmation() {
+        // review 修复回归：PathRule allow 命中 cwd（shell_command 恒以 cwd 作为
+        // file_path 求值）时，破坏性命令仍必须二次确认——不得被路径规则短路。
+        let engine = PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings {
+                path_rules: vec![PathRule {
+                    pattern: "*/workspace/*".into(),
+                    allow: true,
+                }],
+                ..Default::default()
+            },
+        );
+        // 破坏性命令：路径 allow 规则命中 → 仍强制确认
+        let destructive = engine.evaluate(
+            "shell_command",
+            false,
+            Some("/workspace/project"),
+            Some("rm -rf /"),
+        );
+        assert!(
+            !destructive.allowed && destructive.requires_confirmation,
+            "path allow rule must not bypass destructive confirmation: {destructive:?}"
+        );
+        // 安全命令：路径 allow 规则照常放行（不回归基线 allow 语义）
+        let safe = engine.evaluate(
+            "shell_command",
+            false,
+            Some("/workspace/project"),
+            Some("echo hi"),
+        );
+        assert!(
+            safe.allowed,
+            "safe cmd should be allowed via path rule: {safe:?}"
+        );
+        // 名单外路径：回落模式门控（full_auto 放行）
+        let outside = engine.evaluate("shell_command", false, Some("/elsewhere"), Some("echo hi"));
+        assert!(
+            outside.allowed,
+            "full_auto should allow safe cmd: {outside:?}"
+        );
+    }
+
+    #[test]
+    fn path_allow_rule_cannot_bypass_sensitive_confirmation_in_any_mode() {
+        // 敏感门控在 PathRule 之前求值：default / plan 下同样不被路径规则绕过
+        // （plan 对写操作本就拒绝；此处验证允许路径下敏感命令仍确认）。
+        for mode in [PermissionMode::Default, PermissionMode::FullAuto] {
+            let engine = PermissionEngine::new(
+                mode,
+                PermissionSettings {
+                    path_rules: vec![PathRule {
+                        pattern: "/work/*".into(),
+                        allow: true,
+                    }],
+                    ..Default::default()
+                },
+            );
+            let decision = engine.evaluate(
+                "shell_command",
+                false,
+                Some("/work/project"),
+                Some("sudo rm -rf /tmp/x"),
+            );
+            assert!(
+                !decision.allowed && decision.requires_confirmation,
+                "mode {mode:?} must confirm sensitive cmd under path allow: {decision:?}"
+            );
+        }
+        // 隐私工具（clipboard/screenshot）同样不受路径规则豁免
+        let engine = PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings {
+                path_rules: vec![PathRule {
+                    pattern: "*/*".into(),
+                    allow: true,
+                }],
+                ..Default::default()
+            },
+        );
+        for tool in ["clipboard", "screenshot"] {
+            let decision = engine.evaluate(tool, false, Some("/anywhere"), None);
+            assert!(
+                !decision.allowed && decision.requires_confirmation,
+                "{tool} must confirm under path allow: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_tools_does_not_bypass_sensitive_operation() {
+        // C2 修复：配置级 allowed_tools 放行 shell_command 时，
+        // 破坏性命令（rm -rf /）仍须二次确认。
+        let engine = PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings {
+                allowed_tools: vec!["shell_command".into()],
+                ..Default::default()
+            },
+        );
+        // 破坏性命令 → 强制确认
+        let destructive = engine.evaluate("shell_command", false, Some("/work"), Some("rm -rf /"));
+        assert!(
+            !destructive.allowed,
+            "destructive cmd must not be auto-allowed"
+        );
+        assert!(destructive.requires_confirmation);
+        assert!(destructive.reason.contains("destructive"));
+
+        // 安全命令 → allowed_tools 放行
+        let safe = engine.evaluate("shell_command", false, Some("/work"), Some("echo hello"));
+        assert!(safe.allowed, "safe cmd should be allowed via allowed_tools");
     }
 }

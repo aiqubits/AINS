@@ -6,6 +6,8 @@
 //! `std::process::Command`（平台沙箱随 Phase 7.1 落地）。
 
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -40,11 +42,18 @@ pub fn format_shell_output(raw: &str) -> String {
 /// 执行 shell 命令（stdout/stderr 合并捕获），必经 Sandbox。
 pub struct ShellCommandTool {
     sandbox: Arc<dyn Sandbox>,
+    /// 查询级协作式取消标志（Kernel 每批工具分发前经 [`Tool::set_query_cancel`]
+    /// 注入）：透传给沙箱后端的 `ShellRequest.cancel`，UI 中断可终止运行中
+    /// 的进程树（而非仅等超时）。
+    cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl ShellCommandTool {
     pub fn new(sandbox: Arc<dyn Sandbox>) -> Self {
-        Self { sandbox }
+        Self {
+            sandbox,
+            cancel: Mutex::new(None),
+        }
     }
 }
 
@@ -89,6 +98,20 @@ impl Tool for ShellCommandTool {
             }
             None => ctx.cwd.to_path_buf(),
         };
+        // Phase 7.1 review（B1）修复：cwd 是沙箱内的**可写绑定点**（Linux bwrap
+        // `--bind <cwd> <cwd>` / macOS SBPL 写子树 / Windows current_dir），必须
+        // 落在工作区边界内。任意绝对路径（如 "/"）会成为整个文件系统的可写
+        // 挂载，使"沙箱内破坏命令只破坏沙箱视图"的假设失效（cwd="/" 时
+        // `--bind / /` 覆盖先前只读绑定，沙箱即宿主）。
+        let cwd = match crate::policy::resolve_shell_cwd_within_workspace(&cwd, ctx.cwd) {
+            Ok(cwd) => cwd,
+            Err(reason) => {
+                return Ok(ToolResult::err(format!(
+                    "shell cwd {} is outside the workspace: {reason}",
+                    cwd.display()
+                )));
+            }
+        };
         let timeout_seconds = input
             .get("timeout_seconds")
             .and_then(Value::as_u64)
@@ -104,6 +127,13 @@ impl Tool for ShellCommandTool {
             )));
         }
 
+        // 查询级取消标志透传（review 接线）：Kernel 中断置位 → 沙箱后端
+        // 终止整个进程树（killpg / kill-on-close），不再只能等 timeout。
+        let cancel = self
+            .cancel
+            .lock()
+            .expect("shell cancel lock poisoned")
+            .clone();
         match self
             .sandbox
             .exec_shell(ShellRequest {
@@ -111,6 +141,8 @@ impl Tool for ShellCommandTool {
                 cwd,
                 timeout: Duration::from_secs(timeout_seconds),
                 max_output_bytes: SHELL_CAPTURE_MAX_BYTES,
+                cancel,
+                output_sink: None,
             })
             .await
         {
@@ -124,6 +156,10 @@ impl Tool for ShellCommandTool {
     fn category(&self) -> ToolCategory {
         ToolCategory::System
     }
+
+    fn set_query_cancel(&self, flag: Option<Arc<AtomicBool>>) {
+        *self.cancel.lock().expect("shell cancel lock poisoned") = flag;
+    }
 }
 
 fn shell_outcome_to_result(
@@ -135,10 +171,17 @@ fn shell_outcome_to_result(
     metadata.insert("returncode".into(), serde_json::json!(outcome.exit_code));
     if outcome.timed_out {
         metadata.insert("timed_out".into(), Value::Bool(true));
+        if outcome.cancelled {
+            metadata.insert("cancelled".into(), Value::Bool(true));
+        }
         let text = format_shell_output(&outcome.output);
-        let mut parts = vec![format!(
-            "Command timed out after {timeout_seconds} seconds."
-        )];
+        // 协作式取消（UI 中断 / 任务 stop）与超时是不同终止原因，消息分开。
+        let reason = if outcome.cancelled {
+            "Command was cancelled by the user.".to_string()
+        } else {
+            format!("Command timed out after {timeout_seconds} seconds.")
+        };
+        let mut parts = vec![reason];
         if text != "(no output)" {
             parts.push(String::new());
             parts.push("Partial output:".into());
@@ -385,11 +428,14 @@ mod tests {
 
     #[tokio::test]
     async fn relative_shell_cwd_is_anchored_to_context_cwd() {
+        let workspace = tempfile::tempdir().unwrap();
+        let subdir = workspace.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
         let sandbox = Arc::new(CwdRecordingSandbox(Mutex::new(None)));
         let tool = ShellCommandTool::new(Arc::clone(&sandbox) as Arc<_>);
         let mut metadata = ToolMetadata::new();
         let mut ctx = ToolContext {
-            cwd: Path::new("/work/project"),
+            cwd: workspace.path(),
             metadata: &mut metadata,
         };
         let result = tool
@@ -403,9 +449,130 @@ mod tests {
         assert_eq!(
             *sandbox.0.lock().unwrap(),
             Some((
-                std::path::PathBuf::from("/work/project/subdir"),
+                std::fs::canonicalize(&subdir).unwrap(),
                 SHELL_CAPTURE_MAX_BYTES,
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_cwd_outside_workspace_is_refused_without_execution() {
+        // B1 回归：cwd 是沙箱内的可写绑定点（bwrap --bind <cwd> <cwd>）。
+        // 任意绝对路径（如 "/"）会让整个文件系统在沙箱内可写——
+        // "沙箱内破坏命令只破坏沙箱视图"的假设失效。工具层必须拒绝
+        // 工作区外的 cwd，且不得触碰沙箱（CwdRecordingSandbox 不被调用）。
+        let workspace = tempfile::tempdir().unwrap();
+        let src = workspace.path().join("src");
+        let deep = src.join("deep");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::create_dir(&deep).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let sandbox = Arc::new(CwdRecordingSandbox(Mutex::new(None)));
+        let tool = ShellCommandTool::new(Arc::clone(&sandbox) as Arc<_>);
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: workspace.path(),
+            metadata: &mut metadata,
+        };
+        for bad in ["/", outside.path().to_str().unwrap(), "../escape", ".."] {
+            let result = tool
+                .execute(
+                    serde_json::json!({"command": "echo hi", "cwd": bad}),
+                    &mut ctx,
+                )
+                .await
+                .unwrap();
+            assert!(result.is_error, "cwd {bad:?} must be refused");
+            assert!(
+                result.output.contains("outside the workspace"),
+                "cwd {bad:?}: {}",
+                result.output
+            );
+        }
+        // 工作区内路径（含 cwd 自身与子目录）不受影响，照常执行。
+        for ok in [
+            workspace.path().to_str().unwrap(),
+            src.to_str().unwrap(),
+            "src/deep",
+        ] {
+            let result = tool
+                .execute(serde_json::json!({"command": "true", "cwd": ok}), &mut ctx)
+                .await
+                .unwrap();
+            assert!(
+                !result.is_error,
+                "cwd {ok:?} should be allowed: {}",
+                result.output
+            );
+        }
+        assert!(sandbox.0.lock().unwrap().is_some(), "合法 cwd 仍应到达沙箱");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_cwd_symlink_escape_is_refused_without_execution() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let escape = workspace.path().join("escape");
+        symlink(outside.path(), &escape).unwrap();
+        let sandbox = Arc::new(CwdRecordingSandbox(Mutex::new(None)));
+        let tool = ShellCommandTool::new(Arc::clone(&sandbox) as Arc<_>);
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: workspace.path(),
+            metadata: &mut metadata,
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "true", "cwd": "escape"}),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("outside the resolved workspace"),
+            "{}",
+            result.output
+        );
+        assert!(sandbox.0.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn relative_context_cwd_fails_closed_without_sandbox_call() {
+        // B2 端到端回归：`ToolContext.cwd` 为相对路径（如 "."）时，边界校验
+        // 无法提供有意义边界（词法规范化后为空）——工具必须 fail-closed 拒绝
+        // 执行，且不得触碰沙箱（CwdRecordingSandbox 保持 None）。
+        // 触发面：`bridge_cwd()` native 分支在 current_dir() 失败时回退 "."。
+        let sandbox = Arc::new(CwdRecordingSandbox(Mutex::new(None)));
+        let tool = ShellCommandTool::new(Arc::clone(&sandbox) as Arc<_>);
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("."),
+            metadata: &mut metadata,
+        };
+        for cwd in [None, Some("/etc"), Some(".")] {
+            let input = match cwd {
+                Some(dir) => serde_json::json!({"command": "echo hi", "cwd": dir}),
+                None => serde_json::json!({"command": "echo hi"}),
+            };
+            let result = tool.execute(input, &mut ctx).await.unwrap();
+            assert!(
+                result.is_error,
+                "relative ctx.cwd must fail closed: {cwd:?}"
+            );
+            assert!(
+                result.output.contains("workspace"),
+                "cwd {cwd:?}: {}",
+                result.output
+            );
+        }
+        assert!(
+            sandbox.0.lock().unwrap().is_none(),
+            "相对 ctx.cwd 下沙箱不得被调用"
         );
     }
 
@@ -439,6 +606,7 @@ mod tests {
                 output: String::new(),
                 exit_code: Some(0),
                 timed_out: false,
+                cancelled: false,
             })
         }
     }
@@ -500,6 +668,7 @@ mod tests {
                 output: "done\r\n".into(),
                 exit_code: Some(0),
                 timed_out: false,
+                cancelled: false,
             },
         }));
         let result = tool
@@ -515,6 +684,7 @@ mod tests {
                 output: "".into(),
                 exit_code: Some(2),
                 timed_out: false,
+                cancelled: false,
             },
         }));
         let result = tool
@@ -529,6 +699,7 @@ mod tests {
                 output: "partial".into(),
                 exit_code: None,
                 timed_out: true,
+                cancelled: false,
             },
         }));
         let result = tool
@@ -542,6 +713,32 @@ mod tests {
         assert!(result.output.contains("timed out after 7 seconds"));
         assert!(result.output.contains("Partial output:\npartial"));
         assert_eq!(result.metadata["timed_out"], Value::Bool(true));
+        // 超时（非取消）不携带 cancelled 标记。
+        assert_eq!(result.metadata["cancelled"], Value::Null);
+        // 协作式取消（UI 中断）→ 消息区分原因，不再误报为超时。
+        let tool = ShellCommandTool::new(Arc::new(FakeSandbox {
+            outcome: crate::policy::ShellOutcome {
+                output: "partial".into(),
+                exit_code: None,
+                timed_out: true,
+                cancelled: true,
+            },
+        }));
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "x", "timeout_seconds": 7}),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("cancelled by the user"),
+            "cancel reason must not claim timeout: {}",
+            result.output
+        );
+        assert!(!result.output.contains("timed out after"));
+        assert_eq!(result.metadata["cancelled"], Value::Bool(true));
     }
 
     #[tokio::test]

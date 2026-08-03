@@ -233,6 +233,28 @@ async fn loader_list_applies_platform_and_tool_gating() {
 }
 
 #[tokio::test]
+async fn command_allowed_tools_are_preserved_as_skill_gating() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = KvSkillStore::new(kv(&dir));
+    let content =
+        "---\ndescription: command-backed skill\nallowed-tools:\n  - shell_command\n---\nRun it";
+    store.create_skill("command-backed", content).await.unwrap();
+
+    let visible_without_shell = store
+        .list(&ctx(Platform::Web, &["file_read"]))
+        .await
+        .unwrap();
+    assert!(visible_without_shell.is_empty());
+
+    let visible_with_shell = store
+        .list(&ctx(Platform::Web, &["shell_command"]))
+        .await
+        .unwrap();
+    assert_eq!(visible_with_shell.len(), 1);
+    assert_eq!(visible_with_shell[0].requires_tools, vec!["shell_command"]);
+}
+
+#[tokio::test]
 async fn loader_list_excludes_corrupted_entries_from_model_surface() {
     let dir = tempfile::tempdir().unwrap();
     let backend = kv(&dir);

@@ -3,7 +3,7 @@
 //! 写入：dedupe 签名 →（容量满则按保留权重淘汰）→ `memories` + `embeddings`
 //! （Source Of Truth，先落盘）→ 对应 namespace 索引 `add`（Web write-through
 //! 语义天然成立）。
-//! 查询：`get_index(namespace).search` → `memories.get(id)` 回填内容。
+//! 查询：`vector.search(namespace, ...)`（首次命中懒加载重建）→ `memories.get(id)` 回填内容。
 
 use std::sync::Arc;
 
@@ -171,14 +171,33 @@ impl MemoryEngine {
                 return Err(e);
             }
             if let Err(e) = self.index_add(namespace, &existing_id, vector).await {
-                // best-effort 回滚：恢复刷新前的条目与向量
+                // Best-effort rollback: restore both SoT *and* the resident
+                // index.  A backend may report an error after mutating its
+                // in-memory node; restoring only KV would make searches use
+                // the failed refresh until the next process restart.
                 let _ = self.memories.set(&entry_key, &raw, None).await;
                 match &previous_vector {
                     Some(prev) => {
                         let _ = self.embeddings.set(&entry_key, prev, None).await;
+                        match vector_from_value(prev) {
+                            Ok(previous) => {
+                                if let Err(restore_error) =
+                                    self.index_add(namespace, &existing_id, &previous).await
+                                {
+                                    tracing::warn!(key = entry_key, error = %restore_error, "failed to restore refreshed vector index entry");
+                                }
+                            }
+                            Err(restore_error) => {
+                                tracing::warn!(key = entry_key, error = %restore_error, "previous embedding is undecodable; refreshed index entry not restored");
+                            }
+                        }
                     }
                     None => {
                         let _ = self.embeddings.delete(&entry_key).await;
+                        // The previous persisted embedding was absent/corrupt.
+                        // Do not leave a possible partially-added new node in
+                        // the resident index after rolling its SoT row back.
+                        let _ = self.vector.remove(namespace, &existing_id).await;
                     }
                 }
                 return Err(e);
@@ -247,6 +266,10 @@ impl MemoryEngine {
             return Err(e);
         }
         if let Err(e) = self.index_add(namespace, &id, vector).await {
+            // An index backend can fail after adding its resident node.  The
+            // persisted rows below are rolled back, so remove that possible
+            // in-memory orphan as well.
+            let _ = self.vector.remove(namespace, &id).await;
             let _ = self.memories.delete(&skey).await;
             let _ = self.embeddings.delete(&entry_key).await;
             let _ = self.memories.delete(&entry_key).await;
@@ -263,16 +286,13 @@ impl MemoryEngine {
         id: &str,
         vector: &[f32],
     ) -> Result<(), MemoryError> {
-        self.vector
-            .get_index_mut(namespace)
-            .await?
-            .add(id, vector)
-            .await
+        self.vector.add(namespace, id, vector).await
     }
 
     /// 以调用方指定的 id 直接写入（供文档 chunk 等确定性 id 场景使用；
-    /// 不做签名去重合并）。容量已满直接报错——文档 chunk 属成组数据，
-    /// 静默淘汰个人记忆或其他 chunk 会破坏完整性，由调用方决策。
+    /// 不做签名去重合并）。新增条目在容量已满时直接报错——文档 chunk 属
+    /// 成组数据，静默淘汰个人记忆或其他 chunk 会破坏完整性，由调用方决策。
+    /// 已有 id 的覆盖不增加容量，因此即使已满也允许更新。
     pub async fn insert_with_id(
         &mut self,
         namespace: MemoryNamespace,
@@ -282,7 +302,12 @@ impl MemoryEngine {
         metadata: Value,
     ) -> Result<MemoryEntry, MemoryError> {
         ensure_finite(vector)?;
-        if self.count(namespace).await? >= self.max_entries {
+        let entry_key = namespace.storage_key(id);
+        // 确定性 id 用于文档 chunk 等可重试写入。容量检查只限制“新增”，
+        // 否则满容量时无法刷新既有 chunk，调用方只能先删除后写入并暴露
+        // 中间不完整状态。
+        let previous_entry = self.memories.get(&entry_key).await?;
+        if previous_entry.is_none() && self.count(namespace).await? >= self.max_entries {
             return Err(MemoryError::Storage(format!(
                 "namespace {} is full ({} entries)",
                 namespace.as_str(),
@@ -296,28 +321,59 @@ impl MemoryEngine {
             metadata,
             created_at: now_ms(),
         };
-        let entry_key = namespace.storage_key(id);
-        self.memories
-            .set(
-                &entry_key,
-                &serde_json::to_value(&entry)
-                    .map_err(|e| MemoryError::Serialization(e.to_string()))?,
-                None,
-            )
-            .await?;
-        // 向量落盘失败：撤销已写入的 memories 条目行（与 remember 同口径）。
+        let entry_value =
+            serde_json::to_value(&entry).map_err(|e| MemoryError::Serialization(e.to_string()))?;
+        let previous_vector = self.embeddings.get(&entry_key).await?;
+        self.memories.set(&entry_key, &entry_value, None).await?;
+        // 向量落盘失败：恢复旧条目；新增时撤销新行，不留下孤儿占用容量。
         if let Err(e) = self
             .embeddings
             .set(&entry_key, &vector_to_value(vector), None)
             .await
         {
-            let _ = self.memories.delete(&entry_key).await;
+            match &previous_entry {
+                Some(raw) => {
+                    let _ = self.memories.set(&entry_key, raw, None).await;
+                }
+                None => {
+                    let _ = self.memories.delete(&entry_key).await;
+                }
+            }
             return Err(e);
         }
         if let Err(e) = self.index_add(namespace, id, vector).await {
-            // 同 remember：索引 add 失败回滚落盘行
-            let _ = self.embeddings.delete(&entry_key).await;
-            let _ = self.memories.delete(&entry_key).await;
+            // 索引 add 失败时恢复 SoT。若是覆盖，再 best-effort 恢复内存索引
+            // 的旧向量；恢复失败不会掩盖原始错误，重启后的 SoT 重建仍正确。
+            match &previous_entry {
+                Some(raw) => {
+                    let _ = self.memories.set(&entry_key, raw, None).await;
+                }
+                None => {
+                    let _ = self.memories.delete(&entry_key).await;
+                }
+            }
+            match &previous_vector {
+                Some(raw) => {
+                    let _ = self.embeddings.set(&entry_key, raw, None).await;
+                    match vector_from_value(raw) {
+                        Ok(previous) => {
+                            if let Err(restore_error) =
+                                self.index_add(namespace, id, &previous).await
+                            {
+                                tracing::warn!(key = entry_key, error = %restore_error, "failed to restore overwritten vector index entry");
+                            }
+                        }
+                        Err(restore_error) => {
+                            tracing::warn!(key = entry_key, error = %restore_error, "previous embedding is undecodable; index entry not restored");
+                        }
+                    }
+                }
+                None => {
+                    let _ = self.embeddings.delete(&entry_key).await;
+                    // 新增失败时，已物化索引可能已有节点；尽力移除它。
+                    let _ = self.vector.remove(namespace, id).await;
+                }
+            }
             return Err(e);
         }
         Ok(entry)
@@ -332,12 +388,7 @@ impl MemoryEngine {
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<(MemoryEntry, f32)>, MemoryError> {
-        let hits = self
-            .vector
-            .get_index(namespace)
-            .await?
-            .search(query, top_k)
-            .await?;
+        let hits = self.vector.search(namespace, query, top_k).await?;
         let mut results = Vec::with_capacity(hits.len());
         for (id, score) in hits {
             let key = namespace.storage_key(&id);
@@ -424,7 +475,7 @@ impl MemoryEngine {
         }
         self.memories.delete(&namespace.storage_key(id)).await?;
         self.embeddings.delete(&namespace.storage_key(id)).await?;
-        match self.vector.get_index_mut(namespace).await?.remove(id).await {
+        match self.vector.remove(namespace, id).await {
             Ok(()) | Err(MemoryError::NotFound(_)) => Ok(()),
             Err(e) => Err(e),
         }

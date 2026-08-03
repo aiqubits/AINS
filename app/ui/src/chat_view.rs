@@ -56,6 +56,11 @@ pub struct ChatViewState {
     /// 进行中的 assistant 流式文本（TurnComplete 后清空并落定为 Text 条目）。
     pub streaming_text: String,
     pub busy: bool,
+    /// Stop 已发出、但 Kernel 尚未确认停止当前查询。
+    ///
+    /// 在收到确认前不能开始下一条查询，否则旧查询的中断状态可能在新查询
+    /// 已显示为 busy 后到达并错误地将其复位为 idle。
+    pub interrupt_pending: bool,
 }
 
 impl ChatViewState {
@@ -260,7 +265,11 @@ pub struct SlashCommandView {
 #[component]
 pub fn ChatInput(
     busy: bool,
-    on_send: EventHandler<String>,
+    /// 发送暂不可用，但不显示 Stop（例如等待 Kernel 确认中断）。
+    #[props(default)]
+    disabled: bool,
+    /// 返回 `true` 才清空草稿；宿主拒绝发送时保留输入供稍后重试。
+    on_send: Callback<String, bool>,
     on_interrupt: EventHandler<()>,
     /// 可用 Slash 命令；输入以 `/` 起始时展示过滤后的建议下拉。
     #[props(default)]
@@ -275,8 +284,9 @@ pub fn ChatInput(
         if text.is_empty() {
             return;
         }
-        draft.set(String::new());
-        on_send.call(text);
+        if on_send.call(text) {
+            draft.set(String::new());
+        }
     };
 
     // Slash 建议：输入以 `/` 起始时，按首个 token 前缀过滤命令。
@@ -310,12 +320,12 @@ pub fn ChatInput(
                     placeholder: t.chat_input_placeholder,
                     value: "{draft}",
                     rows: 2,
-                    disabled: busy,
+                    disabled: busy || disabled,
                     oninput: move |e| draft.set(e.value()),
                     onkeydown: move |e| {
                         if e.key() == Key::Enter && !e.modifiers().shift() {
                             e.prevent_default();
-                            if !busy {
+                            if !busy && !disabled {
                                 submit();
                             }
                         }
@@ -335,6 +345,7 @@ pub fn ChatInput(
                         class: "ains-chat__btn ains-chat__btn--send",
                         r#type: "button",
                         aria_label: t.chat_send,
+                        disabled,
                         onclick: move |_| submit(),
                         SendHorizontal {}
                         span { {t.chat_send} }

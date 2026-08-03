@@ -7,7 +7,12 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 
 use serde_json::{Value, json};
 
@@ -18,12 +23,140 @@ use agent_core::hooks::{
 };
 use agent_core::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AgentState, ContentBlock, ConversationMessage,
-    Role, ScriptedModelClient, StreamEvent, SystemEventType,
+    QUERY_INTERRUPTED_STATUS, Role, ScriptedModelClient, StreamEvent, SystemEventType,
 };
-use agent_core::model_client::{ModelStreamEvent, UsageSnapshot};
+use agent_core::model_client::{
+    EventStream, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
+};
 use agent_core::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult, ToolRuntime};
 
 struct EchoTool;
+
+/// 永久静默的模型流：回归 Stop 必须能唤醒正在等待网络事件的模型 turn，
+/// 而不是只能等底层 HTTP 超时。
+struct PendingModelClient {
+    started: Arc<AtomicBool>,
+}
+
+/// 在模型完整返回后、工具批分发前请求中断的流。它让测试精确覆盖
+/// `ExecutingTools` 的边界，而不是模型请求开始前的中断分支。
+struct InterruptAfterCompleteStream {
+    event: Option<ModelStreamEvent>,
+    interrupt: Arc<AtomicBool>,
+}
+
+impl futures::Stream for InterruptAfterCompleteStream {
+    type Item = ModelStreamEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if let Some(event) = self.event.take() {
+            Poll::Ready(Some(event))
+        } else {
+            self.interrupt.store(true, Ordering::SeqCst);
+            Poll::Ready(None)
+        }
+    }
+}
+
+struct InterruptAfterToolTurnClient {
+    message: ConversationMessage,
+    /// AgentKernel 在构造后创建中断 handle，测试随后将它接入这里。
+    interrupt: Arc<std::sync::Mutex<Option<Arc<AtomicBool>>>>,
+}
+
+#[async_trait::async_trait]
+impl ModelClient for InterruptAfterToolTurnClient {
+    async fn stream_response(
+        &self,
+        _request: ModelRequest,
+    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+        let interrupt = self
+            .interrupt
+            .lock()
+            .expect("interrupt lock poisoned")
+            .clone()
+            .expect("kernel interrupt handle must be installed before running");
+        Ok(Box::pin(InterruptAfterCompleteStream {
+            event: Some(ModelStreamEvent::Complete {
+                message: self.message.clone(),
+                usage: usage(),
+                stop_reason: None,
+            }),
+            interrupt,
+        }))
+    }
+
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+}
+
+#[async_trait::async_trait]
+impl ModelClient for PendingModelClient {
+    async fn stream_response(
+        &self,
+        _request: ModelRequest,
+    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+        self.started.store(true, Ordering::SeqCst);
+        Ok(Box::pin(futures::stream::pending()))
+    }
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+}
+
+/// 先发 Complete、随后流永久挂起的模型（模拟违反“Complete 后关闭”契约的
+/// 自定义 ModelClient 实现）；验证 Kernel 收到 Complete 即结束 turn，不依赖
+/// 流 EOF 或用户中断（review 修复回归）。
+struct CompleteThenHungClient {
+    message: ConversationMessage,
+}
+
+#[async_trait::async_trait]
+impl ModelClient for CompleteThenHungClient {
+    async fn stream_response(
+        &self,
+        _request: ModelRequest,
+    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+        let complete = ModelStreamEvent::Complete {
+            message: self.message.clone(),
+            usage: usage(),
+            stop_reason: None,
+        };
+        use futures::StreamExt;
+        Ok(Box::pin(
+            futures::stream::iter(vec![complete]).chain(futures::stream::pending()),
+        ))
+    }
+
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
+        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    }
+}
 
 #[async_trait::async_trait]
 impl Tool for EchoTool {
@@ -62,6 +195,302 @@ impl Tool for EchoTool {
     fn category(&self) -> ToolCategory {
         ToolCategory::Compute
     }
+}
+
+/// 长时工具：验证查询级取消标志注入（review 接线回归）。execute 轮询注入的
+/// 标志最多 3 秒，观测到置位（UI 中断）后返回；未注入（回归）立即报错。
+struct CancelAwareTool {
+    cancel: Arc<std::sync::Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for CancelAwareTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "cancel_aware".into(),
+            description: "long-running tool that observes the query cancel flag".into(),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    async fn execute(
+        &self,
+        _input: Value,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let flag = self
+            .cancel
+            .lock()
+            .expect("cancel state lock poisoned")
+            .clone()
+            .ok_or_else(|| ToolError::Execution("query cancel flag was not injected".into()))?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
+            if tokio::time::Instant::now() > deadline {
+                return Ok(ToolResult::err("cancel flag never set"));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(ToolResult::ok("cancel observed"))
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::System
+    }
+
+    fn set_query_cancel(&self, flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        *self.cancel.lock().expect("cancel state lock poisoned") = flag;
+    }
+}
+
+#[tokio::test]
+async fn interrupt_flag_reaches_in_flight_tool_as_query_cancel() {
+    // review 接线回归：工具批运行中 UI 置位中断 → Kernel 注入的查询级取消
+    // 标志被长时工具观测到（修复前 ShellRequest.cancel 恒 None，运行中命令
+    // 只能等超时）。同时验证共享标志在工具运行期间不被边界 check-and-clear
+    // 提前消费（dispatch_many await 中事件循环不检查 interrupt）。
+    use std::sync::atomic::Ordering;
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(None, "tu_cancel", "cancel_aware", json!({})),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let cancel_state = Arc::new(std::sync::Mutex::new(None));
+    let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(CancelAwareTool {
+            cancel: Arc::clone(&cancel_state),
+        })],
+        test_config(),
+    );
+    let interrupt = kernel.interrupt_handle();
+    // 并行置位：kernel.run 驱动工具批的同时，UI 侧 50ms 后置位中断。
+    let notifier = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        interrupt.store(true, Ordering::SeqCst);
+    });
+    event_tx.try_send(user_message("start")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+    notifier.await.unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolExecutionCompleted {
+                output,
+                is_error: false,
+                ..
+            } if output == "cancel observed"
+        )),
+        "cancel flag must reach the in-flight tool: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn complete_then_hung_stream_still_finishes_the_turn() {
+    // review 修复回归：Complete 是协议终止事件。自定义 ModelClient 若在
+    // Complete 后保持连接（流不 EOF），Kernel 必须仍结束本轮（历史实现
+    // 继续等流 EOF，turn 永久挂起，只能靠用户中断逃逸）。
+    let model = Arc::new(CompleteThenHungClient {
+        message: ConversationMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+        },
+    });
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::new(model, vec![Box::new(EchoTool)], test_config());
+    let run = tokio::spawn(async move {
+        kernel.run().await.unwrap();
+        kernel
+    });
+    event_tx.try_send(user_message("finish")).unwrap();
+    drop(event_tx);
+
+    let kernel = tokio::time::timeout(Duration::from_secs(2), run)
+        .await
+        .expect("kernel hung waiting for stream EOF after Complete")
+        .expect("kernel task panicked");
+    assert!(matches!(kernel.state(), AgentState::Completed));
+    // 无工具的回答已落定：完整 turn 结束，非中断（无 QUERY_INTERRUPTED_STATUS）。
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::AssistantTurnComplete { .. })),
+        "turn must complete normally: {events:?}"
+    );
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS)
+        ),
+        "no interrupt expected: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn stale_interrupt_during_complete_tail_does_not_abort_next_query() {
+    // review 修复回归：用户在 Complete 尾窗（流关闭/超时窗口）内点击停止，
+    // 回合已自然完成（无工具回答），该中断应为 no-op。若标志不被消费会残留，
+    // Querying 入口把陈旧标志误判为新查询的中断（QUERY_INTERRUPTED_STATUS）。
+    // 修复：主循环进入 Idle 时统一消费残留标志。
+    let model = Arc::new(CompleteThenHungClient {
+        message: ConversationMessage {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }],
+        },
+    });
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::new(model, vec![Box::new(EchoTool)], test_config());
+    let interrupt = kernel.interrupt_handle();
+    let run = tokio::spawn(async move {
+        kernel.run().await.unwrap();
+        kernel
+    });
+    event_tx.try_send(user_message("first")).unwrap();
+
+    // 第一轮：等 Kernel 处理 Complete 进入尾窗（500ms 收尾窗口）后置位中断，
+    // 模拟用户在该窗口内点击停止——回合已自然完成，此中断不应影响后续查询。
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    interrupt.store(true, Ordering::SeqCst);
+    // 等尾窗超时 + 第一轮自然结束回 Idle。
+    tokio::time::sleep(Duration::from_millis(700)).await;
+
+    // 第二轮：若残留标志未被 Idle 入口消费，Querying 入口会中止本次查询。
+    event_tx.try_send(user_message("second")).unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(event_tx);
+
+    let _kernel = tokio::time::timeout(Duration::from_secs(3), run)
+        .await
+        .expect("kernel hung")
+        .expect("kernel task panicked");
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    // 两轮都必须自然完成：无中断状态，且出现两次 AssistantTurnComplete。
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS)
+        ),
+        "stale interrupt flag must not abort the next query: {events:?}"
+    );
+    let completes = events
+        .iter()
+        .filter(|e| matches!(e, StreamEvent::AssistantTurnComplete { .. }))
+        .count();
+    assert_eq!(
+        completes, 2,
+        "both turns must complete normally: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn interrupt_wakes_silent_model_stream() {
+    let started = Arc::new(AtomicBool::new(false));
+    let model = Arc::new(PendingModelClient {
+        started: Arc::clone(&started),
+    });
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::new(model, vec![Box::new(EchoTool)], test_config());
+    let interrupt = kernel.interrupt_handle();
+    let run = tokio::spawn(async move {
+        kernel.run().await.unwrap();
+        kernel
+    });
+    event_tx.try_send(user_message("hang")).unwrap();
+
+    // Wait until the model request is actually in-flight so the test does not
+    // accidentally exercise only the pre-turn boundary check.
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("model stream did not start");
+    interrupt.store(true, Ordering::SeqCst);
+    drop(event_tx);
+
+    let kernel = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("silent model stream ignored interrupt")
+        .expect("kernel task panicked");
+    assert!(matches!(kernel.state(), AgentState::Completed));
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS
+    )));
+}
+
+#[tokio::test]
+async fn interrupt_before_tool_dispatch_backfills_interrupted_tool_results() {
+    let model = Arc::new(InterruptAfterToolTurnClient {
+        message: ScriptedModelClient::assistant_tool_use(
+            None,
+            "tu_interrupted",
+            "echo",
+            json!({"text": "must not execute"}),
+        ),
+        interrupt: Arc::new(std::sync::Mutex::new(None)),
+    });
+    let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(EchoTool)],
+        test_config(),
+    );
+    *model.interrupt.lock().expect("interrupt lock poisoned") = Some(kernel.interrupt_handle());
+    event_tx.try_send(user_message("start")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS
+    )));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolExecutionStarted { .. })),
+        "interrupted batch must not dispatch tools: {events:?}"
+    );
+
+    let conversation = &kernel.context().conversation;
+    assert_eq!(conversation.len(), 3);
+    assert!(matches!(
+        &conversation[2].content[0],
+        ContentBlock::ToolResult { tool_use_id, content, is_error: true, result_metadata }
+            if tool_use_id == "tu_interrupted"
+                && content == "interrupted"
+                && result_metadata == &Value::Null
+    ));
 }
 
 struct FailingTool;
@@ -669,6 +1098,86 @@ async fn shutdown_event_completes_kernel_without_query() {
     assert!(matches!(kernel.state(), AgentState::Completed));
     assert!(events.is_empty());
     assert!(model.recorded_requests().is_empty());
+}
+
+#[tokio::test]
+async fn interrupt_flag_aborts_query_at_turn_boundary_and_returns_to_idle() {
+    // 中断标志在模型 turn 边界协作式生效：运行前置位，内核在
+    // Querying 起始 check-and-clear 命中 → 不查询模型、发 Status、回 Idle；
+    // 通道随后关闭 → Completed。
+    use std::sync::atomic::Ordering;
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn("should never be sent", usage()),
+    ]));
+    let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(EchoTool)],
+        test_config(),
+    );
+    let interrupt = kernel.interrupt_handle();
+    event_tx
+        .try_send(user_message("start a long task"))
+        .unwrap();
+    // 运行前置位：首个 Querying 边界即中断（新查询会先清旧标志，故需
+    // 在 UserMessage 进入 Querying 后才生效——但 store 在 build 之后的
+    // Querying drain 前：这里用另一种确定性方式）。
+    interrupt.store(true, Ordering::SeqCst);
+    drop(event_tx);
+    kernel.run().await.unwrap();
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+
+    // 模型从未被调用（中断在首个 turn 前生效）
+    assert!(
+        model.recorded_requests().is_empty(),
+        "interrupt must abort before any model call"
+    );
+    // 发出中断 Status
+    assert!(events.iter().any(|event| matches!(
+        event,
+        StreamEvent::Status { message } if message == QUERY_INTERRUPTED_STATUS
+    )));
+    // 无任何工具执行
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::ToolExecutionStarted { .. }))
+    );
+    assert!(matches!(kernel.state(), AgentState::Completed));
+}
+
+#[tokio::test]
+async fn interrupt_flag_is_consumed_on_read_so_next_query_runs() {
+    // interrupt_requested 为 check-and-clear：第一个查询被中断并消耗标志，
+    // 后续查询不受影响（标志已复位）。宿主另在发送前清标志防陈旧。
+    use std::sync::atomic::Ordering;
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn("handled", usage()),
+    ]));
+    let (mut kernel, mut event_tx, _stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
+        Arc::clone(&model) as Arc<_>,
+        vec![Box::new(EchoTool)],
+        test_config(),
+    );
+    let interrupt = kernel.interrupt_handle();
+    // 两条消息：第一条被预置标志中断（swap 清标志），第二条正常查询。
+    interrupt.store(true, Ordering::SeqCst);
+    event_tx.try_send(user_message("first")).unwrap();
+    event_tx.try_send(user_message("second")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    // first 被中断不查询；second 在标志已消耗后正常查询一次
+    assert_eq!(
+        model.recorded_requests().len(),
+        1,
+        "only 'second' reaches the model"
+    );
+    assert!(matches!(kernel.state(), AgentState::Completed));
 }
 
 #[tokio::test]

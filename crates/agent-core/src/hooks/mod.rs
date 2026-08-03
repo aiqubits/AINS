@@ -75,7 +75,7 @@ const PROMPT_HOOK_MESSAGE_MAX_BYTES: usize = 256 * 1024;
 
 /// command hook：执行 shell 命令，退出码非 0 视为失败
 /// （对齐 `CommandHookDefinition`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandHookDefinition {
     pub command: String,
     #[serde(default = "default_timeout_seconds")]
@@ -91,7 +91,7 @@ pub struct CommandHookDefinition {
 
 /// prompt hook：请模型校验条件，返回严格 JSON `{"ok": bool, "reason": …}`
 /// （对齐 `PromptHookDefinition`）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PromptHookDefinition {
     pub prompt: String,
     #[serde(default)]
@@ -107,7 +107,7 @@ pub struct PromptHookDefinition {
 }
 
 /// Hook 定义判别式（`type` 字段；http / agent 两类 Phase 3 后置）。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum HookDefinition {
     Command(CommandHookDefinition),
@@ -186,6 +186,20 @@ impl HookRegistry {
 
     pub fn register(&mut self, event: HookEvent, definition: HookDefinition) {
         self.hooks.push((event, definition));
+    }
+
+    /// 仅在同一事件下尚无完全相同定义时注册。常规 [`Self::register`]
+    /// 保留允许重复 hook 的原有语义；插件重载则应使用本方法，避免每次
+    /// 注入都让相同 command hook 额外执行一次。
+    pub fn register_if_absent(&mut self, event: HookEvent, definition: HookDefinition) -> bool {
+        if self.hooks.iter().any(|(registered_event, registered)| {
+            *registered_event == event && registered == &definition
+        }) {
+            false
+        } else {
+            self.register(event, definition);
+            true
+        }
     }
 
     /// 返回某事件的定义（priority 降序，稳定）。
@@ -328,24 +342,20 @@ impl HookExecutor {
             cwd: self.cwd.clone(),
             timeout,
             max_output_bytes: COMMAND_HOOK_STREAM_MAX_BYTES,
+            cancel: None,
+            output_sink: None,
         };
-        let outcome = match tokio::time::timeout(timeout, self.sandbox.exec_shell(request)).await {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
+        // 不经外层重复 timeout：Sandbox 契约要求后端强制 request.timeout，
+        // 外层包装会在竞态窗口中抢先 drop future，只杀包装进程而绕过后端
+        // 的进程树终止（killpg/kill-on-close），导致命令残留。
+        let outcome = match self.sandbox.exec_shell(request).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
                 return HookResult {
                     hook_type: "command".into(),
                     success: false,
                     blocked: hook.block_on_failure,
                     reason: error.to_string(),
-                    ..Default::default()
-                };
-            }
-            Err(_) => {
-                return HookResult {
-                    hook_type: "command".into(),
-                    success: false,
-                    blocked: hook.block_on_failure,
-                    reason: format!("command hook timed out after {}s", hook.timeout_seconds),
                     ..Default::default()
                 };
             }
@@ -740,6 +750,7 @@ mod tests {
                         output: String::from_utf8_lossy(&combined).into_owned(),
                         exit_code: output.status.code(),
                         timed_out: false,
+                        cancelled: false,
                     })
                 }
                 Ok(Err(error)) => Err(SandboxError::Execution(error.to_string())),
@@ -747,6 +758,7 @@ mod tests {
                     output: String::new(),
                     exit_code: None,
                     timed_out: true,
+                    cancelled: false,
                 }),
             }
         }

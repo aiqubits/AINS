@@ -356,6 +356,8 @@ impl KvSkillStore {
             category: Option<String>,
             #[serde(default)]
             requires_tools: Option<Vec<String>>,
+            #[serde(default, rename = "allowed-tools", alias = "allowed_tools")]
+            allowed_tools: Option<Vec<String>>,
             #[serde(default)]
             platforms: Option<Vec<Platform>>,
             #[serde(default)]
@@ -370,7 +372,7 @@ impl KvSkillStore {
         SkillMeta {
             description: fm.description.unwrap_or_default(),
             category: fm.category.unwrap_or_else(|| "general".into()),
-            requires_tools: fm.requires_tools.unwrap_or_default(),
+            requires_tools: fm.requires_tools.or(fm.allowed_tools).unwrap_or_default(),
             platforms: fm.platforms.unwrap_or_default(),
             trust_level: SkillTrust::Generated,
             creator: "agent".into(),

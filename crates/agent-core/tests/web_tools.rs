@@ -296,6 +296,7 @@ async fn command_hooks_degrade_gracefully_on_web() {
 
 #[wasm_bindgen_test]
 async fn network_guard_syntax_checks_run_on_web() {
+    use agent_core::policy::NetworkPolicy;
     use agent_core::tools::network::{
         ensure_public_http_url, fetch_public_http_response, validate_http_url,
     };
@@ -306,7 +307,7 @@ async fn network_guard_syntax_checks_run_on_web() {
     assert!(ensure_public_http_url("http://127.0.0.1/").await.is_err());
     assert!(ensure_public_http_url("http://localhost/x").await.is_err());
     assert!(ensure_public_http_url("http://intranet/x").await.is_err());
-    let error = fetch_public_http_response("https://example.com/")
+    let error = fetch_public_http_response("https://example.com/", &NetworkPolicy::default())
         .await
         .expect_err("direct browser fetch must fail closed");
     assert!(error.contains("disabled on the web platform"));

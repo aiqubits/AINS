@@ -9,8 +9,12 @@
 //! - Docker sandbox 路径校验分支对应 `policy::validate_sandbox_path`，由
 //!   Phase 7.1 平台沙箱启用后接入。
 
-use std::path::{Path, PathBuf};
-use std::{fs::File, io::Read};
+use std::{
+    fmt,
+    fs::File,
+    io::{Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
+};
 
 use serde_json::Value;
 
@@ -45,6 +49,231 @@ pub(crate) fn resolve_path(base: &Path, candidate: &str) -> PathBuf {
     lexical_normalize(&anchored)
 }
 
+/// File access mode for descriptor-relative workspace opens.
+enum WorkspaceOpenMode {
+    Read,
+    Write {
+        create_directories: bool,
+    },
+    ReadWrite {
+        create_directories: bool,
+        create: bool,
+    },
+}
+
+/// Failure category for descriptor-relative opens. Expected filesystem
+/// failures remain distinguishable from policy rejections, preserving the
+/// tools' existing observable error behaviour.
+pub(crate) enum WorkspaceOpenError {
+    Policy(String),
+    NotFound(String),
+    IsDirectory(PathBuf),
+    Io(String),
+}
+
+impl fmt::Display for WorkspaceOpenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Policy(message) | Self::NotFound(message) | Self::Io(message) => {
+                formatter.write_str(message)
+            }
+            Self::IsDirectory(path) => {
+                write!(formatter, "Cannot read directory: {}", path.display())
+            }
+        }
+    }
+}
+
+/// Open a file below `cwd` without ever resolving a symlink component.
+///
+/// Unix implementations walk the path one component at a time from an
+/// already-open workspace directory descriptor. Every directory and final
+/// file is opened with `O_NOFOLLOW`, so replacing any component after the
+/// authorization check cannot redirect the operation outside the workspace.
+/// Non-Unix targets fail closed until they have an equivalent handle-relative
+/// implementation (Windows reparse-point semantics are not safely covered by
+/// `std::fs` path APIs).
+fn open_workspace_file(
+    cwd: &Path,
+    candidate: &str,
+    mode: WorkspaceOpenMode,
+) -> Result<(File, PathBuf), WorkspaceOpenError> {
+    #[cfg(unix)]
+    {
+        use std::ffi::OsString;
+        use std::path::Component;
+
+        use rustix::fs::{Mode, OFlags, mkdirat, openat};
+        use rustix::io::Errno;
+
+        let root = std::fs::canonicalize(cwd).map_err(|error| {
+            WorkspaceOpenError::Io(format!(
+                "cannot resolve workspace {}: {error}",
+                cwd.display()
+            ))
+        })?;
+        if !root.is_dir() {
+            return Err(WorkspaceOpenError::Policy(format!(
+                "workspace {} is not a directory",
+                root.display()
+            )));
+        }
+        let path = resolve_path(&root, candidate);
+        let relative = path.strip_prefix(&root).map_err(|_| {
+            WorkspaceOpenError::Policy(format!(
+                "refusing file access outside workspace {}: {}",
+                root.display(),
+                path.display()
+            ))
+        })?;
+        let parts: Vec<OsString> = relative
+            .components()
+            .map(|component| match component {
+                Component::Normal(name) => Ok(name.to_os_string()),
+                _ => Err(WorkspaceOpenError::Policy(
+                    "file path must name a file below the workspace".to_string(),
+                )),
+            })
+            .collect::<Result<_, _>>()?;
+        let Some((final_name, parents)) = parts.split_last() else {
+            return Err(WorkspaceOpenError::IsDirectory(path));
+        };
+
+        // `root` was canonical when it was authorized above, but its pathname
+        // can be replaced before this open. Refuse to follow a replacement
+        // symlink so the descriptor walk cannot become anchored elsewhere.
+        let mut parent = open_workspace_root_no_follow(&root)?;
+        for name in parents {
+            let open_dir = || {
+                openat(
+                    &parent,
+                    Path::new(name),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                    Mode::empty(),
+                )
+            };
+            let next = match open_dir() {
+                Ok(fd) => fd,
+                Err(Errno::NOENT)
+                    if matches!(
+                        mode,
+                        WorkspaceOpenMode::Write {
+                            create_directories: true
+                        } | WorkspaceOpenMode::ReadWrite {
+                            create_directories: true,
+                            ..
+                        }
+                    ) =>
+                {
+                    match mkdirat(&parent, Path::new(name), Mode::from(0o755)) {
+                        Ok(()) | Err(Errno::EXIST) => {}
+                        Err(error) => {
+                            return Err(WorkspaceOpenError::Io(format!(
+                                "create workspace directory: {error}"
+                            )));
+                        }
+                    }
+                    open_dir().map_err(|error| {
+                        WorkspaceOpenError::Policy(format!(
+                            "open workspace directory without following symlinks: {error}"
+                        ))
+                    })?
+                }
+                Err(Errno::NOENT) => {
+                    return Err(WorkspaceOpenError::NotFound(format!(
+                        "workspace directory does not exist: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) => {
+                    return Err(WorkspaceOpenError::Policy(format!(
+                        "open workspace directory without following symlinks: {error}"
+                    )));
+                }
+            };
+            parent = File::from(next);
+        }
+
+        let (flags, create_mode) = match mode {
+            WorkspaceOpenMode::Read => (OFlags::RDONLY | OFlags::NOFOLLOW, Mode::empty()),
+            WorkspaceOpenMode::ReadWrite { create, .. } => (
+                OFlags::RDWR
+                    | OFlags::NOFOLLOW
+                    | if create {
+                        OFlags::CREATE
+                    } else {
+                        OFlags::empty()
+                    },
+                if create {
+                    Mode::from(0o666)
+                } else {
+                    Mode::empty()
+                },
+            ),
+            // Do not pass O_TRUNC here.  A hard link can point at an inode
+            // outside the workspace; validate its link count below before
+            // truncating through the returned descriptor.
+            WorkspaceOpenMode::Write { .. } => (
+                OFlags::WRONLY | OFlags::CREATE | OFlags::NOFOLLOW,
+                Mode::from(0o666),
+            ),
+        };
+        let file = match openat(&parent, Path::new(final_name), flags, create_mode) {
+            Ok(file) => file,
+            Err(Errno::NOENT) => {
+                return Err(WorkspaceOpenError::NotFound(format!(
+                    "workspace file does not exist: {}",
+                    path.display()
+                )));
+            }
+            Err(error) => {
+                return Err(WorkspaceOpenError::Policy(format!(
+                    "open workspace file without following symlinks: {error}"
+                )));
+            }
+        };
+        let file = File::from(file);
+        use std::os::unix::fs::MetadataExt;
+        if file
+            .metadata()
+            .map_err(|error| WorkspaceOpenError::Io(format!("inspect workspace file: {error}")))?
+            .nlink()
+            > 1
+        {
+            return Err(WorkspaceOpenError::Policy(
+                "refusing hard-linked file because it may alias data outside the workspace"
+                    .to_string(),
+            ));
+        }
+        Ok((file, path))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (cwd, candidate, mode);
+        Err(WorkspaceOpenError::Policy("secure descriptor-relative file operations are unavailable on this platform; refusing access".to_string()))
+    }
+}
+
+/// Open the authorized workspace root without following a symlink at the root
+/// pathname itself. Child components are handled by `open_workspace_file`'s
+/// descriptor-relative walk.
+#[cfg(unix)]
+fn open_workspace_root_no_follow(root: &Path) -> Result<File, WorkspaceOpenError> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let fd = open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        WorkspaceOpenError::Policy(format!(
+            "open workspace root without following symlinks: {error}"
+        ))
+    })?;
+    Ok(File::from(fd))
+}
+
 /// 写文件类工具的并发独占资源键：`file:{规范路径}` 命名空间跨
 /// write_file / edit_file / todo_write 共享，同批次内命中同一文件时
 /// Runtime 回退顺序执行，避免并发 read-modify-write 丢更新。
@@ -72,6 +301,61 @@ fn lexical_normalize(path: &Path) -> PathBuf {
     normalized
 }
 
+/// Resolve a search root to an existing canonical path below the workspace.
+///
+/// `ignore::WalkBuilder` follows a symlink supplied as its root even when
+/// link following is disabled for entries below that root.  Resolve the root
+/// before constructing a walker so glob and grep cannot use a workspace
+/// symlink as an escape hatch.
+fn resolve_workspace_traversal_root(
+    workspace: &Path,
+    candidate: &Path,
+) -> Result<PathBuf, WorkspaceOpenError> {
+    let root = lexical_normalize(candidate);
+    if !root.starts_with(workspace) {
+        return Err(WorkspaceOpenError::Policy(format!(
+            "refusing search outside workspace {}: {}",
+            workspace.display(),
+            root.display()
+        )));
+    }
+
+    let resolved = std::fs::canonicalize(&root).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            WorkspaceOpenError::NotFound(format!("search root does not exist: {}", root.display()))
+        } else {
+            WorkspaceOpenError::Io(format!(
+                "cannot resolve search root {}: {error}",
+                root.display()
+            ))
+        }
+    })?;
+    if !resolved.starts_with(workspace) {
+        return Err(WorkspaceOpenError::Policy(format!(
+            "refusing search root that resolves outside workspace {}: {}",
+            workspace.display(),
+            root.display()
+        )));
+    }
+    Ok(resolved)
+}
+
+fn canonical_workspace_root(cwd: &Path) -> Result<PathBuf, WorkspaceOpenError> {
+    let workspace = std::fs::canonicalize(cwd).map_err(|error| {
+        WorkspaceOpenError::Io(format!(
+            "cannot resolve workspace {}: {error}",
+            cwd.display()
+        ))
+    })?;
+    if !workspace.is_dir() {
+        return Err(WorkspaceOpenError::Policy(format!(
+            "workspace {} is not a directory",
+            workspace.display()
+        )));
+    }
+    Ok(workspace)
+}
+
 // ── read_file ───────────────────────────────────────────────────────────
 
 pub const FILE_READ_DEFAULT_LIMIT: usize = 200;
@@ -81,8 +365,7 @@ pub const FILE_INPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// 单次文件写入的硬上限。在构造 edit 结果前先校验，避免替换放大导致 OOM。
 pub const FILE_OUTPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
-pub(crate) fn read_file_bounded(path: &Path) -> Result<Option<Vec<u8>>, std::io::Error> {
-    let file = File::open(path)?;
+pub(crate) fn read_open_file_bounded(file: File) -> Result<Option<Vec<u8>>, std::io::Error> {
     let mut raw = Vec::new();
     file.take((FILE_INPUT_MAX_BYTES + 1) as u64)
         .read_to_end(&mut raw)?;
@@ -126,7 +409,36 @@ impl Tool for FileReadTool {
         input: Value,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let path = resolve_path(ctx.cwd, require_str(&input, "path")?);
+        let (file, path) = match open_workspace_file(
+            ctx.cwd,
+            require_str(&input, "path")?,
+            WorkspaceOpenMode::Read,
+        ) {
+            Ok(opened) => opened,
+            Err(WorkspaceOpenError::NotFound(_)) => {
+                return Ok(ToolResult::err(format!(
+                    "File not found: {}",
+                    resolve_path(ctx.cwd, require_str(&input, "path")?).display()
+                )));
+            }
+            Err(WorkspaceOpenError::IsDirectory(path)) => {
+                return Ok(ToolResult::err(format!(
+                    "Cannot read directory: {}",
+                    path.display()
+                )));
+            }
+            Err(reason) => return Ok(ToolResult::err(reason.to_string())),
+        };
+        if file
+            .metadata()
+            .map_err(|error| ToolError::Execution(error.to_string()))?
+            .is_dir()
+        {
+            return Ok(ToolResult::err(format!(
+                "Cannot read directory: {}",
+                path.display()
+            )));
+        }
         let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize;
         let limit = (input
             .get("limit")
@@ -134,20 +446,8 @@ impl Tool for FileReadTool {
             .unwrap_or(FILE_READ_DEFAULT_LIMIT as u64) as usize)
             .clamp(1, FILE_READ_MAX_LIMIT);
 
-        if !path.exists() {
-            return Ok(ToolResult::err(format!(
-                "File not found: {}",
-                path.display()
-            )));
-        }
-        if path.is_dir() {
-            return Ok(ToolResult::err(format!(
-                "Cannot read directory: {}",
-                path.display()
-            )));
-        }
-        let Some(raw) =
-            read_file_bounded(&path).map_err(|error| ToolError::Execution(error.to_string()))?
+        let Some(raw) = read_open_file_bounded(file)
+            .map_err(|error| ToolError::Execution(error.to_string()))?
         else {
             return Ok(ToolResult::err(format!(
                 "File is larger than the {} byte read limit: {}",
@@ -229,7 +529,6 @@ impl Tool for FileWriteTool {
         input: Value,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let path = resolve_path(ctx.cwd, require_str(&input, "path")?);
         let content = require_str(&input, "content")?;
         if content.len() > FILE_OUTPUT_MAX_BYTES {
             return Ok(ToolResult::err(format!(
@@ -240,11 +539,21 @@ impl Tool for FileWriteTool {
             .get("create_directories")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        if create_directories && let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|error| ToolError::Execution(error.to_string()))?;
-        }
-        std::fs::write(&path, content).map_err(|error| ToolError::Execution(error.to_string()))?;
+        let (mut file, path) = match open_workspace_file(
+            ctx.cwd,
+            require_str(&input, "path")?,
+            WorkspaceOpenMode::Write { create_directories },
+        ) {
+            Ok(opened) => opened,
+            Err(WorkspaceOpenError::NotFound(reason)) => {
+                return Err(ToolError::Execution(reason));
+            }
+            Err(reason) => return Ok(ToolResult::err(reason.to_string())),
+        };
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| file.write_all(content.as_bytes()))
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
         Ok(ToolResult::ok(format!("Wrote {}", path.display())))
     }
 
@@ -287,7 +596,23 @@ impl Tool for FileEditTool {
         input: Value,
         ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let path = resolve_path(ctx.cwd, require_str(&input, "path")?);
+        let (mut file, path) = match open_workspace_file(
+            ctx.cwd,
+            require_str(&input, "path")?,
+            WorkspaceOpenMode::ReadWrite {
+                create_directories: false,
+                create: false,
+            },
+        ) {
+            Ok(opened) => opened,
+            Err(WorkspaceOpenError::NotFound(_)) => {
+                return Ok(ToolResult::err(format!(
+                    "File not found: {}",
+                    resolve_path(ctx.cwd, require_str(&input, "path")?).display()
+                )));
+            }
+            Err(reason) => return Ok(ToolResult::err(reason.to_string())),
+        };
         let old_str = require_str(&input, "old_str")?;
         let new_str = require_str(&input, "new_str")?;
         if old_str.is_empty() {
@@ -298,14 +623,11 @@ impl Tool for FileEditTool {
             .and_then(Value::as_bool)
             .unwrap_or(false);
 
-        if !path.exists() {
-            return Ok(ToolResult::err(format!(
-                "File not found: {}",
-                path.display()
-            )));
-        }
-        let Some(raw) =
-            read_file_bounded(&path).map_err(|error| ToolError::Execution(error.to_string()))?
+        let Some(raw) = read_open_file_bounded(
+            file.try_clone()
+                .map_err(|error| ToolError::Execution(error.to_string()))?,
+        )
+        .map_err(|error| ToolError::Execution(error.to_string()))?
         else {
             return Ok(ToolResult::err(format!(
                 "File is larger than the {} byte edit limit: {}",
@@ -344,7 +666,10 @@ impl Tool for FileEditTool {
         } else {
             original.replacen(old_str, new_str, 1)
         };
-        std::fs::write(&path, updated).map_err(|error| ToolError::Execution(error.to_string()))?;
+        file.set_len(0)
+            .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+            .and_then(|()| file.write_all(updated.as_bytes()))
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
         Ok(ToolResult::ok(format!("Updated {}", path.display())))
     }
 
@@ -356,6 +681,24 @@ impl Tool for FileEditTool {
         let path = input.get("path").and_then(Value::as_str)?;
         Some(file_resource_key(cwd, path))
     }
+}
+
+/// Open a workspace file for a secure read-modify-write update.  The returned
+/// descriptor remains anchored below `cwd`, so callers must update through
+/// this handle rather than reopening `path` by name.
+pub(crate) fn open_workspace_file_for_update(
+    cwd: &Path,
+    candidate: &str,
+    create_directories: bool,
+) -> Result<(File, PathBuf), WorkspaceOpenError> {
+    open_workspace_file(
+        cwd,
+        candidate,
+        WorkspaceOpenMode::ReadWrite {
+            create_directories,
+            create: true,
+        },
+    )
 }
 
 // ── glob ────────────────────────────────────────────────────────────────
@@ -415,7 +758,17 @@ impl Tool for GlobTool {
             .unwrap_or(GLOB_DEFAULT_LIMIT as u64) as usize)
             .clamp(1, GLOB_MAX_LIMIT);
 
-        let (root, relative_pattern) = resolve_glob_request(ctx.cwd, root_arg, pattern);
+        let workspace = match canonical_workspace_root(ctx.cwd) {
+            Ok(workspace) => workspace,
+            Err(error) => return Ok(ToolResult::err(error.to_string())),
+        };
+        let (requested_root, relative_pattern) =
+            resolve_glob_request(&workspace, root_arg, pattern);
+        let root = match resolve_workspace_traversal_root(&workspace, &requested_root) {
+            Ok(root) => root,
+            Err(WorkspaceOpenError::NotFound(_)) => return Ok(ToolResult::ok("(no matches)")),
+            Err(error) => return Ok(ToolResult::err(error.to_string())),
+        };
         let overrides = match build_search_overrides(&root, &relative_pattern) {
             Ok(overrides) => overrides,
             Err(error) => {
@@ -624,18 +977,25 @@ impl Tool for GrepTool {
             .and_then(Value::as_u64)
             .unwrap_or(GREP_DEFAULT_LIMIT as u64) as usize)
             .clamp(1, GREP_MAX_LIMIT);
-        let root = match input.get("root").and_then(Value::as_str) {
-            Some(root) => resolve_path(ctx.cwd, root),
-            None => ctx.cwd.to_path_buf(),
+        let workspace = match canonical_workspace_root(ctx.cwd) {
+            Ok(workspace) => workspace,
+            Err(error) => return Ok(ToolResult::err(error.to_string())),
         };
-
-        if !root.exists() {
-            return Ok(ToolResult::err(format!(
-                "Search root does not exist: {}\n\
+        let requested_root = match input.get("root").and_then(Value::as_str) {
+            Some(root) => resolve_path(&workspace, root),
+            None => workspace.clone(),
+        };
+        let root = match resolve_workspace_traversal_root(&workspace, &requested_root) {
+            Ok(root) => root,
+            Err(WorkspaceOpenError::NotFound(_)) => {
+                return Ok(ToolResult::err(format!(
+                    "Search root does not exist: {}\n\
                  If you intended multiple roots, call grep separately for each root.",
-                root.display()
-            )));
-        }
+                    requested_root.display()
+                )));
+            }
+            Err(error) => return Ok(ToolResult::err(error.to_string())),
+        };
 
         let compiled = match regex::RegexBuilder::new(pattern)
             .case_insensitive(!case_sensitive)
@@ -659,7 +1019,7 @@ impl Tool for GrepTool {
         };
         let collected = match run_grep(
             &root,
-            ctx.cwd,
+            &workspace,
             &compiled,
             overrides,
             limit,
@@ -736,7 +1096,20 @@ fn grep_one_file(
     if is_sensitive_file(path) {
         return;
     }
-    let Ok(Some(raw)) = read_file_bounded(path) else {
+    let Ok(file) = File::open(path) else {
+        return;
+    };
+    // Match the direct read tool's hard-link policy. A workspace pathname can
+    // otherwise alias an inode owned outside the workspace and expose it via
+    // content search.
+    #[cfg(unix)]
+    if file
+        .metadata()
+        .is_ok_and(|metadata| std::os::unix::fs::MetadataExt::nlink(&metadata) > 1)
+    {
+        return;
+    }
+    let Ok(Some(raw)) = read_open_file_bounded(file) else {
         return;
     };
     if raw.contains(&0u8) {
@@ -842,6 +1215,235 @@ mod tests {
             .unwrap();
         assert_eq!(metadata.read_files.len(), 1);
         assert!(metadata.read_files[0].ends_with("a.txt"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_tools_reject_linked_components_and_hard_link_aliases() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        symlink(outside.path(), dir.path().join("linked")).unwrap();
+        let read = run(
+            &FileReadTool,
+            dir.path(),
+            serde_json::json!({"path": "linked/secret.txt"}),
+        )
+        .await;
+        assert!(read.is_error);
+        assert!(read.output.contains("symlink"), "{}", read.output);
+
+        let write = run(
+            &FileWriteTool,
+            dir.path(),
+            serde_json::json!({"path": "linked/new.txt", "content": "escaped"}),
+        )
+        .await;
+        assert!(write.is_error, "{write:?}");
+        assert!(!outside.path().join("new.txt").exists());
+
+        let edit = run(
+            &FileEditTool,
+            dir.path(),
+            serde_json::json!({"path": "linked/secret.txt", "old_str": "secret", "new_str": "changed"}),
+        )
+        .await;
+        assert!(edit.is_error, "{edit:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
+
+        // Hard links are not symlinks, but would otherwise let a workspace
+        // path alias an outside inode. Reject before any write/truncate.
+        std::fs::hard_link(
+            outside.path().join("secret.txt"),
+            dir.path().join("hard-linked.txt"),
+        )
+        .unwrap();
+        let hard_read = run(
+            &FileReadTool,
+            dir.path(),
+            serde_json::json!({"path": "hard-linked.txt"}),
+        )
+        .await;
+        assert!(hard_read.is_error, "{hard_read:?}");
+        let hard_write = run(
+            &FileWriteTool,
+            dir.path(),
+            serde_json::json!({"path": "hard-linked.txt", "content": "overwritten"}),
+        )
+        .await;
+        assert!(hard_write.is_error, "{hard_write:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
+
+        let hard_grep = run(
+            &GrepTool,
+            dir.path(),
+            serde_json::json!({"path": "hard-linked.txt", "pattern": "secret"}),
+        )
+        .await;
+        assert_eq!(hard_grep.output, "(no matches)", "{hard_grep:?}");
+    }
+
+    #[tokio::test]
+    async fn file_tools_reject_lexical_escape_and_absolute_paths_outside_workspace() {
+        // 工具级安全回归：`..` 词法穿越与工作区外绝对路径在
+        // descriptor-relative 打开前即被拒绝，绝不落到 `File::open`。
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+
+        // read：`..` 词法穿越被拒绝
+        let read = run(
+            &FileReadTool,
+            dir.path(),
+            serde_json::json!({"path": "../secret.txt"}),
+        )
+        .await;
+        assert!(read.is_error, "{read:?}");
+        assert!(read.output.contains("outside workspace"), "{}", read.output);
+
+        // read：工作区外绝对路径被拒绝
+        let read = run(
+            &FileReadTool,
+            dir.path(),
+            serde_json::json!({"path": outside.path().join("secret.txt").display().to_string()}),
+        )
+        .await;
+        assert!(read.is_error, "{read:?}");
+        assert!(read.output.contains("outside workspace"), "{}", read.output);
+
+        // write：`..` 词法逃逸不得在工作区外创建文件
+        let write = run(
+            &FileWriteTool,
+            dir.path(),
+            serde_json::json!({"path": "../escaped.txt", "content": "x"}),
+        )
+        .await;
+        assert!(write.is_error, "{write:?}");
+        assert!(
+            !dir.path().parent().unwrap().join("escaped.txt").exists(),
+            "lexical escape must not create a file outside the workspace"
+        );
+
+        // edit：`..` 词法逃逸同样拒绝（不触碰目标）
+        let edit = run(
+            &FileEditTool,
+            dir.path(),
+            serde_json::json!({"path": "../secret.txt", "old_str": "secret", "new_str": "changed"}),
+        )
+        .await;
+        assert!(edit.is_error, "{edit:?}");
+        assert_eq!(
+            std::fs::read_to_string(outside.path().join("secret.txt")).unwrap(),
+            "secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn traversal_tools_reject_absolute_root_outside_workspace() {
+        // 工具级安全回归：glob/grep 的 root 为工作区外绝对路径时 fail-closed。
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-secret\n").unwrap();
+        let outside_root = outside.path().display().to_string();
+
+        let glob = run(
+            &GlobTool,
+            dir.path(),
+            serde_json::json!({"root": outside_root, "pattern": "**/*"}),
+        )
+        .await;
+        assert!(glob.is_error, "{glob:?}");
+        assert!(!glob.output.contains("secret.txt"), "{glob:?}");
+
+        let grep = run(
+            &GrepTool,
+            dir.path(),
+            serde_json::json!({"root": outside_root, "pattern": "outside-secret"}),
+        )
+        .await;
+        assert!(grep.is_error, "{grep:?}");
+        assert!(!grep.output.contains("outside-secret"), "{grep:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn traversal_tools_reject_root_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "outside-secret\n").unwrap();
+        symlink(outside.path(), workspace.path().join("escape")).unwrap();
+
+        let glob = run(
+            &GlobTool,
+            workspace.path(),
+            serde_json::json!({"root": "escape", "pattern": "**/*"}),
+        )
+        .await;
+        assert!(glob.is_error, "{glob:?}");
+        assert!(!glob.output.contains("secret.txt"), "{glob:?}");
+
+        let grep = run(
+            &GrepTool,
+            workspace.path(),
+            serde_json::json!({"root": "escape", "pattern": "outside-secret"}),
+        )
+        .await;
+        assert!(grep.is_error, "{grep:?}");
+        assert!(!grep.output.contains("outside-secret"), "{grep:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn traversal_tools_allow_root_symlink_to_workspace_descendant() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let source = workspace.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("inside.txt"), "workspace-needle\n").unwrap();
+        symlink(&source, workspace.path().join("linked-source")).unwrap();
+
+        let glob = run(
+            &GlobTool,
+            workspace.path(),
+            serde_json::json!({"root": "linked-source", "pattern": "*.txt"}),
+        )
+        .await;
+        assert_eq!(glob.output, "inside.txt");
+
+        let grep = run(
+            &GrepTool,
+            workspace.path(),
+            serde_json::json!({"root": "linked-source", "pattern": "workspace-needle"}),
+        )
+        .await;
+        assert_eq!(grep.output, "inside.txt:1:workspace-needle");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_root_open_refuses_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let outside = tempfile::tempdir().unwrap();
+        let workspace_parent = tempfile::tempdir().unwrap();
+        let replaced_root = workspace_parent.path().join("workspace");
+        symlink(outside.path(), &replaced_root).unwrap();
+
+        assert!(matches!(
+            open_workspace_root_no_follow(&replaced_root),
+            Err(WorkspaceOpenError::Policy(_))
+        ));
     }
 
     #[tokio::test]

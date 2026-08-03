@@ -2,6 +2,8 @@
 //!
 //! 测试各种 HTTP 错误状态码的处理和重试行为。
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::time::Duration;
 
 use client_api::{ClientConfig, ClientError};

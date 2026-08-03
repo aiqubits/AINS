@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -72,6 +72,7 @@ impl Sandbox for TestShellSandbox {
                     output: String::from_utf8_lossy(&combined).into_owned(),
                     exit_code: output.status.code(),
                     timed_out: false,
+                    cancelled: false,
                 })
             }
             Ok(Err(error)) => Err(SandboxError::Execution(error.to_string())),
@@ -79,6 +80,7 @@ impl Sandbox for TestShellSandbox {
                 output: String::new(),
                 exit_code: None,
                 timed_out: true,
+                cancelled: false,
             }),
         }
     }
@@ -242,7 +244,11 @@ struct CapturingPrompt {
 
 #[async_trait::async_trait]
 impl PermissionPrompt for CapturingPrompt {
-    async fn confirm(&self, request: &PermissionRequest) -> PermissionReply {
+    async fn confirm(
+        &self,
+        request: &PermissionRequest,
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> PermissionReply {
         *self.request.lock().unwrap() = Some(request.clone());
         PermissionReply::Deny
     }
@@ -250,7 +256,11 @@ impl PermissionPrompt for CapturingPrompt {
 
 #[async_trait::async_trait]
 impl PermissionPrompt for CountingPrompt {
-    async fn confirm(&self, _request: &PermissionRequest) -> PermissionReply {
+    async fn confirm(
+        &self,
+        _request: &PermissionRequest,
+        _cancel: Option<Arc<AtomicBool>>,
+    ) -> PermissionReply {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.reply
     }
@@ -810,7 +820,7 @@ async fn builtin_toolset_registration_smoke() {
     agent_core::tools::compute::register_compute_tools(&mut runtime);
     agent_core::tools::filesystem::register_filesystem_tools(&mut runtime);
     agent_core::tools::system::register_system_tools(&mut runtime, Arc::new(NoopSandbox), None);
-    runtime.register(Box::new(agent_core::tools::network::WebFetchTool));
+    runtime.register(Box::new(agent_core::tools::network::WebFetchTool::default()));
     runtime.register(Box::new(agent_core::tools::interact::TodoWriteTool));
     runtime.register(Box::new(
         agent_core::tools::interact::AskUserQuestionTool::new(None),

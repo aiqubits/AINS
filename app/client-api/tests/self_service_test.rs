@@ -4,6 +4,8 @@
 //!   `token_version += 1`，旧 JWT 永久失效 —— 客户端必须用新 token 替换）
 //! - `get_me`：当前登录用户的资料读取（用于会话恢复后填充 name/email）
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 

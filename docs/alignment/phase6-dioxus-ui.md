@@ -115,7 +115,7 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 | SkillManage.rollback_skill | 随 Phase 6.9（版本链 + 回滚机制） |
 | SkillLoader.load_reference（Level 2） | 随 Phase 6.8（引用文件面） |
 | SkillMeta 用 JSON 而非 bincode | KvStore 信封已 bincode，Value 双重 bincode 不可行（与 kv.rs 载荷策略一致） |
-| 查询中断（stop 按钮） | Kernel 暂无查询中断 API，`on_interrupt` 仅复位 UI 忙碌位；后续流事件仍正常渲染。真正的中断随 Kernel 中断接口落地 |
+| 查询中断（stop 按钮） | ~~Kernel 暂无查询中断 API，`on_interrupt` 仅复位 UI 忙碌位~~ **已于 Phase 7.1 落地**：Kernel `Arc<AtomicBool>` 中断标志 + `interrupt_handle()`，在模型 turn / 工具批边界协作式中断（见 phase7-sandbox-security.md §6） |
 | 系统集成（Clipboard/Notification/Screenshot） | 注入 None，工具自报不可用；平台集成随 Phase 6.10/7 |
 | Web 端非 Send Arc | `service.rs` wasm 分支 `allow(clippy::arc_with_non_send_sync)`（单线程 wasm 无害，双端统一 Arc 便于代码复用） |
 | Native KV 单例缓存 | `OnceLock` 仅缓存成功句柄（redb 单进程独占锁）；瞬时打开失败不永久缓存，重访路由可重试（Code Review 修正） |

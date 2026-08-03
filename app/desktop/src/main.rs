@@ -39,20 +39,30 @@ fn init_language() -> Language {
 
 /// Native 端 Client：读取 `AINS_API_URL`（未设置回退本地服务端），
 /// 建连层重试关闭（GatewayModelClient 自带流式重试，避免双层叠加）。
-/// 用户提供的 URL 非法时告警并回退默认值，不使桌面应用启动崩溃。
+/// 用户显式提供的 URL 非法时拒绝启动 Agent 客户端；不能把凭据转发到
+/// 未经用户指定的默认目标。
 ///
 /// 桌面端暂无登录流：网关认证经 `AINS_API_TOKEN` 环境变量注入；
 /// 未设置时告警提示（模型网关将返回 401/403，前端归类为可恢复错误）。
 fn make_client() -> Client {
     const DEFAULT_API_URL: &str = "http://127.0.0.1:8080";
     let base = std::env::var("AINS_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-    let client =
-        Client::new(ClientConfig::new(base.clone()).with_max_retries(0)).unwrap_or_else(|err| {
-            // desktop 未安装 tracing subscriber，用 stderr 保证误配可诊断
-            eprintln!("invalid AINS_API_URL `{base}` ({err}); falling back to {DEFAULT_API_URL}");
-            Client::new(ClientConfig::new(DEFAULT_API_URL).with_max_retries(0))
-                .expect("default client config must be valid")
-        });
+    // 传输加密加固（Phase 7.5）：默认要求非本地主机走 https；设
+    // `AINS_ALLOW_INSECURE_HTTP=1` 可在受信任内网显式放行明文 http。
+    let allow_insecure = std::env::var("AINS_ALLOW_INSECURE_HTTP")
+        .map(|value| value.eq_ignore_ascii_case("true") || value == "1")
+        .unwrap_or(false);
+    let client = Client::new(
+        ClientConfig::new(base.clone())
+            .with_max_retries(0)
+            .with_allow_insecure_http(allow_insecure),
+    )
+    .unwrap_or_else(|err| {
+        // desktop 未安装 tracing subscriber，用 panic 消息承载可诊断信息；
+        // fail-closed：用户显式配置了 AINS_API_URL 时拒绝回退到默认目标，
+        // 否则凭据/流量会静默发往用户未指定的服务器。
+        panic!("invalid AINS_API_URL `{base}` ({err}); refusing to start the Agent client");
+    });
     match std::env::var("AINS_API_TOKEN") {
         Ok(token) if !token.trim().is_empty() => client.set_token(token),
         _ => eprintln!(

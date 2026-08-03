@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use futures::FutureExt;
@@ -39,6 +40,19 @@ use crate::tools::{Tool, ToolDef, ToolRuntime};
 const EVENT_CHANNEL_CAPACITY: usize = 32;
 /// Waiting 态回到 Idle 前的休眠间隔（对齐 AINS_PLAN 3.1 伪代码）。
 const WAITING_SLEEP: Duration = Duration::from_millis(100);
+/// 模型流没有产生事件时仍需周期性检查中断标志，否则网络层永久静默会
+/// 让 Stop 只能等到底层请求超时。
+const STREAM_INTERRUPT_POLL: Duration = Duration::from_millis(100);
+/// Complete 后等待流关闭的收尾窗口：正常实现（网关）在 Complete 后立即
+/// EOF，此窗口保留“流关闭瞬间的中断”竞态注入点（ExecutingTools 回填
+/// 路径）；违反契约的实现（Complete 后保持连接）在窗口后放弃读取，
+/// 避免 turn 永久挂起（review 修复：历史实现无限等待流关闭）。
+const STREAM_COMPLETE_TAIL_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Stable status payload emitted when the active query is cancelled by the
+/// user.  UI consumers use this protocol value to discard partial streaming
+/// output without conflating ordinary status updates (such as retries).
+pub const QUERY_INTERRUPTED_STATUS: &str = "Query interrupted by user.";
 
 #[derive(Debug, Clone)]
 pub struct AgentKernelConfig {
@@ -78,6 +92,10 @@ pub struct AgentKernel<R: RuntimeAdapter> {
     config: AgentKernelConfig,
     /// 跨轮自动压缩状态（连续失败熔断计数等，Phase 5.5）。
     compact_state: AutoCompactState,
+    /// 用户中断标志（Phase 7.1）：UI 经 [`Self::interrupt_handle`] 置位，Kernel 在
+    /// 模型 turn / 工具批边界 check-and-clear，命中则中止本次查询回 Idle。
+    /// 不经事件通道，避免与 Idle 的事件消费竞争。
+    interrupt: Arc<AtomicBool>,
     _runtime: PhantomData<fn() -> R>,
 }
 
@@ -125,6 +143,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                 stream: stream_tx,
                 config,
                 compact_state: AutoCompactState::default(),
+                interrupt: Arc::new(AtomicBool::new(false)),
                 _runtime: PhantomData,
             },
             event_tx,
@@ -143,6 +162,19 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
     /// 会话快照回载等场景直接操作上下文；回载后续跑请调 `prepare_continuation`。
     pub fn context_mut(&mut self) -> &mut ContextStore {
         &mut self.context
+    }
+
+    /// 返回中断句柄：UI/宿主置位（`store(true, Ordering::Release)` 或更强）后，
+    /// Kernel 在下一个模型 turn / 工具批边界中止本次查询回 Idle（协作式中断，
+    /// 会话保活）。
+    ///
+    /// **Memory ordering 约定**：Kernel 通过 [`Ordering::SeqCst`] 读取并清除标志；
+    /// 调用方在置位前如有其它共享写入（如设置取消原因等），必须以至少
+    /// [`Ordering::Release`] 置位，保证写入对 Kernel 可见。仅置位布尔标志本身
+    /// 时 [`Ordering::Relaxed`] 亦可工作（SeqCst reader 自带同步），但推荐统一
+    /// 使用 Release 以避免混淆。
+    pub fn interrupt_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.interrupt)
     }
 
     /// 会话末尾是否为待续轮：最后一条是含 `tool_result` 的 user 消息，
@@ -265,7 +297,13 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     }
                 }
                 AgentState::Querying { turn } => {
-                    if turn >= self.config.max_turns {
+                    if self.interrupt_requested() {
+                        // 模型 turn 前检测到中断：中止本次查询回 Idle（会话保活）。
+                        self.emit(StreamEvent::Status {
+                            message: QUERY_INTERRUPTED_STATUS.into(),
+                        });
+                        AgentState::Idle
+                    } else if turn >= self.config.max_turns {
                         self.emit(StreamEvent::Error {
                             message: format!(
                                 "Exceeded maximum turn limit ({})",
@@ -307,6 +345,9 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                                         ),
                                         recoverable: true,
                                     });
+                                    // review 修复：回合异常结束同样消费 Complete 尾窗
+                                    // 内置位的陈旧中断标志，避免残留到下一次查询。
+                                    let _ = self.interrupt_requested();
                                     AgentState::Idle
                                 } else {
                                     self.context.conversation.push(message.clone());
@@ -323,6 +364,13 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                                             Value::String("tool_uses_empty".into()),
                                         );
                                         self.run_observational_hook(HookEvent::Stop, payload).await;
+                                        // review 修复：消费 Complete 尾窗 / Stop hook 期间
+                                        // 置位的陈旧中断标志——回合已自然完成（AssistantTurnComplete
+                                        // 已发出），此中断应为 no-op；残留会使下一次查询在
+                                        // Querying 入口被误中止。注意不得在 Idle 入口统一消费：
+                                        // 新查询入队后、Querying 检查前置位的标志必须保留
+                                        // （预置中断语义，见 interrupt_flag_* 回归测试）。
+                                        let _ = self.interrupt_requested();
                                         AgentState::Idle
                                     } else {
                                         AgentState::ExecutingTools { tool_uses, turn }
@@ -335,59 +383,100 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     }
                 }
                 AgentState::ExecutingTools { tool_uses, turn } => {
-                    for tool_use in &tool_uses {
-                        self.emit(StreamEvent::ToolExecutionStarted {
-                            tool_use_id: tool_use.id.clone(),
-                            tool_name: tool_use.name.clone(),
-                            tool_input: tool_use.input.clone(),
+                    if self.interrupt_requested() {
+                        // 工具批分发前检测到中断：不执行本批工具，但仍为每个
+                        // tool_use 回填取消结果。这样内核保存的会话与 UI 镜像
+                        // flush_pending_as_interrupted 的会话形状一致，恢复后不会
+                        // 因 sanitize 丢弃一条曾在 UI 中显示为已中断的工具调用。
+                        self.context.conversation.push(ConversationMessage {
+                            role: Role::User,
+                            content: tool_uses
+                                .iter()
+                                .map(|tool_use| ContentBlock::ToolResult {
+                                    tool_use_id: tool_use.id.clone(),
+                                    content: "interrupted".into(),
+                                    is_error: true,
+                                    result_metadata: Value::Null,
+                                })
+                                .collect(),
                         });
-                    }
-                    let outcomes = self
-                        .tools
-                        .dispatch_many(
-                            &tool_uses,
-                            &self.config.cwd,
-                            &mut self.context.tool_metadata,
-                        )
-                        .await;
-                    let mut results = Vec::with_capacity(tool_uses.len());
-                    for (tool_use, outcome) in tool_uses.iter().zip(outcomes) {
-                        self.emit(StreamEvent::ToolExecutionCompleted {
-                            tool_use_id: tool_use.id.clone(),
-                            tool_name: tool_use.name.clone(),
-                            output: outcome.output.clone(),
-                            is_error: outcome.is_error,
-                            metadata: outcome.metadata.clone(),
-                        });
-                        // 拒绝/失败不中止循环：作为 is_error 的 tool_result 回填
-                        results.push(ContentBlock::ToolResult {
-                            tool_use_id: tool_use.id.clone(),
-                            content: outcome.output,
-                            is_error: outcome.is_error,
-                            result_metadata: outcome.metadata,
-                        });
-                    }
-                    // tool_result 以 user 消息回填，进入下一轮模型调用
-                    self.context.conversation.push(ConversationMessage {
-                        role: Role::User,
-                        content: results,
-                    });
-                    AgentState::Querying { turn: turn + 1 }
-                }
-                AgentState::Compacting { trigger } => {
-                    // 手动/反应式压缩入口（auto 在 Querying 起始内联触发）；真实降级链
-                    // 与生命周期 hook 由 run_compaction 统一处理。压缩成功后回 Querying
-                    // 重置轮数预算续轮；PreCompact hook 阻断或未发生压缩时回 Idle
-                    // 等待后续输入，不重发模型请求（FSM 备用出边 Compacting → Idle）。
-                    let force = matches!(trigger, CompactTrigger::Manual);
-                    if self.run_compaction(trigger, force).await {
-                        AgentState::Querying { turn: 0 }
-                    } else {
                         self.emit(StreamEvent::Status {
-                            message: "Compaction skipped (blocked by hook or nothing to compact)."
-                                .into(),
+                            message: QUERY_INTERRUPTED_STATUS.into(),
                         });
                         AgentState::Idle
+                    } else {
+                        // 注入查询级取消标志（review 接线）：UI 中断置位后，
+                        // 沙箱后端（killpg / kill-on-close）终止运行中的进程树，
+                        // 不再只能等 timeout。批结束后清除防陈旧残留。
+                        // 注：工具批运行期间本循环不检查 interrupt（await 在
+                        // dispatch_many 内），故共享标志不会被 check-and-clear
+                        // 提前消费，沙箱轮询能看到置位。
+                        self.tools
+                            .set_query_cancel(Some(Arc::clone(&self.interrupt)));
+                        for tool_use in &tool_uses {
+                            self.emit(StreamEvent::ToolExecutionStarted {
+                                tool_use_id: tool_use.id.clone(),
+                                tool_name: tool_use.name.clone(),
+                                tool_input: tool_use.input.clone(),
+                            });
+                        }
+                        let outcomes = self
+                            .tools
+                            .dispatch_many(
+                                &tool_uses,
+                                &self.config.cwd,
+                                &mut self.context.tool_metadata,
+                            )
+                            .await;
+                        self.tools.set_query_cancel(None);
+                        let mut results = Vec::with_capacity(tool_uses.len());
+                        for (tool_use, outcome) in tool_uses.iter().zip(outcomes) {
+                            self.emit(StreamEvent::ToolExecutionCompleted {
+                                tool_use_id: tool_use.id.clone(),
+                                tool_name: tool_use.name.clone(),
+                                output: outcome.output.clone(),
+                                is_error: outcome.is_error,
+                                metadata: outcome.metadata.clone(),
+                            });
+                            // 拒绝/失败不中止循环：作为 is_error 的 tool_result 回填
+                            results.push(ContentBlock::ToolResult {
+                                tool_use_id: tool_use.id.clone(),
+                                content: outcome.output,
+                                is_error: outcome.is_error,
+                                result_metadata: outcome.metadata,
+                            });
+                        }
+                        // tool_result 以 user 消息回填，进入下一轮模型调用
+                        self.context.conversation.push(ConversationMessage {
+                            role: Role::User,
+                            content: results,
+                        });
+                        AgentState::Querying { turn: turn + 1 }
+                    }
+                }
+                AgentState::Compacting { trigger } => {
+                    // 手动/反应式压缩入口。压缩前检查中断标志：命中则跳过压缩
+                    // 回 Idle 保活会话（压缩可推迟到下次查询前由 auto-compact 触发）。
+                    if self.interrupt_requested() {
+                        self.emit(StreamEvent::Status {
+                            message: QUERY_INTERRUPTED_STATUS.into(),
+                        });
+                        AgentState::Idle
+                    } else {
+                        // 真实降级链与生命周期 hook 由 run_compaction 统一处理。
+                        // 压缩成功后回 Querying 重置轮数预算续轮；PreCompact hook
+                        // 阻断或未发生压缩时回 Idle 等待后续输入。
+                        let force = matches!(trigger, CompactTrigger::Manual);
+                        if self.run_compaction(trigger, force).await {
+                            AgentState::Querying { turn: 0 }
+                        } else {
+                            self.emit(StreamEvent::Status {
+                                message:
+                                    "Compaction skipped (blocked by hook or nothing to compact)."
+                                        .into(),
+                            });
+                            AgentState::Idle
+                        }
                     }
                 }
                 AgentState::Waiting => {
@@ -407,6 +496,18 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
             self.state = next;
         }
         Ok(())
+    }
+
+    /// 协作式中断检查（check-and-clear）：返回中断标志当前值并复位。
+    /// 在模型 turn / 工具批边界调用；不读事件通道，恰与 Idle 的事件消费解耦。
+    /// 此外，回合自然结束的回 Idle 路径（无工具回答 / 校验错误）也会消费
+    /// 残留标志（如 Complete 尾窗内置位），防止陈旧标志污染下一次查询。
+    ///
+    /// 使用 [`Ordering::SeqCst`] 保证：1) 能看到任意 ordering 的 caller 写入；
+    /// 2) swap 的 store 侧与此前模型输出/工具结果写入构成 release 语义，
+    /// 确保中断复位不对后续操作重排。
+    fn interrupt_requested(&self) -> bool {
+        self.interrupt.swap(false, Ordering::SeqCst)
     }
 
     async fn run_blocking_hook(&self, event: HookEvent, payload: Map<String, Value>) -> bool {
@@ -453,7 +554,33 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
             }
         };
         let mut finished = None;
-        while let Some(event) = stream.next().await {
+        loop {
+            // `stream.next().await` 本身可能永久 pending（例如网关连接静默），
+            // 因此用短轮询把原子中断标志转化为可唤醒的取消点。
+            let next_event = stream.next().fuse();
+            let interrupt_tick = R::sleep(STREAM_INTERRUPT_POLL).fuse();
+            futures::pin_mut!(next_event, interrupt_tick);
+            let event = futures::select! {
+                event = next_event => event,
+                _ = interrupt_tick => {
+                    if self.interrupt_requested() {
+                        self.emit(StreamEvent::Status {
+                            message: QUERY_INTERRUPTED_STATUS.into(),
+                        });
+                        return None;
+                    }
+                    continue;
+                }
+            };
+            let Some(event) = event else { break };
+            // 流内中断检查：UI 置位后中止本次 turn（不等待模型流自然结束），
+            // 发 Status 通知并返回 None 回 Idle。
+            if self.interrupt_requested() {
+                self.emit(StreamEvent::Status {
+                    message: QUERY_INTERRUPTED_STATUS.into(),
+                });
+                return None;
+            }
             match event {
                 ModelStreamEvent::TextDelta { text } => {
                     self.emit(StreamEvent::AssistantTextDelta { text });
@@ -470,6 +597,25 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                 }
                 ModelStreamEvent::Complete { message, usage, .. } => {
                     finished = Some((message, usage));
+                    // Complete 是协议终止事件，其后不应再有事件。正常流在
+                    // 此立即 EOF：短窗收尾保留“流关闭瞬间的中断”竞态窗口
+                    // （ExecutingTools 分发前回填 interrupted tool_result 的
+                    // 注入点）；违反契约的实现（Complete 后保持连接）在窗口
+                    // 后放弃读取，不无限挂起（review 修复：历史实现无限等
+                    // 待流关闭，只能靠用户中断或底层请求超时逃逸）。
+                    // Complete 后的事件不合法：tail 静默丢弃。
+                    let tail = async { while stream.next().await.is_some() {} }.fuse();
+                    let tail_timeout = R::sleep(STREAM_COMPLETE_TAIL_TIMEOUT).fuse();
+                    futures::pin_mut!(tail, tail_timeout);
+                    let tail_closed = futures::select! {
+                        _ = tail => true,
+                        _ = tail_timeout => false,
+                    };
+                    if !tail_closed {
+                        // 流在窗口内未关闭：放弃等待，结束本 turn 的读取
+                        // （下一次 select 会再次永久 pending）。
+                        break;
+                    }
                 }
             }
         }

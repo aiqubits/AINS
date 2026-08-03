@@ -343,23 +343,6 @@ struct MapIndexManager {
 
 #[async_trait::async_trait]
 impl VectorIndexManager for MapIndexManager {
-    async fn get_index(&self, namespace: MemoryNamespace) -> Result<&dyn VectorIndex, MemoryError> {
-        self.indexes
-            .get(&namespace)
-            .map(|index| index as &dyn VectorIndex)
-            .ok_or(MemoryError::NamespaceNotFound(namespace))
-    }
-
-    async fn get_index_mut(
-        &mut self,
-        namespace: MemoryNamespace,
-    ) -> Result<&mut dyn VectorIndex, MemoryError> {
-        self.indexes
-            .get_mut(&namespace)
-            .map(|index| index as &mut dyn VectorIndex)
-            .ok_or(MemoryError::NamespaceNotFound(namespace))
-    }
-
     async fn create_index(
         &mut self,
         namespace: MemoryNamespace,
@@ -373,6 +356,44 @@ impl VectorIndexManager for MapIndexManager {
         // 契约要求幂等（ensure-absent）
         self.indexes.remove(&namespace);
         Ok(())
+    }
+
+    async fn add(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError> {
+        self.indexes
+            .get_mut(&namespace)
+            .ok_or(MemoryError::NamespaceNotFound(namespace))?
+            .add(node_id, vector)
+            .await
+    }
+
+    async fn remove(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+    ) -> Result<(), MemoryError> {
+        self.indexes
+            .get_mut(&namespace)
+            .ok_or(MemoryError::NamespaceNotFound(namespace))?
+            .remove(node_id)
+            .await
+    }
+
+    async fn search(
+        &self,
+        namespace: MemoryNamespace,
+        query: &[f32],
+        top_k: usize,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        self.indexes
+            .get(&namespace)
+            .ok_or(MemoryError::NamespaceNotFound(namespace))?
+            .search(query, top_k)
+            .await
     }
 }
 
@@ -420,35 +441,25 @@ async fn vector_index_manager_namespaces_are_isolated() {
         .unwrap();
 
     manager
-        .get_index_mut(MemoryNamespace::Personal)
-        .await
-        .unwrap()
-        .add("p1", &[1.0, 0.0])
+        .add(MemoryNamespace::Personal, "p1", &[1.0, 0.0])
         .await
         .unwrap();
     manager
-        .get_index_mut(MemoryNamespace::Document)
-        .await
-        .unwrap()
-        .add("d1", &[1.0, 0.0])
+        .add(MemoryNamespace::Document, "d1", &[1.0, 0.0])
         .await
         .unwrap();
 
     let personal_hits = manager
-        .get_index(MemoryNamespace::Personal)
-        .await
-        .unwrap()
-        .search(&[1.0, 0.0], 10)
+        .search(MemoryNamespace::Personal, &[1.0, 0.0], 10)
         .await
         .unwrap();
     assert_eq!(personal_hits.len(), 1);
     assert_eq!(personal_hits[0].0, "p1");
 
     let err = manager
-        .get_index(MemoryNamespace::Code)
+        .search(MemoryNamespace::Code, &[1.0, 0.0], 10)
         .await
-        .err()
-        .expect("Code namespace should not exist");
+        .expect_err("Code namespace should not exist");
     assert!(matches!(
         err,
         MemoryError::NamespaceNotFound(MemoryNamespace::Code)
@@ -458,7 +469,12 @@ async fn vector_index_manager_namespaces_are_isolated() {
         .remove_index(MemoryNamespace::Document)
         .await
         .unwrap();
-    assert!(manager.get_index(MemoryNamespace::Document).await.is_err());
+    assert!(
+        manager
+            .search(MemoryNamespace::Document, &[1.0, 0.0], 10)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

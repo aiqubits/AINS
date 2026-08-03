@@ -4,6 +4,8 @@
 //! （insufficient_balance / no_active_plan 场景所依赖的 400/404 传递）、
 //! list_orders 过滤参数序列化、以及套餐 CRUD 的请求/响应契约。
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use client_api::{ClientError, CreatePlanRequest, ListOrdersFilter, UpdateOrderRequest};
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};

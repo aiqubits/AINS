@@ -8,12 +8,16 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::{Map, Value};
 
 use crate::hooks::{HookEvent, HookExecutor};
 use crate::kernel::messages::ToolUse;
-use crate::policy::{PermissionEngine, PermissionPrompt, PermissionReply, PermissionRequest};
+use crate::policy::{
+    PermissionDecision, PermissionEngine, PermissionPrompt, PermissionReply, PermissionRequest,
+};
 use crate::tools::outputs::{ArtifactSink, offload_tool_output_if_needed};
 use crate::tools::{Tool, ToolContext, ToolDef, ToolMetadata, ToolResult};
 
@@ -29,6 +33,9 @@ pub struct ToolRuntime {
     permission_prompt: Option<Arc<dyn PermissionPrompt>>,
     hooks: Option<Arc<HookExecutor>>,
     artifact_sink: Option<Arc<dyn ArtifactSink>>,
+    /// 本轮查询的协作式取消标志（Kernel 工具批分发前注入、批后清除）。
+    /// 经 [`Tool::set_query_cancel`] 下发给长时工具（shell 等）。
+    query_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Default for ToolRuntime {
@@ -43,6 +50,7 @@ impl Default for ToolRuntime {
             permission_prompt: None,
             hooks: None,
             artifact_sink: None,
+            query_cancel: Mutex::new(None),
         }
     }
 }
@@ -98,6 +106,36 @@ impl ToolRuntime {
         &self.permissions
     }
 
+    /// 设置 / 清除本轮查询的协作式取消标志（Kernel 在工具批分发前注入、
+    /// 批后传 None 清除）。每次 [`Self::dispatch`] 前都会把当前值（含 None）
+    /// 重新注入给目标工具，故陈旧标志不会跨批残留。
+    pub fn set_query_cancel(&self, flag: Option<Arc<AtomicBool>>) {
+        *self
+            .query_cancel
+            .lock()
+            .expect("query cancel lock poisoned") = flag;
+    }
+
+    fn current_query_cancel(&self) -> Option<Arc<AtomicBool>> {
+        self.query_cancel
+            .lock()
+            .expect("query cancel lock poisoned")
+            .clone()
+    }
+
+    /// A cancellation request belongs to the Kernel, which performs the
+    /// check-and-clear and emits the terminal status.  The runtime must only
+    /// observe it: clearing it here would allow a later tool in the same batch
+    /// to run after the user pressed Stop.
+    fn query_is_cancelled(&self) -> bool {
+        self.current_query_cancel()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn cancelled_result() -> ToolResult {
+        ToolResult::err("Tool execution interrupted by user")
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -114,6 +152,13 @@ impl ToolRuntime {
     /// 单个 tool_use 的完整分发管线。未知工具与执行异常均归一化为
     /// is_error 的 ToolResult（对齐基线合成 error tool_result 语义）。
     pub async fn dispatch(&self, tool_use: &ToolUse, ctx: &mut ToolContext<'_>) -> ToolResult {
+        // Stop may arrive while another tool in this batch is awaiting a
+        // permission reply.  Never start a later hook/prompt/tool after it;
+        // the Kernel remains responsible for consuming the flag at the batch
+        // boundary and reporting QUERY_INTERRUPTED_STATUS.
+        if self.query_is_cancelled() {
+            return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
+        }
         // 1. pre_tool_use hook：任一 blocked 即拒绝执行
         if let Some(hooks) = &self.hooks {
             let mut payload = Map::new();
@@ -146,12 +191,43 @@ impl ToolRuntime {
             let engine = &self.permissions;
             let file_path = resolve_permission_file_path(&tool_use.name, ctx.cwd, &tool_use.input);
             let command = extract_permission_command(&tool_use.input);
-            let decision = engine.evaluate(
-                &tool_use.name,
-                tool.is_read_only(&tool_use.input),
-                file_path.as_deref(),
-                command.as_deref(),
-            );
+            let permission_tool_name = if tool_use.name == "background_task"
+                && matches!(
+                    tool_use.input.get("action").and_then(Value::as_str),
+                    Some("run" | "stop")
+                ) {
+                // `background_task/run` is an arbitrary shell execution surface;
+                // it must share shell_command's deny/allow identity. `stop`
+                // terminates the process spawned by `run`, so it belongs to the
+                // same authorization surface — otherwise a user who approved
+                // `run` (persisted under shell_command) cannot stop the task
+                // without a fresh prompt ("can start but cannot stop").
+                "shell_command"
+            } else {
+                &tool_use.name
+            };
+            let decision = if let Some(path) = file_path.as_deref()
+                && tool_use.name == "edit_file"
+                && !engine.file_access_allowed(path, true)
+            {
+                PermissionDecision::deny(format!(
+                    "Access denied: {path} is not readable under the sandbox filesystem policy"
+                ))
+            } else if let Some(path) = file_path.as_deref()
+                && matches!(tool_use.name.as_str(), "glob" | "grep")
+                && !engine.recursive_read_allowed(path)
+            {
+                PermissionDecision::deny(format!(
+                    "Recursive access denied: {path} cannot be authorized with the configured sandbox deny rules"
+                ))
+            } else {
+                engine.evaluate(
+                    permission_tool_name,
+                    tool.is_read_only(&tool_use.input),
+                    file_path.as_deref(),
+                    command.as_deref(),
+                )
+            };
             if !decision.allowed {
                 if decision.requires_confirmation
                     && let Some(prompt) = &self.permission_prompt
@@ -186,10 +262,15 @@ impl ToolRuntime {
                         resolved_file_path: file_path.clone(),
                         command: command.clone(),
                     };
-                    match prompt.confirm(&request).await {
+                    match prompt.confirm(&request, self.current_query_cancel()).await {
                         PermissionReply::Allow => {}
                         PermissionReply::AlwaysAllow => {
-                            engine.allow_for_session(&tool_use.name);
+                            // `background_task/run` shares shell_command's
+                            // permission identity.  Persist the identity
+                            // actually evaluated; storing the display tool
+                            // name made “Always allow” ineffective for every
+                            // later background run.
+                            engine.allow_for_session(permission_tool_name);
                         }
                         PermissionReply::Deny => {
                             let result = ToolResult::err(permission_denied_message(
@@ -198,6 +279,12 @@ impl ToolRuntime {
                             ));
                             return self.apply_output_budget(tool_use, result, ctx);
                         }
+                    }
+                    // A prompt can resolve with Allow after the user pressed
+                    // Stop (for example a click already queued by the UI).
+                    // Do not let that stale approval authorize a mutation.
+                    if self.query_is_cancelled() {
+                        return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
                     }
                 } else {
                     let result = ToolResult::err(permission_denied_message(
@@ -209,7 +296,12 @@ impl ToolRuntime {
             }
         }
 
-        // 4. 执行（Err 归一化为 is_error tool_result）
+        // 4. 执行（Err 归一化为 is_error tool_result）。先注入查询级取消标志
+        //    （含 None 清除旧值），长时工具据此响应 UI 中断。
+        if self.query_is_cancelled() {
+            return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
+        }
+        tool.set_query_cancel(self.current_query_cancel());
         let result = match tool.execute(tool_use.input.clone(), ctx).await {
             Ok(result) => result,
             Err(error) => ToolResult::err(format!("Tool {} failed: {error}", tool_use.name)),
@@ -393,6 +485,10 @@ fn resolve_permission_file_path(tool_name: &str, cwd: &Path, input: &Value) -> O
         let candidate = object.get("cwd").and_then(Value::as_str).unwrap_or(".");
         return Some(resolve_permission_candidate(cwd, candidate));
     }
+    if tool_name == "background_task" && object.get("action").and_then(Value::as_str) == Some("run")
+    {
+        return Some(resolve_permission_candidate(cwd, "."));
+    }
     // glob ignores `root` when `pattern` is absolute, so the permission path
     // must follow the same precedence or an absolute sensitive pattern could
     // be checked against an unrelated safe root.
@@ -509,7 +605,9 @@ fn extract_permission_command(input: &Value) -> Option<String> {
 mod tests {
     use super::*;
     use crate::error::ToolError;
+    use crate::policy::{PermissionMode, PermissionSettings};
     use crate::tools::{ToolCategory, ToolMetadata};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct EchoTool {
         name: &'static str,
@@ -517,6 +615,60 @@ mod tests {
     }
 
     struct ExclusiveCounterTool;
+
+    struct AlwaysAllowPrompt(AtomicUsize);
+
+    struct CancelThenAllowPrompt(Arc<AtomicBool>);
+
+    struct CountingMutatingTool(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl PermissionPrompt for AlwaysAllowPrompt {
+        async fn confirm(
+            &self,
+            _request: &PermissionRequest,
+            _cancel: Option<Arc<AtomicBool>>,
+        ) -> PermissionReply {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            PermissionReply::AlwaysAllow
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl PermissionPrompt for CancelThenAllowPrompt {
+        async fn confirm(
+            &self,
+            _request: &PermissionRequest,
+            _cancel: Option<Arc<AtomicBool>>,
+        ) -> PermissionReply {
+            self.0.store(true, Ordering::Release);
+            PermissionReply::Allow
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Tool for CountingMutatingTool {
+        fn definition(&self) -> ToolDef {
+            ToolDef {
+                name: "counting_mutator".into(),
+                description: "records a mutation".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _input: Value,
+            _ctx: &mut ToolContext<'_>,
+        ) -> Result<ToolResult, ToolError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolResult::ok("mutated"))
+        }
+
+        fn category(&self) -> ToolCategory {
+            ToolCategory::AgentInternal
+        }
+    }
 
     #[async_trait::async_trait]
     impl Tool for ExclusiveCounterTool {
@@ -718,6 +870,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn background_task_always_allow_is_stored_under_shell_permission_identity() {
+        // background_task/run 以 shell_command 身份求值；“总是允许”也必须
+        // 写入同一身份，否则每次后台任务都会再次弹窗。
+        let prompt = Arc::new(AlwaysAllowPrompt(AtomicUsize::new(0)));
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::Default,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, Some(prompt.clone()));
+        runtime.register(Box::new(EchoTool {
+            name: "background_task",
+            read_only: false,
+        }));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+        let run = || {
+            tool_use(
+                "background_task",
+                serde_json::json!({"action": "run", "command": "echo task"}),
+            )
+        };
+
+        assert!(!runtime.dispatch(&run(), &mut ctx).await.is_error);
+        assert!(!runtime.dispatch(&run(), &mut ctx).await.is_error);
+        assert_eq!(prompt.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn background_task_stop_shares_shell_permission_identity() {
+        // review 修复回归：`background_task/stop` 终止 `run` 启动的进程，必须
+        // 与 `run` 同属 shell_command 授权面——否则用户批准 run（持久化在
+        // shell_command 身份下）后 stop 仍需弹窗（"能起不能停"）。
+        let prompt = Arc::new(AlwaysAllowPrompt(AtomicUsize::new(0)));
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::Default,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, Some(prompt.clone()));
+        runtime.register(Box::new(EchoTool {
+            name: "background_task",
+            read_only: false,
+        }));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+        let run = || {
+            tool_use(
+                "background_task",
+                serde_json::json!({"action": "run", "command": "echo task"}),
+            )
+        };
+        let stop = || {
+            tool_use(
+                "background_task",
+                serde_json::json!({"action": "stop", "task_id": "task-1"}),
+            )
+        };
+
+        // run 首次弹窗并把 AlwaysAllow 持久化到 shell_command 身份。
+        assert!(!runtime.dispatch(&run(), &mut ctx).await.is_error);
+        assert_eq!(prompt.0.load(Ordering::SeqCst), 1);
+        // stop 复用 shell_command 放行，不再弹窗（修复前按 background_task
+        // 身份求值 → 未授权 → 弹第 2 次）。
+        assert!(!runtime.dispatch(&stop(), &mut ctx).await.is_error);
+        assert_eq!(prompt.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_permission_allow_prevents_mutation() {
+        // Regression: Stop can race a visible permission dialog.  Even if an
+        // Allow click was already queued, it must not authorize execution.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let executed = Arc::new(AtomicUsize::new(0));
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::Default,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(
+            engine,
+            Some(Arc::new(CancelThenAllowPrompt(Arc::clone(&cancel)))),
+        );
+        runtime.set_query_cancel(Some(Arc::clone(&cancel)));
+        runtime.register(Box::new(CountingMutatingTool(Arc::clone(&executed))));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+
+        let result = runtime
+            .dispatch(&tool_use("counting_mutator", Value::Null), &mut ctx)
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.output.contains("interrupted by user"));
+        assert_eq!(executed.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn conflicting_exclusive_keys_execute_against_latest_metadata() {
         let mut runtime = ToolRuntime::new();
         runtime.register(Box::new(ExclusiveCounterTool));
@@ -831,6 +1087,14 @@ mod tests {
                 "shell_command",
                 cwd,
                 &serde_json::json!({"command": "pwd"})
+            ),
+            Some("/work/project".to_string())
+        );
+        assert_eq!(
+            resolve_permission_file_path(
+                "background_task",
+                cwd,
+                &serde_json::json!({"action": "run", "command": "pwd"})
             ),
             Some("/work/project".to_string())
         );

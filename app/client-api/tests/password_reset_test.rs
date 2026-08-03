@@ -6,6 +6,8 @@
 //!   暴力尝试上限 / 弱密码" 全部统一 400 + 通用文案（anti-enumeration +
 //!   凭证探测防护）。成功路径会签发新 JWT。
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, ResponseTemplate};
 

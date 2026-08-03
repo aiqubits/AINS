@@ -2,6 +2,8 @@
 //!
 //! 使用 Wiremock 模拟后端服务，无需启动真实服务器。
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, ResponseTemplate};
 

@@ -13,6 +13,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::error::ToolError;
+use crate::policy::sandbox_policy::NetworkPolicy;
 use crate::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult};
 
 pub const USER_AGENT: &str = "Mozilla/5.0 (compatible) AINS/0.1";
@@ -288,12 +289,18 @@ pub struct FetchedResponse {
 }
 
 /// Native：重定向禁自动跟随、每一跳复检公网目标（对齐
-/// `fetch_public_http_response`）。
+/// `fetch_public_http_response`）；每一跳先经 `network` 域名策略裁决。
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn fetch_public_http_response(raw_url: &str) -> Result<FetchedResponse, String> {
+pub async fn fetch_public_http_response(
+    raw_url: &str,
+    network: &NetworkPolicy,
+) -> Result<FetchedResponse, String> {
     let mut current_url = raw_url.to_string();
     for _redirect_count in 0..=MAX_REDIRECTS {
         let mut validated = validate_http_url(&current_url)?;
+        // 域名策略在 DNS 解析之前裁决（每一跳复检：白名单域名重定向
+        // 到名单外域名也被拦截）。
+        network.check_host(&normalized_hostname(&validated))?;
         // Resolve once, validate every address, then pin reqwest to that exact
         // set. This removes the validation/connect DNS-rebinding window.
         let addresses = resolve_public_socket_addrs(&validated).await?;
@@ -363,7 +370,12 @@ pub async fn fetch_public_http_response(raw_url: &str) -> Result<FetchedResponse
 /// 响应，并不会阻止对内网目标发出请求，因此直接抓取必须 fail-closed。
 /// Web 宿主应通过受信任的同源服务端代理提供该能力。
 #[cfg(target_arch = "wasm32")]
-pub async fn fetch_public_http_response(raw_url: &str) -> Result<FetchedResponse, String> {
+pub async fn fetch_public_http_response(
+    raw_url: &str,
+    network: &NetworkPolicy,
+) -> Result<FetchedResponse, String> {
+    let validated = validate_http_url(raw_url)?;
+    network.check_host(&normalized_hostname(&validated))?;
     let _ = ensure_public_http_url(raw_url).await?;
     Err("web_fetch is disabled on the web platform because the browser cannot enforce DNS and redirect SSRF checks; use a trusted same-origin proxy".into())
 }
@@ -436,8 +448,18 @@ pub fn html_to_text(html: &str) -> String {
     collapsed.replace(" \n", "\n").trim().to_string()
 }
 
-/// 抓取单个网页并返回紧凑可读文本。
-pub struct WebFetchTool;
+/// 抓取单个网页并返回紧凑可读文本。持有网络域名策略（空 = 全放行）。
+#[derive(Default)]
+pub struct WebFetchTool {
+    network: NetworkPolicy,
+}
+
+impl WebFetchTool {
+    /// 携带网络域名策略构造（sandbox 策略层注入）。
+    pub fn new(network: NetworkPolicy) -> Self {
+        Self { network }
+    }
+}
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -481,7 +503,7 @@ impl Tool for WebFetchTool {
         if let Err(error) = validate_http_url(raw_url) {
             return Ok(ToolResult::err(format!("web_fetch failed: {error}")));
         }
-        let response = match fetch_public_http_response(raw_url).await {
+        let response = match fetch_public_http_response(raw_url, &self.network).await {
             Ok(response) => response,
             Err(error) => return Ok(ToolResult::err(format!("web_fetch failed: {error}"))),
         };
@@ -661,18 +683,59 @@ mod tests {
             cwd: std::path::Path::new("/tmp"),
             metadata: &mut metadata,
         };
-        let result = WebFetchTool
+        let result = WebFetchTool::default()
             .execute(serde_json::json!({"url": "ftp://example.com"}), &mut ctx)
             .await
             .unwrap();
         assert!(result.is_error);
         assert!(result.output.starts_with("web_fetch failed:"));
-        let result = WebFetchTool
+        let result = WebFetchTool::default()
             .execute(serde_json::json!({"url": "http://127.0.0.1:9/x"}), &mut ctx)
             .await
             .unwrap();
         assert!(result.is_error);
         assert!(result.output.contains("non-public"));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_domain_policy_blocks_before_dns() {
+        // 白名单模式：名单外域名在 DNS 解析前即被拒（不依赖网络）。
+        let mut metadata = crate::tools::ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: std::path::Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+        let tool = WebFetchTool::new(NetworkPolicy {
+            allowed_domains: vec!["example.com".into()],
+            denied_domains: vec![],
+        });
+        let result = tool
+            .execute(
+                serde_json::json!({"url": "https://not-allowed.org/x"}),
+                &mut ctx,
+            )
+            .await
+            .unwrap();
+        assert!(result.is_error);
+        assert!(
+            result
+                .output
+                .contains("blocked by the sandbox network policy"),
+            "{}",
+            result.output
+        );
+        // 直接调用底层：deny 域名在解析前拦截
+        let denied = NetworkPolicy {
+            allowed_domains: vec![],
+            denied_domains: vec!["blocked.example".into()],
+        };
+        let error = fetch_public_http_response("https://blocked.example/x", &denied)
+            .await
+            .unwrap_err();
+        assert!(
+            error.contains("blocked by the sandbox network policy"),
+            "{error}"
+        );
     }
 
     #[test]

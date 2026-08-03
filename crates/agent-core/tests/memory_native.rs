@@ -1130,6 +1130,52 @@ async fn capacity_full_remember_evicts_but_insert_with_id_errors() {
     assert!(hits.iter().any(|(e, _)| e.content == "entry three"));
 }
 
+#[tokio::test]
+async fn insert_with_id_updates_existing_entry_when_namespace_is_full() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let mut engine = build_engine(&backend, MemoryNamespace::Personal)
+        .await
+        .with_max_entries(1);
+
+    engine
+        .insert_with_id(
+            MemoryNamespace::Personal,
+            "stable-id",
+            "old content",
+            &embed_text("old content"),
+            json!({"revision": 1}),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .insert_with_id(
+            MemoryNamespace::Personal,
+            "stable-id",
+            "new content",
+            &embed_text("new content"),
+            json!({"revision": 2}),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(engine.count(MemoryNamespace::Personal).await.unwrap(), 1);
+    let entry = engine
+        .get(MemoryNamespace::Personal, "stable-id")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(entry.content, "new content");
+    assert_eq!(entry.metadata["revision"], 2);
+    let hits = engine
+        .search(MemoryNamespace::Personal, &embed_text("new content"), 1)
+        .await
+        .unwrap();
+    assert_eq!(hits[0].0.id, "stable-id");
+    assert_eq!(hits[0].0.content, "new content");
+}
+
 // ── Fix 回归：clear_namespace 全量清理（SoT + 签名 + 索引）──
 
 #[tokio::test]
@@ -1317,6 +1363,72 @@ impl KvStore for FailingKv {
 
     async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
         self.inner.list_prefix(prefix).await
+    }
+}
+
+/// Test index manager that mutates its resident vector before reporting the
+/// second add as failed.  It models a backend that cannot atomically roll back
+/// an in-memory graph update on its own.
+struct MutatingThenFailingVectorManager {
+    vectors: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>>,
+    adds: usize,
+    fail_on_add: usize,
+}
+
+#[async_trait::async_trait]
+impl agent_core::memory::VectorIndexManager for MutatingThenFailingVectorManager {
+    async fn create_index(
+        &mut self,
+        _namespace: MemoryNamespace,
+        _config: VectorIndexConfig,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    async fn remove_index(&mut self, _namespace: MemoryNamespace) -> Result<(), MemoryError> {
+        self.vectors.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn add(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError> {
+        self.adds += 1;
+        self.vectors
+            .lock()
+            .unwrap()
+            .insert(namespace.storage_key(node_id), vector.to_vec());
+        if self.adds == self.fail_on_add {
+            Err(MemoryError::Storage(
+                "injected post-mutation index failure".into(),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn remove(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+    ) -> Result<(), MemoryError> {
+        self.vectors
+            .lock()
+            .unwrap()
+            .remove(&namespace.storage_key(node_id));
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        _namespace: MemoryNamespace,
+        _query: &[f32],
+        _top_k: usize,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        Ok(Vec::new())
     }
 }
 
@@ -1574,6 +1686,269 @@ async fn dedupe_refresh_index_failure_restores_previous_state() {
         .await
         .unwrap();
     assert!(hits[0].1 > 0.999);
+}
+
+#[tokio::test]
+async fn dedupe_refresh_failure_restores_resident_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let vectors = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let manager = MutatingThenFailingVectorManager {
+        vectors: Arc::clone(&vectors),
+        adds: 0,
+        fail_on_add: 2,
+    };
+    let mut engine = MemoryEngine::new(
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Box::new(manager),
+    );
+
+    let content = "resident-index rollback fact";
+    let original = vec![1.0; DIM as usize];
+    let refreshed = vec![0.0; DIM as usize];
+    let first = engine
+        .remember(MemoryNamespace::Personal, content, &original, json!({}))
+        .await
+        .unwrap();
+
+    // The manager stores `refreshed` before returning an error.  The engine
+    // must replay the old embedding into the resident index during rollback.
+    assert!(
+        engine
+            .remember(MemoryNamespace::Personal, content, &refreshed, json!({}))
+            .await
+            .is_err()
+    );
+
+    assert_eq!(
+        vectors
+            .lock()
+            .unwrap()
+            .get(&MemoryNamespace::Personal.storage_key(&first.id))
+            .cloned(),
+        Some(original)
+    );
+}
+
+#[tokio::test]
+async fn failed_new_remember_removes_resident_index_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let vectors = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let manager = MutatingThenFailingVectorManager {
+        vectors: Arc::clone(&vectors),
+        adds: 0,
+        fail_on_add: 1,
+    };
+    let mut engine = MemoryEngine::new(
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Box::new(manager),
+    );
+
+    assert!(
+        engine
+            .remember(
+                MemoryNamespace::Personal,
+                "new index rollback fact",
+                &[1.0; DIM as usize],
+                json!({}),
+            )
+            .await
+            .is_err()
+    );
+    assert!(vectors.lock().unwrap().is_empty());
+}
+
+// ── 7.4 冷启动优化：向量索引懒加载（首次检索才重建） ──
+
+#[tokio::test]
+async fn create_index_is_lazy_and_first_search_rebuilds_from_sot() {
+    use agent_core::memory::{VectorIndexManager, vector_to_value};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
+    let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
+    let ns = MemoryNamespace::Personal;
+
+    // 模拟上次会话遗留的 Source Of Truth：直接把向量写入 embeddings 表。
+    let v_apple = embed_text("apple");
+    embeddings
+        .set(&ns.storage_key("n-apple"), &vector_to_value(&v_apple), None)
+        .await
+        .unwrap();
+
+    let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
+    manager.create_index(ns, test_config()).await.unwrap();
+
+    // 冷启动核心：create_index 只登记配置，不触发整表加载 / 图重建。
+    assert!(
+        !manager.is_loaded(ns),
+        "create_index 应懒加载，不应立即物化索引"
+    );
+
+    // 首次检索才从 SoT 懒加载重建，并正确命中遗留向量。
+    let hits = manager.search(ns, &v_apple, 5).await.unwrap();
+    assert!(manager.is_loaded(ns), "首次 search 后索引应已物化");
+    assert_eq!(hits[0].0, "n-apple");
+    assert!(hits[0].1 > 0.999);
+
+    // 未被检索的其他 namespace 永不重建（冷启动只为用到的 namespace 付费）。
+    manager
+        .create_index(MemoryNamespace::Document, test_config())
+        .await
+        .unwrap();
+    assert!(!manager.is_loaded(MemoryNamespace::Document));
+}
+
+#[tokio::test]
+async fn pending_index_absorbs_writes_without_rebuild() {
+    use agent_core::memory::{VectorIndexManager, vector_to_value};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
+    let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
+    let ns = MemoryNamespace::Personal;
+
+    let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
+    manager.create_index(ns, test_config()).await.unwrap();
+
+    // SoT 先行（模拟引擎写入契约）：先落盘 embeddings，再调用 index.add。
+    let v = embed_text("banana");
+    embeddings
+        .set(&ns.storage_key("n-banana"), &vector_to_value(&v), None)
+        .await
+        .unwrap();
+    manager.add(ns, "n-banana", &v).await.unwrap();
+    // 写入不应物化未加载索引：只有检索才重建（首次检索才重建）。
+    assert!(!manager.is_loaded(ns), "add 不应物化未加载索引");
+
+    // 被 no-op add 的条目经 SoT 懒加载重建后仍可命中。
+    let hits = manager.search(ns, &v, 5).await.unwrap();
+    assert!(manager.is_loaded(ns));
+    assert_eq!(hits[0].0, "n-banana");
+
+    // 维度不符即使索引未物化也须在写时报错（供上层及时回滚 SoT）。
+    let ns2 = MemoryNamespace::Document;
+    manager.create_index(ns2, test_config()).await.unwrap();
+    let wrong = vec![1.0f32; (DIM + 1) as usize];
+    assert!(matches!(
+        manager.add(ns2, "bad", &wrong).await,
+        Err(MemoryError::Storage(_))
+    ));
+    assert!(!manager.is_loaded(ns2), "写时维度校验失败不应物化索引");
+}
+
+// ── 7.5 隐私审计：本地数据静态加密（EncryptedKvStore 包真实 redb 表） ──
+
+#[tokio::test]
+async fn encrypted_kv_store_roundtrip_and_ciphertext_at_rest() {
+    use agent_core::memory::{EncryptedKvStore, EncryptionKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    // 同一张底层表：`raw` 直接读写（观测静态形态），`enc` 经加密装饰器。
+    let raw: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let enc = EncryptedKvStore::new(Arc::clone(&raw), EncryptionKey::from_bytes([42u8; 32]));
+
+    let secret = json!({"token": "SECRET-VALUE-XYZ", "n": 7});
+    enc.set("kv/session", &secret, None).await.unwrap();
+
+    // 经装饰器读回 = 原值。
+    assert_eq!(enc.get("kv/session").await.unwrap(), Some(secret.clone()));
+
+    // 直读底层：存的是密文信封，且序列化后不含明文。
+    let at_rest = raw.get("kv/session").await.unwrap().unwrap();
+    assert!(at_rest.get("__ains_sealed_v").is_some(), "底层应存密文信封");
+    let at_rest_str = serde_json::to_string(&at_rest).unwrap();
+    assert!(!at_rest_str.contains("SECRET-VALUE-XYZ"), "底层不得含明文");
+
+    // key 明文：前缀列举不受加密影响。
+    assert_eq!(
+        enc.list_prefix("kv/").await.unwrap(),
+        vec!["kv/session".to_string()]
+    );
+
+    // 错误密钥无法解密（而非静默返回错误明文）。
+    let wrong = EncryptedKvStore::new(Arc::clone(&raw), EncryptionKey::from_bytes([1u8; 32]));
+    assert!(wrong.get("kv/session").await.is_err());
+
+    // delete 透传生效。
+    enc.delete("kv/session").await.unwrap();
+    assert_eq!(enc.get("kv/session").await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn encrypted_kv_store_forwards_ttl() {
+    use agent_core::memory::{EncryptedKvStore, EncryptionKey};
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let raw: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let enc = EncryptedKvStore::new(raw, EncryptionKey::from_bytes([5u8; 32]));
+
+    // TTL 存于底层明文信封，过期惰性回收不需解密。
+    enc.set(
+        "kv/short",
+        &json!({"x": 1}),
+        Some(Duration::from_millis(10)),
+    )
+    .await
+    .unwrap();
+    enc.set("kv/keep", &json!({"y": 2}), Some(Duration::from_secs(3600)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(enc.get("kv/short").await.unwrap(), None);
+    assert_eq!(enc.get("kv/keep").await.unwrap(), Some(json!({"y": 2})));
+}
+
+// ── 7+.3 子代理 Swarm：KV 信箱 IPC（包真实 redb 表） ──
+
+#[tokio::test]
+async fn kv_mailbox_post_inbox_unread_mark_read() {
+    use agent_core::swarm::KvMailbox;
+
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let mbox = KvMailbox::new(kv);
+
+    // lead 向 researcher 投递两条；tester 一条（隔离）
+    let m1 = mbox
+        .post("lead", "researcher", "gather sources")
+        .await
+        .unwrap();
+    let _m2 = mbox
+        .post("lead", "researcher", "then summarize")
+        .await
+        .unwrap();
+    mbox.post("lead", "tester", "run suite").await.unwrap();
+
+    // researcher 收件箱有 2 条，按投递时间升序
+    let inbox = mbox.inbox("researcher").await.unwrap();
+    assert_eq!(inbox.len(), 2);
+    assert_eq!(inbox[0].body, "gather sources");
+    assert_eq!(inbox[1].body, "then summarize");
+    assert_eq!(inbox[0].sender, "lead");
+    // namespace 隔离：tester 不受影响
+    assert_eq!(mbox.inbox("tester").await.unwrap().len(), 1);
+
+    // 全部未读 → 标记 m1 已读 → 剩 1 未读
+    assert_eq!(mbox.unread("researcher").await.unwrap().len(), 2);
+    mbox.mark_read("researcher", &m1.id).await.unwrap();
+    let unread = mbox.unread("researcher").await.unwrap();
+    assert_eq!(unread.len(), 1);
+    assert_eq!(unread[0].body, "then summarize");
+
+    // 不存在的消息报 NotFound
+    assert!(matches!(
+        mbox.mark_read("researcher", "0000000000000-deadbeef").await,
+        Err(MemoryError::NotFound(_))
+    ));
 }
 
 // ── Fix 回归：remember 写入中途 KvStore 落盘失败回滚，不留孤儿 / 不破坏去重 ──

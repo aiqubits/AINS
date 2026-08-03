@@ -159,20 +159,33 @@ impl Tool for TodoWriteTool {
             // Native 端与 filesystem 工具共用同一路径解析（review 十二轮
             // 修复）：`~` 展开 + cwd 锚定 + 词法归一，保证权限管线求值的
             // 路径与实际写入路径一致（不把跨 cwd 路径钳回 cwd）。
-            let path = crate::tools::filesystem::resolve_path(ctx.cwd, rel_path);
-            let existing = if path.exists() {
-                let Some(raw) = crate::tools::filesystem::read_file_bounded(&path)
-                    .map_err(|error| ToolError::Execution(error.to_string()))?
-                else {
-                    return Ok(ToolResult::err(format!(
-                        "TODO file is larger than the {} byte edit limit: {}",
-                        crate::tools::filesystem::FILE_INPUT_MAX_BYTES,
-                        path.display()
-                    )));
-                };
-                String::from_utf8(raw).map_err(|error| ToolError::Execution(error.to_string()))?
-            } else {
+            use std::io::{Seek, SeekFrom, Write};
+
+            // Use the same descriptor-relative, no-symlink traversal as the
+            // file tools.  Keep this descriptor for the final write so an
+            // attacker cannot swap the TODO path between read and write.
+            let (mut file, path) = match crate::tools::filesystem::open_workspace_file_for_update(
+                ctx.cwd, rel_path, true,
+            ) {
+                Ok(opened) => opened,
+                Err(reason) => return Ok(ToolResult::err(reason.to_string())),
+            };
+            let Some(raw) = crate::tools::filesystem::read_open_file_bounded(
+                file.try_clone()
+                    .map_err(|error| ToolError::Execution(error.to_string()))?,
+            )
+            .map_err(|error| ToolError::Execution(error.to_string()))?
+            else {
+                return Ok(ToolResult::err(format!(
+                    "TODO file is larger than the {} byte edit limit: {}",
+                    crate::tools::filesystem::FILE_INPUT_MAX_BYTES,
+                    path.display()
+                )));
+            };
+            let existing = if raw.is_empty() {
                 "# TODO\n".to_string()
+            } else {
+                String::from_utf8(raw).map_err(|error| ToolError::Execution(error.to_string()))?
             };
             match apply_todo(&existing, item, checked) {
                 None => Ok(ToolResult::ok(format!(
@@ -185,7 +198,9 @@ impl Tool for TodoWriteTool {
                             "TODO document would exceed the {TODO_DOCUMENT_MAX_BYTES} byte limit"
                         )));
                     }
-                    std::fs::write(&path, updated)
+                    file.set_len(0)
+                        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+                        .and_then(|()| file.write_all(updated.as_bytes()))
                         .map_err(|error| ToolError::Execution(error.to_string()))?;
                     Ok(ToolResult::ok(format!("Updated {}", path.display())))
                 }
@@ -500,6 +515,32 @@ mod tests {
             .await
             .unwrap();
         assert!(result.output.starts_with("No change needed"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn todo_write_rejects_symlinked_path_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("TODO.md");
+        std::fs::write(&target, "# Private TODO\n").unwrap();
+        symlink(&target, dir.path().join("TODO.md")).unwrap();
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: dir.path(),
+            metadata: &mut metadata,
+        };
+
+        let result = TodoWriteTool
+            .execute(serde_json::json!({"item": "must stay local"}), &mut ctx)
+            .await
+            .unwrap();
+
+        assert!(result.is_error, "{result:?}");
+        assert!(result.output.contains("symlink"), "{}", result.output);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "# Private TODO\n");
     }
 
     #[tokio::test]

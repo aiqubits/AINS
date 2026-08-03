@@ -3,7 +3,9 @@
 //! desktop 端经 `#[path]` 引用本文件复用同一实现与测试
 //! （两端行为一致由本文件单测保障，见 AINS_PLAN Phase 6 计划 6.3）。
 
-use agent_core::kernel::{ContentBlock, ConversationMessage, Role, StreamEvent, ToolUse};
+use agent_core::kernel::{
+    ContentBlock, ConversationMessage, QUERY_INTERRUPTED_STATUS, Role, StreamEvent, ToolUse,
+};
 use serde_json::Value;
 use ui::{ChatItem, ChatRole, ChatViewState, ToolCallStatus};
 
@@ -290,6 +292,20 @@ pub fn push_user(state: &mut ChatViewState, text: &str) {
     state.busy = true;
 }
 
+/// 标记已向 Kernel 请求中断。
+///
+/// 中断确认到达前，宿主必须通过 [`can_send`] 保持输入区不可发送。这样旧
+/// 查询的 `QUERY_INTERRUPTED_STATUS` 不会在新查询已开始后错误复位其 busy 位。
+pub fn request_interrupt(state: &mut ChatViewState) {
+    state.interrupt_pending = true;
+    state.busy = false;
+}
+
+/// 当前是否可以开始新的用户查询。
+pub fn can_send(state: &ChatViewState) -> bool {
+    !state.interrupt_pending
+}
+
 /// 发送失败回退：从尾部移除最近一条文本完全匹配的 user 条目，
 /// 使可见转写与镜像/持久历史保持一致（内核从未收到该消息）。
 /// 从尾部匹配而非直接 pop：防御 push 与失败之间流事件插入新条目。
@@ -376,6 +392,8 @@ pub fn apply_stream_event(
         } => {
             state.streaming_text.clear();
             state.busy = false;
+            // Kernel 异常结束时不会再有中断确认；允许用户重新发送。
+            state.interrupt_pending = false;
             state.push_item(ChatItem::ErrorNote {
                 text: message,
                 recoverable,
@@ -383,6 +401,14 @@ pub fn apply_stream_event(
             None
         }
         StreamEvent::Status { message } => {
+            // The kernel emits this status after it has stopped the active query.
+            // Discard partial output so a later query cannot append to the
+            // interrupted response.
+            if message == QUERY_INTERRUPTED_STATUS {
+                state.streaming_text.clear();
+                state.busy = false;
+                state.interrupt_pending = false;
+            }
             state.push_item(ChatItem::StatusNote { text: message });
             None
         }
@@ -394,6 +420,11 @@ pub fn apply_stream_event(
 }
 
 /// 一轮查询自然结束（宿主检测到流暂无后续且无 Running 工具）时复位忙碌位。
+///
+/// 无工具的 `AssistantTurnComplete` 是 Kernel 已自然结束该查询的确认。若用户
+/// 恰在该确认到达 UI 前点击 Stop，`interrupt_pending` 是陈旧状态：保留它会
+/// 锁住输入框，且下一次查询可能被遗留的原子中断标志取消。因此自然结束同样
+/// 必须解除 UI 侧的中断等待；宿主同时负责清除对应的原子标志。
 pub fn settle_idle(state: &mut ChatViewState) {
     let tool_running = state.items.iter().any(|item| {
         matches!(
@@ -406,6 +437,7 @@ pub fn settle_idle(state: &mut ChatViewState) {
     });
     if !tool_running && state.streaming_text.is_empty() {
         state.busy = false;
+        state.interrupt_pending = false;
     }
 }
 
@@ -721,6 +753,7 @@ mod tests {
     #[test]
     fn status_and_compact_progress_become_notes() {
         let mut state = ChatViewState::default();
+        state.streaming_text = "partial response".into();
         apply_stream_event(
             &mut state,
             StreamEvent::Status {
@@ -735,9 +768,101 @@ mod tests {
             },
         );
         assert_eq!(state.items.len(), 2);
+        assert_eq!(state.streaming_text, "partial response");
         assert!(matches!(&state.items[0], ChatItem::StatusNote { text } if text == "retrying"));
         assert!(
             matches!(&state.items[1], ChatItem::CompactNote { phase } if phase == "microcompact")
+        );
+    }
+
+    #[test]
+    fn interruption_status_discards_partial_stream_before_next_delta() {
+        let mut state = ChatViewState::default();
+        state.busy = true;
+
+        apply_stream_event(
+            &mut state,
+            StreamEvent::AssistantTextDelta {
+                text: "partial response".into(),
+            },
+        );
+        apply_stream_event(
+            &mut state,
+            StreamEvent::Status {
+                message: QUERY_INTERRUPTED_STATUS.into(),
+            },
+        );
+
+        assert!(state.streaming_text.is_empty());
+        assert!(!state.busy);
+        assert!(matches!(
+            state.items.last(),
+            Some(ChatItem::StatusNote { text }) if text == QUERY_INTERRUPTED_STATUS
+        ));
+
+        apply_stream_event(
+            &mut state,
+            StreamEvent::AssistantTextDelta {
+                text: "new response".into(),
+            },
+        );
+        assert_eq!(state.streaming_text, "new response");
+    }
+
+    #[test]
+    fn interruption_acknowledgement_gates_next_send() {
+        let mut state = ChatViewState::default();
+        push_user(&mut state, "first query");
+
+        request_interrupt(&mut state);
+        assert!(!state.busy);
+        assert!(!can_send(&state));
+
+        // The host keeps the draft intact rather than starting a second query
+        // whose busy state could be cleared by this delayed status event.
+        apply_stream_event(
+            &mut state,
+            StreamEvent::Status {
+                message: QUERY_INTERRUPTED_STATUS.into(),
+            },
+        );
+
+        assert!(can_send(&state));
+        push_user(&mut state, "second query");
+        assert!(state.busy);
+        assert!(matches!(
+            state.items.last(),
+            Some(ChatItem::Text { role: ChatRole::User, text }) if text == "second query"
+        ));
+    }
+
+    #[test]
+    fn final_turn_acknowledges_a_stop_that_arrived_too_late() {
+        // Kernel may complete a no-tool turn immediately before the UI handles
+        // Stop. That is a natural completion, not an in-flight cancellation;
+        // leaving interrupt_pending set would disable every later send.
+        let mut state = ChatViewState::default();
+        push_user(&mut state, "first query");
+        request_interrupt(&mut state);
+
+        apply_stream_event(
+            &mut state,
+            StreamEvent::AssistantTurnComplete {
+                message: ConversationMessage {
+                    role: Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "completed".into(),
+                    }],
+                },
+                usage: Default::default(),
+            },
+        );
+        settle_idle(&mut state);
+
+        assert!(!state.busy);
+        assert!(
+            can_send(&state),
+            "a completed turn must release the composer"
         );
     }
 

@@ -11,6 +11,8 @@ pub enum MemoryError {
     Storage(String),
     #[error("serialization error: {0}")]
     Serialization(String),
+    #[error("encryption error: {0}")]
+    Encryption(String),
     #[error("vector index namespace not found: {0:?}")]
     NamespaceNotFound(MemoryNamespace),
     #[error("entry not found: {0}")]
@@ -41,6 +43,15 @@ pub enum SkillsError {
     Storage(String),
 }
 
+/// Slash Command 系统错误（AINS_PLAN 7+.1）。
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("command not found: {0}")]
+    NotFound(String),
+    #[error("invalid command format: {0}")]
+    InvalidFormat(String),
+}
+
 /// Agent Runtime 顶层错误。
 #[derive(Debug, Error)]
 pub enum AgentError {
@@ -50,6 +61,8 @@ pub enum AgentError {
     Tool(#[from] ToolError),
     #[error(transparent)]
     Skills(#[from] SkillsError),
+    #[error(transparent)]
+    Command(#[from] CommandError),
     #[error("model transport error: {0}")]
     Model(String),
     #[error("max turns exceeded")]

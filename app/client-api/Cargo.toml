@@ -13,6 +13,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+# Phase 7.5 传输加密加固：明文 HTTP 到非本地主机的安全告警（双 target）
+tracing = { workspace = true }
 # AI 传输层 SSE 流式解析（Phase 5.1，双 target）
 futures = { workspace = true }
 bytes = { workspace = true }

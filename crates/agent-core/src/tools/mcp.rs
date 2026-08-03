@@ -308,7 +308,16 @@ impl HttpTransport {
         if !status.is_success() {
             // 失败响应（如代理 401）不得改写既有会话 id
             //（review 十二轮修复）：会话头仅从成功响应采纳。
-            return Err(format!("MCP server returned HTTP {status}"));
+            // 错误消息附带响应来源（remote addr），便于诊断代理/中间层干扰。
+            // WASM 的 fetch 后端无 TCP peer 概念，恒为 unknown。
+            #[cfg(not(target_arch = "wasm32"))]
+            let remote = response
+                .remote_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|| "unknown".into());
+            #[cfg(target_arch = "wasm32")]
+            let remote = "unknown";
+            return Err(format!("MCP server returned HTTP {status} (from {remote})"));
         }
         if let Some(session_id) = response
             .headers()
@@ -1153,6 +1162,14 @@ mod tests {
     async fn http_error_response_does_not_adopt_session_id() {
         // review 十二轮修复回归：失败响应（如代理 401）携带的
         // mcp-session-id 不得覆盖/建立会话；成功响应正常采纳。
+        //
+        // 本测试曾因宿主环境注入的 HTTP 代理变量（如 `http_proxy` 指向本机
+        // 代理端口）间歇性失败：reqwest 把针对测试服务器的请求转发给代理，
+        // 代理无法代理到本地 ephemeral 端口并返回 400 Bad Request（测试
+        // 服务器从未收到连接，客户端却收到 400）。修复：测试 client 显式
+        // `no_proxy()`（本测试验证的是错误响应不采纳 session id 的语义，
+        // 与代理无关），并禁用连接复用（`pool_max_idle_per_host(0)`，请求
+        // 与连接严格一一对应）；服务器读取完整请求头（容忍分片）后再响应。
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1169,23 +1186,76 @@ mod tests {
                 success_body.len()
             ),
         ];
+
+        // 测试专用 client：禁用代理（宿主环境的 http_proxy 会把本地测试请求
+        // 劫持到代理端口返回 400）与连接复用（请求/连接一一对应）。
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(MCP_HTTP_TIMEOUT_SECS))
+            .no_proxy()
+            .pool_max_idle_per_host(0)
+            .build()
+            .unwrap();
+        // 服务器观察日志（内存，无 I/O）：诊断失败时输出服务器视角。
+        let server_log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let server_log_clone = std::sync::Arc::clone(&server_log);
         let server = tokio::spawn(async move {
-            for response in responses {
+            for (i, response) in responses.into_iter().enumerate() {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let mut buffer = [0u8; 4096];
-                let _ = socket.read(&mut buffer).await;
-                socket.write_all(response.as_bytes()).await.unwrap();
-                socket.shutdown().await.ok();
+                let mut received = 0usize;
+                loop {
+                    match socket.read(&mut buffer[received..]).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            received += n;
+                            if received == buffer.len()
+                                || buffer[..received].windows(4).any(|w| w == b"\r\n\r\n")
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+                server_log_clone.lock().unwrap().push(format!(
+                    "conn {i}: read {received} bytes: {:?}",
+                    String::from_utf8_lossy(&buffer[..received.min(60)])
+                ));
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    server_log_clone
+                        .lock()
+                        .unwrap()
+                        .push(format!("conn {i}: write failed"));
+                    break;
+                }
+                server_log_clone.lock().unwrap().push(format!(
+                    "conn {i}: wrote {:?}",
+                    &response[..40.min(response.len())]
+                ));
+                let _ = socket.shutdown().await;
             }
         });
-
-        let mut transport =
-            HttpTransport::new(format!("http://{address}/mcp"), HashMap::new()).unwrap();
+        let mut transport = HttpTransport {
+            url: format!("http://{address}/mcp"),
+            headers: HashMap::new(),
+            client,
+            session_id: None,
+            next_id: 1,
+            request_timeout: std::time::Duration::from_secs(MCP_HTTP_TIMEOUT_SECS),
+        };
         let error = transport
             .request("tools/list", json!({}))
             .await
             .unwrap_err();
-        assert!(error.contains("HTTP 401"), "{error}");
+        if !error.contains("HTTP 401") {
+            let log = server_log
+                .lock()
+                .map(|log| log.join("; "))
+                .unwrap_or_else(|_| "(log poisoned)".into());
+            panic!(
+                "expected HTTP 401 error, got: {error} | url: {} | server log: {log}",
+                transport.url
+            );
+        }
         assert_eq!(
             transport.session_id, None,
             "error response must not establish a session id"

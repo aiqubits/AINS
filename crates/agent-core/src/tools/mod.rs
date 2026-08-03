@@ -19,6 +19,8 @@ pub mod system;
 pub use runtime::ToolRuntime;
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -161,6 +163,13 @@ pub trait Tool: MaybeSendSync {
     fn exclusive_execution_key(&self, _input: &Value, _cwd: &Path) -> Option<String> {
         None
     }
+
+    /// 注入本轮查询的协作式取消标志（Phase 7.1 review 接线）：Kernel 在工具
+    /// 批分发前调用。长时工具（如 shell）应把它透传给沙箱后端的
+    /// [`crate::policy::ShellRequest::cancel`]，使 UI 中断能终止运行中的进程树；
+    /// 其余工具默认不消费（无长时操作，忽略即可）。每次分发前 Runtime 都会
+    /// 重新注入（含 None 清除），无需工具自行清理。
+    fn set_query_cancel(&self, _flag: Option<Arc<AtomicBool>>) {}
 
     async fn execute(
         &self,

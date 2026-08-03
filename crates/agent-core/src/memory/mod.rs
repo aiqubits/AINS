@@ -5,6 +5,7 @@ pub mod document;
 pub mod engine;
 pub mod extract;
 pub mod kv;
+pub mod kv_crypto;
 pub mod manage;
 pub mod memdir;
 pub mod parser;
@@ -34,6 +35,7 @@ pub use extract::{
 pub use kv::{
     KvStore, TABLE_DOCUMENTS, TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_KV, TABLE_MEMORIES, now_ms,
 };
+pub use kv_crypto::{EncryptedKvStore, EncryptionKey};
 pub use memdir::{
     ENTRY_PREFIX, INDEX_KEY, MAX_ENTRYPOINT_BYTES, MAX_ENTRYPOINT_LINES, MAX_MANIFEST_FILES,
     MEMORY_POLICY_LINES, MemdirEntry, MemdirStore, MemoryScope, MemoryType, NewMemoryEntry,

@@ -10,7 +10,7 @@ pub mod state;
 pub mod stream_events;
 
 pub use context::ContextStore;
-pub use event_loop::{AgentKernel, AgentKernelConfig};
+pub use event_loop::{AgentKernel, AgentKernelConfig, QUERY_INTERRUPTED_STATUS};
 pub use messages::{
     ContentBlock, ConversationMessage, Role, ToolUse, sanitize_conversation_messages,
 };

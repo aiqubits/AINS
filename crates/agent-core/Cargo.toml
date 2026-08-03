@@ -32,6 +32,22 @@ client-api = { workspace = true }
 # Phase 5.2 流式重试状态机的 stream! 生成器（纯 Rust，双 target）
 async-stream = "0.3"
 
+# Phase 7.5 本地数据静态加密（memory/kv_crypto.rs，EncryptedKvStore 装饰器，双 target）：
+# ChaCha20-Poly1305 AEAD（纯 Rust，wasm 兼容）。仅用 alloc 侧 encrypt/decrypt，
+# nonce/密钥随机数由 getrandom 直接生成（不依赖 aead 的 OsRng）。zeroize 是
+# chacha20poly1305 0.10 的硬依赖（库内无条件启用，无 feature 开关）：
+# `EncryptionKey` Drop 清零依赖的密钥副本 zeroize 化由库保证。
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# 口令 → 密钥派生（Argon2id，密码哈希 KDF，纯 Rust双 target）
+argon2 = { version = "0.5", default-features = false, features = ["alloc"] }
+# 密钥/中间态内存清零（Drop 时 zeroize，防密钥残留）
+zeroize = "1"
+# 加密 nonce / 随机密钥的 CSPRNG（双 target；wasm 侧启用 js 后端，见下方 target 表）
+getrandom = "0.2"
+# 正则：供 tools/filesystem.rs grep 内容检索（Native）与 personalization 偏好抽取
+# （双 target，纯 Rust wasm 兼容）。
+regex = "1"
+
 # ── 平台特定依赖：由 cfg(target_arch = "wasm32") 互斥选择（见 AINS_PLAN 附录 A）──
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -45,12 +61,28 @@ hnsw_rs = "0.3"
 pdf-extract = "0.12"
 # 供 tools/network.rs / tools/mcp.rs 使用：Native HTTP 客户端（重定向手动逐跳复检）
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-# 供 tools/filesystem.rs grep 使用：正则内容检索（对齐 grep_tool.py 纯 Python 回退路径）
-regex = "1"
 # 供 tools/filesystem.rs glob/grep 使用：尊重 .gitignore 的目录遍历（对齐 rg --files 语义）
 ignore = "0.4"
+# 供 policy/sandbox_linux.rs 使用：探测 bubblewrap（bwrap）可执行（Phase 7.1）
+which = { workspace = true }
+# Native 文件工具通过目录描述符逐段打开路径，避免检查后再按路径访问的
+# symlink TOCTOU 越界（Unix 的 openat + O_NOFOLLOW）。
+rustix = { version = "1", features = ["fs"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# 供 policy/sandbox_windows.rs 使用：Job Object 进程隔离 FFI（Phase 7.1；
+# 无 C 构建，仅链接导入库）。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# 供 memory/kv_crypto.rs 加密 nonce/密钥生成：启用 getrandom js 后端
+# （浏览器 crypto.getRandomValues），RustCrypto RNG 在 wasm 下的标准接入方式。
+getrandom = { version = "0.2", features = ["js"] }
 # 供 tools/mcp.rs 使用：浏览器 streamable-http 后端。web_fetch 在 Web 端
 # 因无法可靠校验 DNS/重定向目标而 fail-closed。
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

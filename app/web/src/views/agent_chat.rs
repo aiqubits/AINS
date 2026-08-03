@@ -4,6 +4,7 @@
 //! 三条泵协程（stream / 权限确认 / ask_user_question）→ 视图信号。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use dioxus::prelude::*;
 use futures::{SinkExt, StreamExt};
@@ -52,6 +53,8 @@ pub fn AgentChat() -> Element {
     let mut ready = use_signal(|| false);
     let mut event_tx_sig = use_signal(|| None::<futures::channel::mpsc::Sender<AgentEvent>>);
     let mut engine_sig = use_signal(|| None::<Arc<PermissionEngine>>);
+    // 中断句柄（Phase 7.1）：停止按钮置位，Kernel 消费后自行清位。
+    let mut interrupt_sig = use_signal(|| None::<Arc<AtomicBool>>);
     // 会话镜像：忠实重建 Kernel 内部对话（含合成 tool_result），快照持久化源
     let mut mirror = use_signal(|| view_model::ConversationMirror::new(Vec::new()));
     let mut pending_perm = use_signal(|| None::<PermissionPromptMsg>);
@@ -83,6 +86,7 @@ pub fn AgentChat() -> Element {
             ));
             event_tx_sig.set(Some(bridge.event_tx.clone()));
             engine_sig.set(Some(Arc::clone(&bridge.engine)));
+            interrupt_sig.set(Some(Arc::clone(&bridge.interrupt)));
             mode.set(to_view_mode(bridge.engine.mode()));
             ready.set(true);
 
@@ -97,7 +101,18 @@ pub fn AgentChat() -> Element {
             if let Some(mut perm_rx) = bridge.permission_rx.take() {
                 spawn(async move {
                     while let Some(msg) = perm_rx.next().await {
-                        pending_perm.set(Some(msg));
+                        // Stop can arrive just before a FIFO-queued prompt is
+                        // delivered.  Fail closed instead of displaying a
+                        // stale dialog that could authorize a cancelled query.
+                        if interrupt_sig
+                            .read()
+                            .as_ref()
+                            .is_some_and(|flag| flag.load(Ordering::Acquire))
+                        {
+                            let _ = msg.respond.send(PermissionChoice::Deny);
+                        } else {
+                            pending_perm.set(Some(msg));
+                        }
                     }
                 });
             }
@@ -173,12 +188,27 @@ pub fn AgentChat() -> Element {
                             }
                             _ => {}
                         }
-                        {
+                        // A Stop click can race a no-tool terminal response:
+                        // the Kernel may already be Idle, so it will not
+                        // consume the flag or emit QUERY_INTERRUPTED_STATUS.
+                        // In that case the terminal turn is the authoritative
+                        // acknowledgement; clear both UI and Kernel flags so
+                        // the next user message is not falsely interrupted.
+                        // A terminal Error event ends the query just the same:
+                        // keeping the Kernel flag would leave the next message
+                        // immediately interrupted (review 修复).
+                        let clear_stale_interrupt = {
                             let mut state = chat.write();
+                            let had_pending_interrupt = state.interrupt_pending
+                                && (final_turn || matches!(event, StreamEvent::Error { .. }));
                             view_model::apply_stream_event(&mut state, event);
                             if final_turn {
                                 view_model::settle_idle(&mut state);
                             }
+                            had_pending_interrupt
+                        };
+                        if clear_stale_interrupt && let Some(flag) = interrupt_sig.read().as_ref() {
+                            flag.store(false, Ordering::SeqCst);
                         }
                         if persist {
                             // 先 clone 快照再 await，不跨 await 持有 Signal 读写守卫
@@ -223,7 +253,10 @@ pub fn AgentChat() -> Element {
                     }
                     // 流关闭（Kernel 退出/异常终止且无末尾 Error 事件）：
                     // 复位忙碌位与状态指示器，避免永久 Thinking 脉冲。
-                    chat.write().busy = false;
+                    let mut state = chat.write();
+                    state.busy = false;
+                    state.interrupt_pending = false;
+                    drop(state);
                     if agent_status() != AgentStatusView::Error {
                         agent_status.set(AgentStatusView::Idle);
                     }
@@ -240,6 +273,11 @@ pub fn AgentChat() -> Element {
     };
 
     let on_send = move |text: String| {
+        // Stop 的确认尚未到达时保留输入草稿而不发送。旧查询的中断状态
+        // 在此时到达会清空 busy；若先开始新查询，UI 会错误显示为 idle。
+        if !view_model::can_send(&chat.read()) {
+            return false;
+        }
         // 未完成初始化时给出提示而非静默丢失输入（初始化含
         // IndexedDB/redb 打开 + 会话恢复，可能耗时或失败）。
         let Some(tx) = event_tx_sig.read().clone() else {
@@ -248,7 +286,7 @@ pub fn AgentChat() -> Element {
                 .clone()
                 .unwrap_or_else(|| t.agent_initializing.to_string());
             push_notice(hint, NoticeKind::Warning);
-            return;
+            return false;
         };
         // Slash 命令（6.12）：/skill <name> 加载技能全文并作为指令发送；
         // /help 展示命令列表；其余按普通文本发送。
@@ -259,7 +297,7 @@ pub fn AgentChat() -> Element {
             let name = rest.trim().to_string();
             if name.is_empty() {
                 push_notice(t.chat_slash_skill.to_string(), NoticeKind::Warning);
-                return;
+                return false;
             }
             let mut tx = tx;
             spawn(async move {
@@ -303,7 +341,7 @@ pub fn AgentChat() -> Element {
                     Err(err) => push_notice(err, NoticeKind::Warning),
                 }
             });
-            return;
+            return true;
         }
         if text.trim() == "/help" {
             push_notice(
@@ -313,7 +351,7 @@ pub fn AgentChat() -> Element {
                 ),
                 NoticeKind::Info,
             );
-            return;
+            return true;
         }
         view_model::push_user(&mut chat.write(), &text);
         agent_status.set(AgentStatusView::Thinking);
@@ -338,13 +376,29 @@ pub fn AgentChat() -> Element {
                 push_notice(t.agent_send_failed.to_string(), NoticeKind::Warning);
             }
         });
+        true
     };
 
-    // Kernel 暂无查询中断 API（对齐清单偏差记录）：仅复位 UI 忙碌位与
-    // 状态指示器（否则头部持续显示进行态脉冲），后续流事件到达时仍会
-    // 正常渲染并重新派生状态。
+    // 真实中断（Phase 7.1）：置位中断标志（Kernel 在模型 turn / 工具批
+    // 边界协作式检查，中止本次查询回 Idle）；同时立即复位 UI 忙碌
+    // 位与状态指示器（不等待流关闭）。
     let on_interrupt = move |_| {
-        chat.write().busy = false;
+        if let Some(flag) = interrupt_sig.read().as_ref() {
+            flag.store(true, Ordering::SeqCst);
+        }
+        // Explicitly deny the dialog currently shown to the user.  This wakes
+        // the Kernel immediately; queued dialogs are denied by the bridge
+        // pump once they arrive while the cancellation flag remains set.
+        if let Some(msg) = pending_perm.write().take() {
+            let _ = msg.respond.send(PermissionChoice::Deny);
+        }
+        // ask_user_question 弹窗同样立即关闭（空答复 = 工具侧按空处理）：
+        // 工具批运行期间 Kernel 不检查中断，若不否认，中断须等用户关闭
+        // 提问弹窗后才生效（review 修复 S4）。
+        if let Some(msg) = pending_question.write().take() {
+            let _ = msg.respond.send(String::new());
+        }
+        view_model::request_interrupt(&mut chat.write());
         agent_status.set(AgentStatusView::Idle);
     };
 
@@ -400,6 +454,7 @@ pub fn AgentChat() -> Element {
             }
             ChatInput {
                 busy: chat.read().busy && ready(),
+                disabled: chat.read().interrupt_pending || !ready(),
                 on_send,
                 on_interrupt,
                 slash_commands: vec![

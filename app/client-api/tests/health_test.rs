@@ -1,5 +1,7 @@
 //! 健康检查模块集成测试
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, ResponseTemplate};
 

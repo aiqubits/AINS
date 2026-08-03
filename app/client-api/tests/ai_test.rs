@@ -1,6 +1,8 @@
 //! AI 传输层集成测试（Phase 5.1）：`POST /api/ai/response` 统一 envelope、
 //! 直连能力（embedding/stt/tts）、SSE 流式与失败信封映射。
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures::StreamExt;

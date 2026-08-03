@@ -4,6 +4,8 @@ use reqwest::Method;
 use serde::{Serialize, de::DeserializeOwned};
 
 use crate::config::ClientConfig;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::config::validate_redirect_transport_url;
 use crate::error::ClientError;
 use crate::types::*;
 
@@ -67,6 +69,7 @@ impl Client {
 
                 let mut builder = reqwest::Client::builder()
                     .timeout(Duration::from_secs(config.timeout_secs))
+                    .redirect(transport_redirect_policy(config.allow_insecure_http))
                     .cookie_store(true);
                 if no_proxy {
                     builder = builder.no_proxy();
@@ -982,6 +985,31 @@ impl Client {
             Err(ClientError::from_status(status_code, message))
         }
     }
+}
+
+/// Native redirect policy: every hop must obey the configured transport policy
+/// and cannot pivot from a remote endpoint into local services. Browser fetch
+/// (WASM) owns redirect handling and does not expose reqwest's redirect policy
+/// hook; the initial URL is still validated by [`ClientConfig::validate`].
+#[cfg(not(target_arch = "wasm32"))]
+fn transport_redirect_policy(allow_insecure_http: bool) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        if attempt.previous().len() > 10 {
+            return attempt.error("too many redirects");
+        }
+        let Some(previous) = attempt.previous().last() else {
+            return attempt.error("redirect chain has no source URL");
+        };
+        if let Err(error) =
+            validate_redirect_transport_url(previous, attempt.url(), allow_insecure_http)
+        {
+            return attempt.error(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                error.to_string(),
+            ));
+        }
+        attempt.follow()
+    })
 }
 
 #[cfg(test)]

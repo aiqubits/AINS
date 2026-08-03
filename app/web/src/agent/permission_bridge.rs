@@ -12,6 +12,7 @@
 //! desktop 端经 `#[path]` 引用本文件复用同一实现与测试。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::channel::{mpsc, oneshot};
 use futures::lock::Mutex;
@@ -56,9 +57,22 @@ impl UiPermissionPrompt {
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 impl PermissionPrompt for UiPermissionPrompt {
-    async fn confirm(&self, request: &PermissionRequest) -> PermissionReply {
+    async fn confirm(
+        &self,
+        request: &PermissionRequest,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> PermissionReply {
         // 串行化：上一个弹窗未答复前不投递下一个
         let _guard = self.serial.lock().await;
+        // A cancelled query may have been waiting behind another permission
+        // dialog.  Do not enqueue a stale second dialog after the first one
+        // is dismissed; ToolRuntime also re-checks this flag before execution.
+        if cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return PermissionReply::Deny;
+        }
         let (respond, reply_rx) = oneshot::channel();
         let msg = PermissionPromptMsg {
             view: to_view(request),
@@ -204,7 +218,7 @@ mod tests {
                     let msg = rx.next().await.expect("prompt message");
                     msg.respond.send(choice).unwrap();
                 });
-                let reply = prompt.confirm(&request()).await;
+                let reply = prompt.confirm(&request(), None).await;
                 assert_eq!(reply, expected);
                 ui.await.unwrap();
             }
@@ -217,7 +231,10 @@ mod tests {
                 let msg = rx.next().await.expect("prompt message");
                 drop(msg.respond); // UI 弹窗被销毁而未答复
             });
-            assert_eq!(prompt.confirm(&request()).await, PermissionReply::Deny);
+            assert_eq!(
+                prompt.confirm(&request(), None).await,
+                PermissionReply::Deny
+            );
             ui.await.unwrap();
         }
 
@@ -225,7 +242,10 @@ mod tests {
         async fn closed_channel_is_deny_fail_closed() {
             let (prompt, rx) = UiPermissionPrompt::channel();
             drop(rx); // UI 协程已退出
-            assert_eq!(prompt.confirm(&request()).await, PermissionReply::Deny);
+            assert_eq!(
+                prompt.confirm(&request(), None).await,
+                PermissionReply::Deny
+            );
         }
 
         #[tokio::test]
@@ -233,8 +253,8 @@ mod tests {
             let (prompt, mut rx) = UiPermissionPrompt::channel();
             let p1 = Arc::clone(&prompt);
             let p2 = Arc::clone(&prompt);
-            let t1 = tokio::spawn(async move { p1.confirm(&request()).await });
-            let t2 = tokio::spawn(async move { p2.confirm(&request()).await });
+            let t1 = tokio::spawn(async move { p1.confirm(&request(), None).await });
+            let t2 = tokio::spawn(async move { p2.confirm(&request(), None).await });
 
             // 第一个弹窗未答复前，第二个请求不得出现在 channel 中
             let first = rx.next().await.expect("first prompt");
@@ -250,6 +270,21 @@ mod tests {
             let replies = [t1.await.unwrap(), t2.await.unwrap()];
             assert!(replies.contains(&PermissionReply::Allow));
             assert!(replies.contains(&PermissionReply::Deny));
+        }
+
+        #[tokio::test]
+        async fn cancelled_prompt_is_denied_without_reaching_the_ui() {
+            let (prompt, mut rx) = UiPermissionPrompt::channel();
+            let cancel = Arc::new(AtomicBool::new(true));
+
+            assert_eq!(
+                prompt.confirm(&request(), Some(cancel)).await,
+                PermissionReply::Deny
+            );
+            assert!(
+                futures::FutureExt::now_or_never(rx.next()).is_none(),
+                "a cancelled query must not enqueue a stale permission dialog"
+            );
         }
 
         #[tokio::test]

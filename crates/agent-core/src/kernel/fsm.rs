@@ -12,14 +12,15 @@ use crate::kernel::state::StateKind;
 ///
 /// 终态（Completed / Failed）无出边；`Compacting → Querying` 为压缩成功
 /// 主出边（Phase 5.5 已落地），`Compacting → Idle` 为 PreCompact hook 阻断
-/// 或未发生压缩时的回退出口。
+/// 或未发生压缩时的回退出口。`ExecutingTools → Idle` 为用户中断出边
+/// （Phase 7.1：工具批边界检测到 Interrupt 时中止查询回 Idle）。
 pub fn is_valid_transition(from: StateKind, to: StateKind) -> bool {
     use StateKind::*;
     match from {
         Idle => matches!(to, Observing | Waiting | Completed),
         Observing => matches!(to, Querying | Idle | Completed),
         Querying => matches!(to, Idle | ExecutingTools | Compacting | Failed),
-        ExecutingTools => matches!(to, Querying | Failed),
+        ExecutingTools => matches!(to, Querying | Idle | Failed),
         Compacting => matches!(to, Querying | Idle | Failed),
         Waiting => matches!(to, Idle),
         Completed | Failed => false,
@@ -55,6 +56,8 @@ mod tests {
             (Compacting, Querying),
             (ExecutingTools, Failed),
             (Querying, Failed),
+            // 用户中断出边（Phase 7.1）
+            (ExecutingTools, Idle),
         ] {
             assert!(is_valid_transition(from, to), "{from:?} -> {to:?}");
         }
@@ -83,7 +86,6 @@ mod tests {
             (Idle, Querying),
             (Idle, ExecutingTools),
             (Waiting, Observing),
-            (ExecutingTools, Idle),
             (Observing, ExecutingTools),
         ] {
             assert!(!is_valid_transition(from, to), "{from:?} -> {to:?}");

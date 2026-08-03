@@ -2,6 +2,8 @@
 //!
 //! 测试 CRUD 操作：list / create / get / update / delete
 
+#![cfg(not(target_arch = "wasm32"))]
+
 use wiremock::matchers::{body_json, method, path, query_param};
 use wiremock::{Mock, ResponseTemplate};
 
