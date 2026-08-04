@@ -96,7 +96,9 @@ cd app/web && dx serve --package web --platform web --hot-reload true
 
 ### 一键脚本
 
-将以上步骤合并为 `start-dev.sh`，内容见 Docker Compose 章节的脚本模式。
+如需一键启动本地环境，可将上方命令合并为 `start-dev.sh`；更简单的全栈启动方式见
+[Docker Compose 部署](#docker-compose-部署)——`docker compose up -d` 一条命令拉起
+postgres / redis / ains-server / ains-web。
 
 ---
 

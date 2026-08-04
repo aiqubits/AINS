@@ -53,30 +53,37 @@ cargo run --package ains-server \
 
 ### Handler 签名
 
-所有 handler 使用统一的、框架无关的签名：
+所有 handler 使用统一的、框架无关的签名。`crate::ServerRequest` 是
+`ains_axum::UnifiedRequest` / `ains_salvo::UnifiedRequest` 的类型别名（由 feature
+决定），二者均实现 `ains_runtime::RequestContext` trait：
 
 ```rust
-use ains_runtime::types::{UnifiedRequest, Response, HttpError};
+use ains_runtime::{HttpError, Response};
+use crate::ServerRequest;
 
-async fn my_handler(req: UnifiedRequest) -> Result<Response, HttpError> {
-    // req.extract::<T>() 用于提取 JSON 体、查询参数等
-    // 返回 Response::json() / Response::empty()
+async fn my_handler(mut req: ServerRequest) -> Result<Response, HttpError> {
+    // req.parse_json::<T>() / req.parse_json_or_form::<T>() — 解析请求体
+    // req.parse_query::<T>()                                 — 查询参数
+    // extract_state(&req)?（等价于 req.get_data::<AppState>()）— 注入的状态
+    // 返回 Response::json(&data)? / Response::new()
 }
 ```
 
 ### Route 注册（通用模板）
 
+实际代码风格（见 [server/src/routes/auth.rs](../server/src/routes/auth.rs)）：
+`AppRouter` 是 `AppRuntime::Router` 的类型别名（Axum 或 Salvo 的 Router），
+`get` / `post` 等助手从 `routes/helpers.rs` 导入：
+
 ```rust
-use ains_runtime::Runtime;
+use crate::AppRouter;
+use crate::routes::helpers::{get, post};
+use crate::handlers::auth::{login, register};
 
-fn build_routes<R: Runtime<State = AppState>>() -> R::Router {
-    let router = R::new_router();
-
-    let auth_routes = R::new_router()
-        .route("/login", post(login_handler))
-        .route("/register", post(register_handler));
-
-    R::nest(router, "/api/public/auth", auth_routes)
+pub fn build_auth_routes() -> AppRouter {
+    AppRouter::new()
+        .route("/login", post(login))
+        .route("/register", post(register))
 }
 ```
 
@@ -99,18 +106,19 @@ fn build_routes<R: Runtime<State = AppState>>() -> R::Router {
 
 ```rust
 // 1. server/src/handlers/health.rs
-use ains_runtime::types::{UnifiedRequest, Response, HttpError};
+use ains_runtime::{HttpError, Response};
 
-pub async fn liveness(_req: UnifiedRequest) -> Result<Response, HttpError> {
-    Ok(Response::json(&serde_json::json!({"status": "alive"})))
+pub async fn liveness(_req: ServerRequest) -> Result<Response, HttpError> {
+    Response::json(&serde_json::json!({ "status": "alive" }))
 }
 
 // 2. server/src/routes/health.rs
 use crate::handlers::health::*;
-use ains_runtime::Runtime;
+use crate::AppRouter;
+use crate::routes::helpers::get;
 
-pub fn routes<R: Runtime<State = AppState>>() -> R::Router {
-    R::new_router()
+pub fn health_routes() -> AppRouter {
+    AppRouter::new()
         .route("/live", get(liveness))
 }
 ```
@@ -182,6 +190,7 @@ impl ActiveModelBehavior for ActiveModel {}
 
 | Crate | 位置 | 用途 |
 |-------|------|------|
+| `agent-core` | `crates/agent-core/` | 客户端 Agent Runtime 核心（Native + WASM） |
 | `ains-runtime` | `crates/ains-runtime/` | Runtime trait + 共享类型 |
 | `ains-axum` | `crates/ains-axum/` | Axum 运行时适配器 |
 | `ains-salvo` | `crates/ains-salvo/` | Salvo 运行时适配器 |
@@ -338,12 +347,20 @@ let (acquired, _value) = acquire_lock(
 
 ```rust
 // 1. handlers/book.rs
-use ains_runtime::types::*;
+use ains_runtime::{HttpError, RequestContext, Response};
+use serde::Deserialize;
 
-pub async fn list_books(req: UnifiedRequest) -> Result<Response, HttpError> {
-    let state = req.state::<AppState>()?;
-    let page: u64 = req.query("page").unwrap_or(1);
-    let per_page: u64 = req.query("per_page").unwrap_or(20);
+#[derive(Deserialize)]
+struct BookListQuery {
+    page: Option<u64>,
+    per_page: Option<u64>,
+}
+
+pub async fn list_books(mut req: ServerRequest) -> Result<Response, HttpError> {
+    let state: AppState = extract_state(&req)?;
+    let query: BookListQuery = req.parse_query().map_err(HttpError::bad_request)?;
+    let page = query.page.unwrap_or(1);
+    let per_page = query.per_page.unwrap_or(20);
 
     let cache_key = format!("books:list:{}:{}", page, per_page);
     let books = state.cache.get_or_insert(&cache_key, Duration::from_secs(30), || async {
@@ -354,17 +371,20 @@ pub async fn list_books(req: UnifiedRequest) -> Result<Response, HttpError> {
             .map_err(|e| e.to_string())
     }).await.map_err(|_| HttpError::internal("Failed to fetch books"))?;
 
-    Ok(Response::json(&books))
+    Ok(Response::json(&books)?)
 }
 
 // 2. routes/book.rs
-pub fn routes<R: Runtime<State = AppState>>() -> R::Router {
-    R::new_router()
+use crate::AppRouter;
+use crate::routes::helpers::get;
+
+pub fn book_routes() -> AppRouter {
+    AppRouter::new()
         .route("/books", get(list_books))
 }
 
 // 3. 在 routes/api.rs 中 nest
-// R::nest(router, "/api", book::routes::<R>());
+// R::nest(router, "/api", book_routes());
 ```
 
 ### 使用 Snowflake ID
@@ -388,11 +408,12 @@ model.insert(&state.db).await?;
 
 ## 配置体系
 
-AINS 支持三层配置来源，优先级从低到高：
+AINS 支持四层配置来源，优先级从低到高：
 
-1. **config.toml** — 静态配置文件
-2. **Kubernetes Secret / ConfigMap** — 容器环境
-3. **环境变量** — 最高优先级（前缀 `AINS_`）
+1. **代码默认值** — 内置默认配置
+2. **config.toml** — 静态配置文件
+3. **Kubernetes Secret / ConfigMap** — 容器环境
+4. **环境变量** — 最高优先级（前缀 `AINS_`）
 
 ### config.toml 结构
 
@@ -402,7 +423,7 @@ database_read_urls = []           # 可选，启用读写分离
 redis_url = "redis://..."
 jwt_secret = "..."
 jwt_expiry_seconds = 3600
-jwt_remember_me_expiry_days = 30
+jwt_remember_expiry_seconds = 2592000   # "记住我"：30 天
 cookie_secure = false
 
 [server]
@@ -421,8 +442,7 @@ circuit_break_ms = 30000
 fallback_to_write = true
 health_check_interval_secs = 15
 
-[logging]
-level = "info"
+# 日志级别由环境变量 RUST_LOG 或 CLI --log-level 控制（无 [logging] 配置段）
 ```
 
 ### 环境变量映射
@@ -463,8 +483,8 @@ cargo test --package ains-server
 # 仅客户端 API
 cargo test --package client-api
 
-# 集成测试（需要 PostgreSQL 和 Redis 运行中）
-cargo test --test integration_tests -- --test-threads=1
+# 集成测试（需要 PostgreSQL 和 Redis 运行中；含 axum_* / salvo_* 双框架套件）
+cargo test --package ains-server -- --test-threads=1
 ```
 
 ### 测试覆盖范围

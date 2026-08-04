@@ -28,7 +28,7 @@
 │  │  ┌──────────────────────────────────────────────────┐   │    │
 │  │  │  server/ (业务代码, 框架无关)                      │   │    │
 │  │  │  routes / handlers / services / middlewares       │   │    │
-│  │  │  统一签名: async fn(UnifiedRequest)->Result<..>   │   │    │
+│  │  │  统一签名: async fn(ServerRequest)->Result<..>  │   │    │
 │  │  └──────────────────────────────────────────────────┘   │    │
 │  └─────────────────────────────────────────────────────────┘    │
 ├─────────────────────────────────────────────────────────────────┤
@@ -100,8 +100,16 @@ pub type AppRuntime = AxumRuntime<AppState>;
 ### 统一 Handler 签名
 
 ```rust
-// 框架无关
-async fn my_handler(req: UnifiedRequest) -> Result<Response, HttpError>
+// 框架无关：ServerRequest 是 ains_axum::UnifiedRequest / ains_salvo::UnifiedRequest
+// 的类型别名（由 feature 决定），二者均实现 ains_runtime::RequestContext trait
+use ains_runtime::{HttpError, Response};
+use crate::ServerRequest;
+
+async fn my_handler(mut req: ServerRequest) -> Result<Response, HttpError> {
+    let payload: MyPayload = req.parse_json().await.map_err(HttpError::bad_request)?;
+    let state: AppState = extract_state(&req)?; // 等价于 req.get_data::<AppState>()
+    Ok(Response::json(&result)?)
+}
 ```
 
 ### 中间件抽象
@@ -301,103 +309,89 @@ max_body_size (10MB)                ← 最外层
 
 ```
 ains/
-├── server/                          # 后端服务
+├── server/                          # 后端服务（框架无关业务代码）
 │   ├── migrations/                  # SQL 迁移 (001_init.sql)
 │   ├── src/
-│   │   ├── bootstrap/
-│   │   │   ├── mod.rs               # 启动引导（config/DB/state/migration）
+│   │   ├── bootstrap/               # 启动引导（config/DB/state/migration）
+│   │   │   ├── mod.rs
 │   │   │   ├── axum.rs              # Axum 路由构建 + CORS 配置
 │   │   │   └── salvo.rs             # Salvo 路由构建
-│   │   ├── handlers/                # HTTP 处理程序（框架无关）
-│   │   │   ├── api.rs               # 用户 CRUD
-│   │   │   ├── auth.rs              # 认证端点
-│   │   │   ├── wechat.rs            # 微信回调
-│   │   │   └── helpers.rs           # 共享 handler 工具
-│   │   ├── middlewares/
-│   │   │   ├── auth.rs              # JWT 认证（统一 MiddlewareState）
-│   │   │   ├── panic.rs             # Panic 捕获
-│   │   │   └── mod.rs               # RateLimitGuard 定义
-│   │   ├── repositories/
-│   │   │   ├── user.rs              # 用户 Entity + ActiveModel
-│   │   │   ├── refresh_token.rs     # Refresh Token Entity
-│   │   │   └── snowflake_worker.rs  # Snowflake worker 注册表
-│   │   ├── routes/
-│   │   │   ├── api.rs               # API 路由（需认证）
-│   │   │   ├── auth.rs              # 认证路由（公开，带限流）
-│   │   │   └── helpers.rs           # 统一 routing re-export
-│   │   ├── services/
-│   │   │   ├── auth.rs              # 注册/登录/令牌刷新
-│   │   │   ├── user.rs              # 用户管理
-│   │   │   ├── cache.rs             # 统一缓存服务
-│   │   │   ├── lock.rs              # 分布式锁
-│   │   │   ├── wechat.rs            # 微信组件
-│   │   │   ├── verification.rs      # 邮箱验证
-│   │   │   └── password_reset.rs    # 密码重置
+│   │   ├── handlers/                # HTTP 处理器（框架无关）
+│   │   │   ├── auth.rs / api.rs / wechat.rs / helpers.rs
+│   │   │   ├── gateway.rs / responses.rs        # AI 网关
+│   │   │   ├── tenant.rs / plan.rs / payment_order.rs / metering.rs
+│   │   ├── middlewares/             # JWT 认证 / Panic 捕获 / RateLimitGuard
+│   │   ├── repositories/            # SeaORM 仓储层
+│   │   │   ├── user.rs / refresh_token.rs / snowflake_worker.rs
+│   │   │   ├── tenant.rs / plan.rs / user_plan.rs
+│   │   │   ├── payment_order.rs / token_usage.rs / channel.rs
+│   │   ├── routes/                  # 路由注册（api.rs 需认证 / auth.rs 公开限流）
+│   │   ├── services/                # 业务服务
+│   │   │   ├── auth.rs / user.rs / cache.rs / lock.rs / wechat.rs
+│   │   │   ├── verification.rs / password_reset.rs
+│   │   │   ├── gateway.rs / dispatch.rs / responses.rs   # AI 网关与分发
+│   │   │   ├── tenant.rs / plan.rs / payment_order.rs
+│   │   │   └── metering.rs / quota.rs
 │   │   └── utils/
-│   │       ├── config.rs            # AppConfig (TOML + 环境变量 + CLI)
-│   │       ├── error.rs             # AppError 统一错误处理
-│   │       ├── jwt.rs               # JWT 签发/验证
-│   │       ├── password.rs          # Argon2id 哈希
-│   │       ├── validator.rs         # 邮箱/密码验证
-│   │       ├── logger.rs            # Tracing 初始化
-│   │       ├── snowflake.rs         # Snowflake ID 生成器
+│   │       ├── config.rs / error.rs / jwt.rs / password.rs
+│   │       ├── validator.rs / logger.rs / snowflake.rs
 │   │       └── db_router.rs         # AutoRouter 读写分离
-│   ├── tests/
-│   │   └── integration_tests.rs
+│   ├── tests/                       # axum_* / salvo_* 双框架集成测试
 │   └── Cargo.toml
 │
 ├── app/                             # 前端多端应用
-│   ├── ui/                          # 共享 UI 组件 (Dioxus)
-│   │   ├── src/
-│   │   │   ├── app_shell.rs         # 应用外壳
-│   │   │   ├── auth_form.rs         # 认证表单
-│   │   │   ├── navbar/sidebar/hero/ # 布局组件
-│   │   │   ├── data_table.rs        # 数据表格
-│   │   │   ├── modal/toast/         # 弹窗/提示
-│   │   │   ├── code_console.rs      # 代码控制台
-│   │   │   └── global_styles.rs     # 全局样式
-│   │   └── Cargo.toml
-│   ├── web/                         # Web 端 (WASM)
-│   │   ├── src/views/               # 页面视图
-│   │   │   ├── auth.rs / dashboard.rs / users.rs
-│   │   │   ├── settings.rs / forgot_password.rs
-│   │   │   └── verify_email.rs / reset_password.rs
-│   │   ├── src/auth/                # 客户端认证 (jwt/storage/state)
-│   │   ├── src/components/          # 业务组件 (require_auth/admin)
-│   │   └── Cargo.toml
-│   ├── desktop/                     # 桌面端
-│   │   └── src/views/
+│   ├── ui/                          # 共享 UI 组件库 (Dioxus)
+│   │   └── src/ (chat_view / permission_dialog / skills_panel /
+│   │             memory_viewer / tool_panel / agent_status / ...)
+│   ├── web/                         # Web 端 (WASM，含 Agent 装配桥接)
+│   │   ├── src/views/ (auth / dashboard / users / tenants / plans /
+│   │   │            orders / metering / channels / agent_chat / skills / ...)
+│   │   ├── src/agent/ (service / view_model / permission_bridge)
+│   │   └── src/auth/ (jwt / storage / state)
+│   ├── desktop/                     # 桌面端（经 #[path] 复用 web 桥接与视图）
 │   ├── mobile/                      # 移动端
-│   │   └── src/views/
-│   └── client-api/                  # 客户端 API SDK
-│       ├── src/ (client / types / config / error)
-│       └── tests/ (auth / health / user / password_reset)
+│   └── client-api/                  # 类型化客户端 API SDK (chat/embed/stt/tts)
 │
 ├── crates/
-│   ├── ains-runtime/            # Runtime trait + 共享类型
-│   ├── ains-axum/               # Axum 适配器
-│   ├── ains-salvo/              # Salvo 适配器
+│   ├── agent-core/                  # 客户端 Agent Runtime 核心（Native + WASM）
+│   ├── ains-runtime/                # Runtime trait + 统一请求/响应/错误
+│   ├── ains-axum/                   # Axum 适配器
+│   ├── ains-salvo/                  # Salvo 适配器
 │   ├── distributed-ratelimit/       # Redis 分布式限流
 │   ├── emailserver/                 # SMTP 邮件发送
 │   ├── wechat-api/                  # 微信公众平台 SDK
 │   └── i18n/                        # 国际化 (过程宏)
 │
 ├── k8s/
-│   ├── namespace.yml                # 命名空间
-│   ├── postgres-cluster.yml         # CNP 1主2从集群
-│   ├── postgres.yml                 # 单实例 PG（开发用）
-│   ├── redis.yml                    # Redis StatefulSet
-│   ├── ains.yml                 # 应用 3 副本 Deployment
-│   ├── ains-web.yml             # 前端 Nginx
-│   ├── configmap.yml                # 配置映射
-│   ├── secret.yml.example           # 密钥示例
-│   └── ingress.yml                  # Ingress
+│   ├── namespace.yml / postgres.yml / postgres-cluster.yml (CNP 1主2从)
+│   ├── redis.yml / ains.yml (3 副本) / ains-web.yml
+│   ├── configmap.yml / secret.yml.example / ingress.yml
 │
 ├── docker-compose.yml               # Docker 全栈编排
-├── Dockerfile.server                # 服务端容器
-├── Dockerfile.web                   # 前端容器
-└── config.toml                      # 主配置文件
+├── Dockerfile.server / Dockerfile.web
+├── config.toml / config.toml.example
+└── .github/workflows/ains.yml       # CI: 双目标构建 + wasm 测试 + 安全审计
 ```
+
+---
+
+## 客户端 Agent Runtime（agent-core）
+
+`crates/agent-core` 是 AINS 的客户端 Agent Runtime 核心，**同一 crate 双目标编译**（Native 与 WASM），业务逻辑只依赖 trait 抽象，平台实现（tokio / wasm-bindgen / redb / IndexedDB）收敛在 cfg 门控文件中按 target 互斥编译。
+
+| 模块 | 职责 |
+|------|------|
+| `kernel/` | Agent Kernel：事件驱动 FSM 主循环、流式工具调用、协作式中断机制 |
+| `memory/` | 三层记忆：KV（redb / IndexedDB）、Vector（HNSW + int8 量化）、Document，含 memdir 与 LLM 提取 |
+| `tools/` | Tool Runtime：本地工具 + MCP（stdio / streamable-http），工具输出预算管理 |
+| `policy/` | 三态权限引擎 + 平台沙箱（Linux bubblewrap / macOS sandbox-exec / Windows Job Object / Mobile） |
+| `skills/` | Skills 系统：版本化存储、评分淘汰、自动回滚 |
+| `perception/` | Vision / Voice / File 感知输入通道 |
+| `context/` | 分段系统提示、会话持久化、四级上下文压缩 |
+| `hooks/` | 10 触发点 Hook 系统 |
+| `commands/` `plugins/` `swarm/` `tasks/` `personalization/` | Slash 命令 / 插件 / 子代理 / 后台任务 / 个性化扩展 |
+
+安全基线遵循 **fail-closed** 原则：沙箱不可用时拒绝执行而非降级；`EncryptedKvStore` 提供 ChaCha20-Poly1305 AEAD 本地加密。
 
 ---
 
@@ -702,6 +696,46 @@ Authorization: Bearer <token>
   "total_pages": 5
 }
 ```
+
+### AI 网关（需要认证）
+
+统一入口 `POST /api/ai/response`，按 `capability` 字段路由到不同能力（省略时服务端按输入自动检测）：
+
+| capability | 说明 | 输入 |
+|------------|------|------|
+| `chat` | 对话补全（vision 图片消息经 chat 携带） | 消息数组 |
+| `vision` | 视觉理解（同 chat 路由） | 消息数组（含图片） |
+| `embedding` | 向量化 | 文本 / 文本数组 |
+| `stt` | 语音转文字 | 音频 |
+| `tts` | 文字转语音 | 文本 |
+| `web_search` | 联网搜索 | 文本 |
+
+```http
+POST /api/ai/response
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "capability": "chat",
+  "model": "optional-model",
+  "input": "Hello",
+  "stream": true
+}
+```
+
+`stream: true` 时返回 SSE 流式响应。该接口对 `user` 角色强制校验有效套餐（`admin`/`system` 豁免），未持套餐返回 `403 no_active_plan`。
+
+### 业务管理端点（需要认证）
+
+| 资源 | 端点 |
+|------|------|
+| 租户 | `GET/POST /api/tenants` · `GET/PUT/DELETE /api/tenants/{id}` |
+| 套餐 | `GET/POST /api/plans` · `GET/PUT/DELETE /api/plans/{id}` · `GET /api/plans/available` · `POST /api/plans/{id}/purchase` |
+| 订单 | `GET/POST /api/orders` · `GET/PUT/DELETE /api/orders/{id}` · `GET /api/users/me/orders` |
+| 计量 | `GET /api/usage` · `GET /api/usage/stats` |
+| 渠道 | `GET/POST /api/channels` · `GET/PUT/DELETE /api/channels/{id}` |
+| 用户管理 | `GET/POST /api/users` · `GET/PUT/DELETE /api/users/{id}` · `GET/POST /api/users/{id}/plans` · `GET /api/users/{id}/balance` · `POST /api/users/{id}/balance/adjust` |
+| 个人中心 | `GET /api/users/me` · `PUT /api/users/me/password` · `GET /api/users/me/plans` · `POST /api/users/me/logout-all` |
 
 ### 微信登录
 
