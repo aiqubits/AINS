@@ -15,6 +15,7 @@ use serde_json::{Map, Value};
 
 use crate::hooks::{HookEvent, HookExecutor};
 use crate::kernel::messages::ToolUse;
+use crate::policy::permission_engine::sensitive_path_pattern;
 use crate::policy::{
     PermissionDecision, PermissionEngine, PermissionPrompt, PermissionReply, PermissionRequest,
 };
@@ -207,6 +208,19 @@ impl ToolRuntime {
                 &tool_use.name
             };
             let decision = if let Some(path) = file_path.as_deref()
+                // 内置敏感路径防护优先：无论工具与模式一律拒绝（对齐 evaluate
+                // 内部恒检查语义）。必须置于复合工具读象限分支之前——
+                // file_access_allowed 对敏感路径同样返回 false，若后者先判，
+                // todo_write/edit_file 的敏感路径拒绝会变成 "not readable..."
+                // 文案，与 web 契约测试断言的 "sensitive credential path" 不一致
+                // （review 修复：历史该分支先于 evaluate 拦截敏感路径）。
+                && let Some(pattern) = sensitive_path_pattern(path)
+            {
+                PermissionDecision::deny(format!(
+                    "Access denied: {path} is a sensitive credential path \
+                     (matched built-in pattern '{pattern}')"
+                ))
+            } else if let Some(path) = file_path.as_deref()
                 // edit_file 与 todo_write 都是先读旧内容再写的复合操作：
                 // 写象限之外还必须过读象限（deny_read 区域的 read-modify-write
                 // 实际发生读取；review 修复：历史 todo_write 只走写象限，
@@ -1261,6 +1275,106 @@ mod tests {
                 &tool_use(
                     "echo",
                     serde_json::json!({"path": ".ssh/id_rsa", "text": "x"}),
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("sensitive credential path"));
+    }
+
+    #[tokio::test]
+    async fn dispatch_denies_todo_write_sensitive_path_with_canonical_message() {
+        // 回归：复合工具（todo_write）访问敏感路径必须返回与 evaluate 一致的
+        // "sensitive credential path" 文案。历史实现先判读象限分支，敏感路径被
+        // file_access_allowed 拦截但文案变成 "not readable..."，与 wasm 契约
+        // 测试（web_tools.rs）断言不一致（web 端 CI 红）。
+        use crate::policy::{PermissionMode, PermissionSettings};
+        use crate::tools::interact::TodoWriteTool;
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, None);
+        runtime.register(Box::new(TodoWriteTool));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(
+                &tool_use(
+                    "todo_write",
+                    serde_json::json!({"item": "x", "path": "/home/u/.ssh/notes.md"}),
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("sensitive credential path"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn dispatch_denies_edit_file_sensitive_path_with_canonical_message() {
+        // edit_file 与 todo_write 共享复合工具读象限分支，且真实攻击面更常见
+        // （read-modify-write 会先读取旧内容），锁定其敏感路径拒绝文案防回归。
+        use crate::policy::{PermissionMode, PermissionSettings};
+        use crate::tools::filesystem::FileEditTool;
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, None);
+        runtime.register(Box::new(FileEditTool));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(
+                &tool_use(
+                    "edit_file",
+                    serde_json::json!({
+                        "path": "/home/u/.ssh/notes.md",
+                        "old_str": "a",
+                        "new_str": "b",
+                    }),
+                ),
+                &mut ctx,
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(result.output.contains("sensitive credential path"));
+        assert!(!result.output.contains("not readable"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn dispatch_denies_glob_sensitive_root_with_canonical_message() {
+        // glob/grep 的敏感 root 拒绝文案与 evaluate 统一（review 修复后走
+        // "sensitive credential path" 而非 "Recursive access denied"）。
+        // 目录根经 policy_match_paths 尾随斜杠变体命中 */.ssh/* 规则。
+        use crate::policy::{PermissionMode, PermissionSettings};
+        use crate::tools::filesystem::GlobTool;
+        let engine = crate::policy::PermissionEngine::new(
+            PermissionMode::FullAuto,
+            PermissionSettings::default(),
+        );
+        let mut runtime = ToolRuntime::new().with_permissions(engine, None);
+        runtime.register(Box::new(GlobTool));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(
+                &tool_use(
+                    "glob",
+                    serde_json::json!({"root": "/home/u/.ssh", "pattern": "*.pem"}),
                 ),
                 &mut ctx,
             )

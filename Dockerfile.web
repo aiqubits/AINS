@@ -46,11 +46,17 @@ RUN cargo binstall wasm-bindgen-cli --version 0.2.126 -y
 # Install esbuild (required by dioxus-cli for web builds; NO_DOWNLOADS=1 prevents dx from
 # downloading it automatically, so it must be pre-installed on PATH).
 # Downloaded from npm registry for reliable version pinning and binary naming.
+# SHA256 verified against the dist.integrity published by npm for the same version.
 ENV ESBUILD_VERSION=0.28.1
 RUN ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/') && \
     curl -L --proto '=https' --tlsv1.2 -sSf \
     "https://registry.npmjs.org/@esbuild/linux-${ARCH}/-/linux-${ARCH}-${ESBUILD_VERSION}.tgz" \
     -o /tmp/esbuild.tgz && \
+    case "$ARCH" in \
+      x64) echo "9ed00ab5330c94386f3273eda99a1fb0e8f37cfd6cb5270e4ad2fe3527da3546  /tmp/esbuild.tgz" | sha256sum -c - ;; \
+      arm64) echo "2145e9e686c95ee47c1181f83f272f0ff95820e52d7736fdcd9eeb106fd6456a  /tmp/esbuild.tgz" | sha256sum -c - ;; \
+      *) echo "Unsupported architecture: $ARCH"; exit 1 ;; \
+    esac && \
     tar xzf /tmp/esbuild.tgz -C /tmp && \
     mv /tmp/package/bin/esbuild /usr/local/bin/esbuild && \
     chmod +x /usr/local/bin/esbuild && \

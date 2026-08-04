@@ -6,14 +6,17 @@
 //! 中 `wasm-bindgen` crate 的版本。若二者漂移（例如依赖升级后忘记同步 Dockerfile 里
 //! 硬编码的版本号），Docker 构建会在 `dx build` 深处报错、信息晦涩。
 //!
-//! 本测试在**编译期**通过 `include_str!` 读取仓库根的 `Cargo.lock` 与 `Dockerfile.web`，
-//! 静态校验两者版本一致，并防止有人把 `NO_DOWNLOADS` 退回到无效的
-//! `WASM_BINDGEN_USE_LOCAL_OPT`。该测试跑在既有的 `cargo test --package web` CI 步骤内，
-//! 因此每个 PR 都能拦截漂移。
+//! 本测试在**编译期**通过 `include_str!` 读取仓库根的 `Cargo.lock`、`Dockerfile.web`
+//! 与 `.github/workflows/ains.yml`，静态校验三处工具链版本一致（Dockerfile 与 CI
+//! workflow 的 wasm-bindgen-cli / esbuild 均须与 Cargo.lock 对齐），并校验 CI 与
+//! Dockerfile 两侧的 esbuild SHA256 哈希一致、防止有人把 `NO_DOWNLOADS` 退回到
+//! 无效的 `WASM_BINDGEN_USE_LOCAL_OPT`。该测试跑在既有的
+//! `cargo test --package web` CI 步骤内，因此每个 PR 都能拦截漂移。
 
 // 相对本测试文件（app/web/tests/）：`../../../` 即仓库根。
 const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
 const DOCKERFILE_WEB: &str = include_str!("../../../Dockerfile.web");
+const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ains.yml");
 
 // ── esbuild 版本同步契约 ──
 //
@@ -50,11 +53,11 @@ fn cargo_lock_version(lock: &str, crate_name: &str) -> Option<String> {
     None
 }
 
-/// 从 Dockerfile 提取 `cargo binstall <pkg> --version <X>` 中的版本号 X。
-fn dockerfile_binstall_version(df: &str, pkg: &str) -> Option<String> {
+/// 从 Dockerfile / CI workflow 提取 `cargo binstall <pkg> --version <X>` 中的版本号 X。
+fn binstall_version(text: &str, pkg: &str) -> Option<String> {
     let needle = format!("{pkg} --version ");
-    let idx = df.find(&needle)?;
-    let rest = &df[idx + needle.len()..];
+    let idx = text.find(&needle)?;
+    let rest = &text[idx + needle.len()..];
     let ver: String = rest
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -74,12 +77,42 @@ fn dockerfile_env_version(df: &str, var: &str) -> Option<String> {
     (!ver.is_empty()).then_some(ver)
 }
 
+/// 从 CI workflow 提取 esbuild tarball URL（`linux-${ARCH}-<X>.tgz`）中的版本号 X。
+/// 该 URL 中的版本为字面量（非变量），漂移时直接与 Dockerfile 的 `ESBUILD_VERSION` 对齐。
+/// 版本号后紧跟 `.tgz` 后缀，须在此处截断（否则 `take_while` 会把 `.tgz` 的前导点吃掉）。
+fn workflow_esbuild_url_version(yml: &str) -> Option<String> {
+    let needle = "linux-${ARCH}-";
+    let idx = yml.find(needle)?;
+    let rest = &yml[idx + needle.len()..];
+    let end = rest.find(".tgz")?;
+    let ver = &rest[..end];
+    (!ver.is_empty()).then(|| ver.to_string())
+}
+
+/// 从 Dockerfile / CI workflow 提取指定架构分支的 esbuild SHA256 哈希。
+/// 两种文件均在 `case` 分支内以 `echo "<sha256>  /tmp/esbuild.tgz" | sha256sum -c -`
+/// 校验 tarball；`echo "` 与哈希可同行（Dockerfile）或换行（CI workflow），
+/// 因此先定位分支起始 `{arch})`，取分支体（至 `;;`）内第一个 `"` 后的 64 位十六进制串。
+fn esbuild_sha256(text: &str, arch: &str) -> Option<String> {
+    let branch = format!("{arch})");
+    let start = text.find(&branch)?;
+    let rest = &text[start + branch.len()..];
+    let end = rest.find(";;").unwrap_or(rest.len());
+    let body = &rest[..end];
+    let quote = body.find('"')?;
+    let sha: String = body[quote + 1..]
+        .chars()
+        .take_while(|c| c.is_ascii_hexdigit())
+        .collect();
+    (sha.len() == 64).then_some(sha)
+}
+
 /// Dockerfile.web 里硬编码的 wasm-bindgen-cli 版本必须与 Cargo.lock 的 wasm-bindgen 一致。
 #[test]
 fn dockerfile_wasm_bindgen_cli_matches_cargo_lock() {
     let lock_ver = cargo_lock_version(CARGO_LOCK, "wasm-bindgen")
         .expect("Cargo.lock 中应存在 wasm-bindgen 包");
-    let df_ver = dockerfile_binstall_version(DOCKERFILE_WEB, "wasm-bindgen-cli")
+    let df_ver = binstall_version(DOCKERFILE_WEB, "wasm-bindgen-cli")
         .expect("Dockerfile.web 中应通过 `cargo binstall wasm-bindgen-cli --version <X>` 固定版本");
     assert_eq!(
         df_ver, lock_ver,
@@ -135,7 +168,7 @@ fn dockerfile_esbuild_version_is_pinned() {
 /// 请重新核对其 esbuild 解析逻辑是否仍是“PATH 存在即可”，并按需同步版本。
 #[test]
 fn dockerfile_dioxus_cli_pinned_for_esbuild_contract() {
-    let df_cli = dockerfile_binstall_version(DOCKERFILE_WEB, "dioxus-cli")
+    let df_cli = binstall_version(DOCKERFILE_WEB, "dioxus-cli")
         .expect("Dockerfile.web 应通过 `cargo binstall dioxus-cli --version <X>` 固定版本");
     assert_eq!(
         df_cli, DIOXUS_CLI_VERSION,
@@ -143,6 +176,64 @@ fn dockerfile_dioxus_cli_pinned_for_esbuild_contract() {
          {DIOXUS_CLI_VERSION} 的解析契约（NO_DOWNLOADS 下 `which esbuild`、不校验版本，内部固定 \
          esbuild={DIOXUS_CLI_PINNED_ESBUILD}）验证的。升级 dioxus-cli 后请重新确认该契约仍成立。"
     );
+}
+
+/// CI workflow 硬编码的 wasm-bindgen-cli 版本必须与 Cargo.lock 一致。
+/// 审查修复：web job 的 `dx build` 同样在 NO_DOWNLOADS=1 下对
+/// `wasm-bindgen --version` 做精确匹配；Dockerfile 与 workflow 两侧版本任何
+/// 一侧漂移都会导致构建失败（Docker 构建或 CI 深处报错、信息晦涩），
+/// 本测试把 workflow 侧也纳入编译期防护。
+#[test]
+fn ci_workflow_wasm_bindgen_cli_matches_cargo_lock() {
+    let lock_ver = cargo_lock_version(CARGO_LOCK, "wasm-bindgen")
+        .expect("Cargo.lock 中应存在 wasm-bindgen 包");
+    let wf_ver = binstall_version(CI_WORKFLOW, "wasm-bindgen-cli")
+        .expect(".github/workflows/ains.yml 中应通过 `cargo binstall wasm-bindgen-cli --version <X>` 固定版本");
+    assert_eq!(
+        wf_ver, lock_ver,
+        "CI workflow 固定的 wasm-bindgen-cli 版本为 {wf_ver}，但 Cargo.lock 中 \
+         wasm-bindgen 为 {lock_ver}；NO_DOWNLOADS=1 下 dx 对 `wasm-bindgen --version` \
+         做精确匹配，版本不一致会导致 CI 的 dx build 步骤失败。请同步更新 ains.yml 的版本号。"
+    );
+}
+
+/// CI workflow 的 esbuild 版本必须与 Dockerfile.web 的 `ESBUILD_VERSION` 一致。
+/// 两条链路各自从 npm 下载 tarball 并做 SHA256 校验，版本漂移会让 CI 验证的
+/// 产物与生产镜像不一致（版本号同步由本测试约束，SHA256 同步由
+/// `ci_workflow_esbuild_sha256_matches_dockerfile` 约束）。
+#[test]
+fn ci_workflow_esbuild_version_matches_dockerfile() {
+    let df_ver = dockerfile_env_version(DOCKERFILE_WEB, "ESBUILD_VERSION")
+        .expect("Dockerfile.web 应通过 `ENV ESBUILD_VERSION=<X>` 固定 esbuild 版本");
+    let wf_ver = workflow_esbuild_url_version(CI_WORKFLOW)
+        .expect(".github/workflows/ains.yml 的 esbuild 下载 URL 应形如 `linux-${ARCH}-<X>.tgz`");
+    assert_eq!(
+        wf_ver, df_ver,
+        "CI workflow 的 esbuild 版本为 {wf_ver}，但 Dockerfile.web 为 {df_ver}；\
+         CI 与生产两条构建链路应使用同一 esbuild 版本。"
+    );
+}
+
+/// CI workflow 与 Dockerfile.web 的 esbuild SHA256 哈希必须一致。
+/// 两侧各自硬编码 x64/arm64 哈希校验 npm tarball；版本号同步由
+/// `ci_workflow_esbuild_version_matches_dockerfile` 约束，但升级 esbuild 时
+/// 若只更新一侧哈希（或改版本而漏改哈希），会造成“CI 绿、生产红”或反之，
+/// 本测试把两侧哈希也纳入编译期同步。
+#[test]
+fn ci_workflow_esbuild_sha256_matches_dockerfile() {
+    for arch in ["x64", "arm64"] {
+        let df_sha = esbuild_sha256(DOCKERFILE_WEB, arch).unwrap_or_else(|| {
+            panic!("Dockerfile.web 应包含 `{arch}) echo \"<sha256>...` 形式的 esbuild 哈希校验")
+        });
+        let wf_sha = esbuild_sha256(CI_WORKFLOW, arch).unwrap_or_else(|| {
+            panic!("ains.yml 应包含 `{arch}) echo \"<sha256>...` 形式的 esbuild 哈希校验")
+        });
+        assert_eq!(
+            df_sha, wf_sha,
+            "CI workflow 的 esbuild {arch} SHA256 为 {wf_sha}，但 Dockerfile.web 为 {df_sha}；\
+             CI 与生产两条构建链路必须使用同一 tarball 校验哈希，请同步两侧哈希。"
+        );
+    }
 }
 
 /// 校验解析辅助函数：不应把 `wasm-bindgen-futures` 误判为 `wasm-bindgen`。
@@ -172,4 +263,36 @@ fn dockerfile_env_version_parses_pinned_value() {
         Some("0.28.1")
     );
     assert_eq!(dockerfile_env_version(sample, "MISSING"), None);
+}
+
+/// 校验 workflow 中 esbuild tarball URL 的版本解析：正确取到版本号，缺失时返回 None。
+#[test]
+fn workflow_esbuild_url_version_parses_pinned_value() {
+    let sample = "https://registry.npmjs.org/@esbuild/linux-${ARCH}/-/linux-${ARCH}-0.28.1.tgz";
+    assert_eq!(
+        workflow_esbuild_url_version(sample).as_deref(),
+        Some("0.28.1")
+    );
+    assert_eq!(workflow_esbuild_url_version("no esbuild url"), None);
+}
+
+/// 校验架构分支的 esbuild SHA256 解析：正确取到各架构哈希，缺失架构返回 None。
+/// 样本哈希使用占位值——解析函数与真实哈希值无关，真实值同步由
+/// `ci_workflow_esbuild_sha256_matches_dockerfile` 约束。
+#[test]
+fn esbuild_sha256_parses_pinned_value() {
+    let sample = "case \"$ARCH\" in \
+      x64) echo \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  /tmp/esbuild.tgz\" | sha256sum -c - ;; \
+      arm64) echo \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /tmp/esbuild.tgz\" | sha256sum -c - ;; \
+      *) echo \"Unsupported architecture: $ARCH\"; exit 1 ;; \
+    esac";
+    assert_eq!(
+        esbuild_sha256(sample, "x64").as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
+    assert_eq!(
+        esbuild_sha256(sample, "arm64").as_deref(),
+        Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+    );
+    assert_eq!(esbuild_sha256(sample, "riscv64"), None);
 }

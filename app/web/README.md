@@ -24,3 +24,14 @@ You can start your web app with the following command:
 ```bash
 dx serve
 ```
+
+### Release Builds & the `wasm-release` Profile
+
+Production wasm builds run through `dx build --release --platform web`, which uses the
+`[profile.wasm-release]` defined in the [workspace Cargo.toml](../../Cargo.toml).
+
+That profile sets `panic = "abort"` to minimize wasm binary size. As a consequence,
+**panic unwinding does not work inside the wasm app**: `catch_unwind` and dioxus
+`ErrorBoundary` will never trigger. Validate input at component boundaries instead of
+relying on in-wasm panic recovery. If you ever need `ErrorBoundary`, remove
+`panic = "abort"` from `[profile.wasm-release]` first (and expect a larger binary).

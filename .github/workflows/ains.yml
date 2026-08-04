@@ -5,6 +5,9 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  # 依赖漏洞不随 push 更新：每周一 03:00 UTC 定期扫描 Cargo.lock
+  schedule:
+    - cron: "0 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,6 +17,9 @@ jobs:
   # Backend - Server CI
   # ========================================
   server:
+    # 定时触发（schedule）只跑 security-audit：重 job 验证的是代码质量，
+    # 代码未变时全量重跑是纯浪费（含 Postgres 复制集群 setup）。
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     services:
       # Primary PostgreSQL (configured for streaming replication in setup step)
@@ -163,15 +169,22 @@ jobs:
     - name: Format Check
       run: cargo fmt --check
     - name: Lint (Clippy)
-      run: cargo clippy --package ains-server -- -D warnings
+      run: cargo clippy --package ains-server --all-targets -- -D warnings
     - name: Lint (Clippy - Salvo)
-      run: cargo clippy --package ains-server --features ains-salvo -- -D warnings
-    - name: Build Server (Axum)
-      run: cargo build --package ains-server --verbose
-    - name: Build Server (Salvo)
-      run: cargo build --package ains-server --features ains-salvo --verbose
+      run: cargo clippy --package ains-server --features ains-salvo --all-targets -- -D warnings
+    # 共享 crate（server 的 path 依赖）的单测/lint 曾被 `-p ains-server` 跳过
+    # （clippy/test 只作用于指定包自身）：同 job 补齐验证（均为离线单测，
+    # 无 DB/Redis 依赖，仅复用 job 内已有的编译缓存与 services 环境）。
+    - name: Lint (Clippy - Shared Crates)
+      run: cargo clippy --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --all-targets -- -D warnings
     - name: Run Server Tests (Axum)
       run: cargo test --package ains-server --verbose
+    - name: Run Shared Crate Tests
+      run: cargo test --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --verbose
+    # wechat-api 的 store/login 测试由非默认 feature memory-store 门控
+    # （离线内存实现，已实测 47 passed），单独开启补齐覆盖
+    - name: Run WeChat API Tests (memory-store)
+      run: cargo test --package wechat-api --features memory-store --verbose
 
     - name: Run Server Tests (Salvo)
       run: >
@@ -188,6 +201,7 @@ jobs:
   # Frontend - Web CI
   # ========================================
   web:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -197,48 +211,77 @@ jobs:
     - name: Install wasm32 target
       run: rustup target add wasm32-unknown-unknown
     - name: Install cargo-binstall
-      uses: cargo-bins/cargo-binstall@main
+      uses: cargo-bins/cargo-binstall@v1.14.4
     - name: Install dioxus-cli
       run: cargo binstall dioxus-cli --version 0.7.9 -y --force
-    - name: Verify dx installation
+    # dx 离线构建工具链（NO_DOWNLOADS=1 时全部从 PATH 解析，契约见
+    # app/web/tests/dockerfile_wasm_tooling_test.rs 与 Dockerfile.web）：
+    # wasm-bindgen-cli 必须与 Cargo.lock 的 wasm-bindgen 版本精确匹配。
+    - name: Install wasm-bindgen-cli (match Cargo.lock)
+      run: cargo binstall wasm-bindgen-cli --version 0.2.126 -y --force
+    - name: Install esbuild
+      # 与 Dockerfile.web 相同的 tarball 方式（非 npm 全局安装）：免去
+      # runner 对 npm prefix 的写权限依赖，行为与生产镜像完全一致。
+      # SHA256 与 npm registry 发布的 dist.integrity 交叉验证一致（2026-08 核验）。
       run: |
-        echo "Cargo bin directory: $HOME/.cargo/bin"
-        ls -la $HOME/.cargo/bin/ | grep dx || echo "dx not found in cargo/bin"
-        which dx || echo "dx not in PATH"
-        if [ -f "$HOME/.cargo/bin/dx" ]; then
-          echo "dx found at: $HOME/.cargo/bin/dx"
-          $HOME/.cargo/bin/dx --version
-        else
-          echo "ERROR: dx binary not found, installing via cargo install as fallback"
-          cargo install dioxus-cli --version 0.7.9
-        fi
+        set -euo pipefail
+        ARCH=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
+        curl -L --proto '=https' --tlsv1.2 -sSf \
+          "https://registry.npmjs.org/@esbuild/linux-${ARCH}/-/linux-${ARCH}-0.28.1.tgz" \
+          -o /tmp/esbuild.tgz
+        case "$ARCH" in
+          x64)
+            echo "9ed00ab5330c94386f3273eda99a1fb0e8f37cfd6cb5270e4ad2fe3527da3546  /tmp/esbuild.tgz" | sha256sum -c - ;;
+          arm64)
+            echo "2145e9e686c95ee47c1181f83f272f0ff95820e52d7736fdcd9eeb106fd6456a  /tmp/esbuild.tgz" | sha256sum -c - ;;
+          *)
+            echo "Unsupported architecture: $ARCH" >&2
+            exit 1 ;;
+        esac
+        tar xzf /tmp/esbuild.tgz -C /tmp
+        sudo mv /tmp/package/bin/esbuild /usr/local/bin/esbuild
+        chmod +x /usr/local/bin/esbuild
+        rm -rf /tmp/esbuild.tgz /tmp/package
+    - name: Install wasm-opt (binaryen)
+      run: sudo apt-get update && sudo apt-get install -y binaryen
+    - name: Lint (Clippy, native)
+      run: cargo clippy --package web --all-targets -- -D warnings
+    - name: Lint (Clippy, wasm32)
+      run: cargo clippy --package web --target wasm32-unknown-unknown --all-targets -- -D warnings
     - name: Run Web Tests
       run: cargo test --package web --verbose
-    - name: Build Web
+    # 生产构建链路：与 Dockerfile.web 的 `dx build` 完全一致（NO_DOWNLOADS=1
+    # + 本地 esbuild/wasm-bindgen-cli/wasm-opt），验证发布产物契约。
+    - name: Build Web (dx, matches Dockerfile.web)
       run: |
-        export PATH="$HOME/.cargo/bin:$PATH"
-        cargo build --profile release-wasm -p web --target wasm32-unknown-unknown
+        export NO_DOWNLOADS=1
+        dx build --release --package web --platform web
+    - name: Verify dx build artifacts
+      # 空目录同样满足 -d，追加 index.html 存在性校验（与 nginx 入口一致）
+      run: |
+        test -d target/dx/web/release/web/public
+        test -f target/dx/web/release/web/public/index.html
 
   # ========================================
   # Client API Library CI
   # ========================================
   client-api:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "client-api"
-    - name: Format Check
-      run: cargo fmt --check --package client-api
+    # fmt 由 server / agent-core job 的 `cargo fmt --check`（全 workspace）覆盖
+    # （agent-core 无 services 依赖，作为 server job 容器故障时的兜底）
     - name: Lint (Clippy)
       run: cargo clippy --package client-api --all-targets -- -D warnings
     - name: Install wasm32 target
       run: rustup target add wasm32-unknown-unknown
+    # clippy 已隐含编译检查，无需单独的 wasm32 check 步骤
     - name: Check WASM (Clippy)
       run: cargo clippy --package client-api --target wasm32-unknown-unknown -- -D warnings
-    - name: Check WASM compilation
-      run: cargo check --package client-api --target wasm32-unknown-unknown
     - name: Build Client API
       run: cargo build --package client-api --verbose
     - name: Run Client API Tests
@@ -248,14 +291,17 @@ jobs:
   # Agent Core CI (wasm32 + native dual target)
   # ========================================
   agent-core:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "agent-core"
+    # fmt 兜底：server job 的 `cargo fmt --check`（全 workspace）依赖 Postgres/Redis
+    # services 启动成功；本 job 无 services 依赖，容器故障时仍能执行格式检查。
     - name: Format Check
-      run: cargo fmt --check --package agent-core
+      run: cargo fmt --check
     - name: Lint (Clippy, native)
       run: cargo clippy --package agent-core --all-targets -- -D warnings
     - name: Build & Test (native)
@@ -269,6 +315,29 @@ jobs:
     # IndexedDB 等浏览器环境测试仅在 CI 执行（AINS_PLAN Phase 0.5）
     - name: Run wasm tests (headless Chrome)
       run: wasm-pack test --headless --chrome crates/agent-core
+
+  # ========================================
+  # Desktop App CI (Phase 6.2 native agent embedding)
+  # ========================================
+  desktop:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "desktop"
+    # dioxus-desktop 依赖 GTK/WebKit 系统库（build 期 pkg-config 探测）
+    - name: Install system dependencies (dioxus desktop)
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+    - name: Lint (Clippy)
+      run: cargo clippy --package desktop --all-targets -- -D warnings
+    # desktop crate 当前无 #[test]（clippy --all-targets 已覆盖 test 目标编译），
+    # cargo build 即完成链接验证，避免 test harness 的额外开销。
+    - name: Build
+      run: cargo build --package desktop --verbose
 
   # ========================================
   # Security - dependency vulnerability audit

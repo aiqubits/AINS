@@ -87,7 +87,12 @@ strip = true           # 移除调试符号
 # 导致 panic_middleware 无法通过 tokio::spawn 捕获 panic 并返回 500。
 
 # ── WASM 前端专用 Release profile ──────────────────────
-# 使用方式: cargo build --profile release-wasm -p web --target wasm32-unknown-unknown
-[profile.release-wasm]
+# dioxus-cli 的 `dx build --release --platform web` 固定使用 profile 名
+# `wasm-release`（见 dioxus-cli build/request.rs：Cargo.toml 已定义同名
+# profile 时不再注入 adhoc 参数，仅强制 strip=false 供 wasm-opt 处理）。
+# panic=abort 减小 wasm 体积；注意：abort 会使 wasm 内 catch_unwind/
+# dioxus ErrorBoundary 失效，引入此类机制前需先撤销 panic="abort"。
+[profile.wasm-release]
 inherits = "release"
-panic = "abort"        # WASM 前端：减少 panic 展开代码
+opt-level = "s"         # 与 dx 默认对齐：体积优先
+panic = "abort"         # WASM 前端：减少 panic 展开代码
