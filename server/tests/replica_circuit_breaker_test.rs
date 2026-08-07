@@ -44,6 +44,18 @@ use ains_server::AutoRouter;
 use ains_server::utils::config::{DatabaseReadConfig, DatabaseRoutingConfig};
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
 
+// ── Concurrency guard ─────────────────────────────────────────────────
+// `pg_terminate_backend` 是数据库级全局操作（WHERE pid <> pg_backend_pid()
+// 会终止该 replica 上所有连接，无法只杀自己的连接池）。两个测试
+// （test_concurrent_reads_with_circuit_breaker 的 keep-killing 阶段与
+// test_fallback_to_write_when_replicas_down）并行执行时会互相终止对方的
+// 连接：被终止的连接在查询处理中收到 FATAL 57P01，即使 is_connection_error
+// 已识别也可能因时序落在断言窗口内。二者必须串行执行（与 web 端测试
+// SIGNAL_TEST_LOCK 同模式）。用 tokio::sync::Mutex：guard 为 Send，可跨
+// await 持有（std::sync::MutexGuard 非 Send，会触发 await_holding_lock
+// 且使测试 future 不满足 Send 约束）。
+static REPLICA_KILL_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 // ── Prerequisite checks ──────────────────────────────────────────────
 
 /// Check whether the test environment has read replicas configured.
@@ -246,6 +258,9 @@ async fn test_concurrent_reads_with_circuit_breaker() {
         eprintln!("SKIP: AINS_DATABASE_READ_URLS not set — no read replicas available");
         return;
     }
+    // pg_terminate_backend 杀的是 replica 上所有连接（全局副作用），
+    // 与同文件的 fallback 测试互踩，必须串行（见 REPLICA_KILL_LOCK 注释）。
+    let _kill_guard = REPLICA_KILL_LOCK.lock().await;
 
     // Create AutoRouter with 3 second circuit breaker (fast test).
     // fallback_to_write = false: when ALL replicas are down, queries
@@ -578,6 +593,11 @@ async fn test_cte_select_routed_to_replicas() {
     if !has_read_replicas() {
         return;
     }
+    // 查询走 replicas：kill 测试（pg_terminate_backend 杀 replica 上所有
+    // 连接）并行执行时会终止本测试的连接，即使 is_connection_error 会重试，
+    // keep-killing 窗口内两副本同时被杀时仍可能断言失败——须与 kill 测试
+    // 串行（见 REPLICA_KILL_LOCK 注释）。其余走 write DB 的测试不受影响。
+    let _kill_guard = REPLICA_KILL_LOCK.lock().await;
     let router = create_test_router(3000, false).await;
 
     // Read CTE: no table dependency, works on any PostgreSQL.
@@ -683,6 +703,10 @@ async fn test_fallback_to_write_when_replicas_down() {
     if !has_read_replicas() {
         return;
     }
+    // pg_terminate_backend 杀的是 replica 上所有连接（全局副作用），
+    // 与 circuit breaker 测试的 keep-killing 阶段互踩，必须串行
+    // （见 REPLICA_KILL_LOCK 注释）。
+    let _kill_guard = REPLICA_KILL_LOCK.lock().await;
     let urls = get_replica_urls();
     let router = create_test_router(5000, true).await; // fallback_to_write = true
     warm_up_replicas(&router, 5).await;

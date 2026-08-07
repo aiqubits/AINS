@@ -8,6 +8,13 @@ use views::{AgentChat, Blog, Home, Memory, Skills, Tools};
 mod agent;
 mod views;
 
+// 测试共享设施（仅测试构建）：web 端 views/tools.rs 与 agent/service.rs
+// 经 #[path] 复用进本 crate 后，其测试仍引用 `crate::test_shared`，故
+// 此处复用 web 端的同一实现（见 web/src/test_shared.rs 文档注释）。
+#[cfg(test)]
+#[path = "../../web/src/test_shared.rs"]
+mod test_shared;
+
 #[derive(Debug, Clone, Routable, PartialEq)]
 #[rustfmt::skip]
 enum Route {

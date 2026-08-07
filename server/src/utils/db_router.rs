@@ -348,6 +348,18 @@ impl AutoRouter {
                     last_err = Some(e);
                     continue;
                 }
+                // Hot-standby recovery conflict (40001): statement cancelled
+                // but the connection stays usable — retry another replica
+                // WITHOUT marking this one down (the replica is healthy).
+                Err(e) if is_recovery_conflict(&e) => {
+                    tracing::warn!(
+                        "Read replica {} recovery conflict, retrying another replica: {}",
+                        idx,
+                        e
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -367,6 +379,15 @@ impl AutoRouter {
                         self.mark_down(idx);
                         tracing::warn!(
                             "Read replica {} failed during retry, marked down: {}",
+                            idx,
+                            e
+                        );
+                        last_err = Some(e);
+                        continue;
+                    }
+                    Err(e) if is_recovery_conflict(&e) => {
+                        tracing::warn!(
+                            "Read replica {} recovery conflict during retry, trying next: {}",
                             idx,
                             e
                         );
@@ -638,11 +659,42 @@ fn is_connection_error(e: &DbErr) -> bool {
             "network",
             "eof",
             "transport",
+            // PostgreSQL server-side connection termination classes:
+            // 57P01 admin_shutdown / 57P02 crash_shutdown terminate the
+            // backend mid-query and report FATAL via the normal protocol
+            // (not a socket-level EOF), so they surface as DbErr::Query.
+            // 57P03 cannot_connect_now is returned during startup recovery.
+            // All three indicate the server dropped the connection — the
+            // replica must be marked down and the query retried/fallback.
+            "terminating connection",
+            "database system is starting up",
         ];
         return hints.iter().any(|h| s.contains(h));
     }
 
     false
+}
+
+/// Determine whether a `DbErr` represents a hot-standby recovery conflict
+/// (SQLSTATE 40001, message "canceling statement due to conflict with
+/// recovery").
+///
+/// During WAL replay on a standby, in-flight queries conflicting with the
+/// replayed changes are cancelled after `max_standby_streaming_delay` — the
+/// statement is aborted but the connection remains fully usable. The replica
+/// itself is healthy, so the query should be retried on another replica
+/// WITHOUT marking this one down.
+///
+/// The match is message-based ("conflict with recovery") rather than on the
+/// 40001 code: 40001 also covers business serialization failures, which never
+/// occur on the read-only standby path this function is used for.
+fn is_recovery_conflict(e: &DbErr) -> bool {
+    if matches!(e, DbErr::Query(_)) {
+        let s = e.to_string().to_ascii_lowercase();
+        s.contains("conflict with recovery")
+    } else {
+        false
+    }
 }
 
 // ---- connection helpers ----
@@ -956,6 +1008,81 @@ mod tests {
             "column \"connection_id\" does not exist".to_string(),
         ));
         assert!(!is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_admin_shutdown_57p01() {
+        // PostgreSQL 57P01: backend terminated mid-query by pg_terminate_backend
+        // or server shutdown. Reported as a FATAL PgDatabaseError, NOT a
+        // socket-level EOF — must still be treated as a connection error so
+        // the replica is marked down and the query retried/falls back.
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "Database(PgDatabaseError { severity: Fatal, code: \"57P01\", \
+             message: \"terminating connection due to administrator command\" })"
+                .to_string(),
+        ));
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_crash_shutdown_57p02() {
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "message: \"terminating connection due to crash of another server process\""
+                .to_string(),
+        ));
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_cannot_connect_now_57p03() {
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "message: \"the database system is starting up\"".to_string(),
+        ));
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_recovery_conflict_is_not_connection_error() {
+        // Regression: hot-standby recovery conflict (40001) cancels the
+        // statement but leaves the connection usable — must NOT be treated
+        // as a connection error (no mark_down), but IS retryable.
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "Database(PgDatabaseError { severity: Error, code: \"40001\", \
+             message: \"canceling statement due to conflict with recovery\" })"
+                .to_string(),
+        ));
+        assert!(!is_connection_error(&err));
+        assert!(is_recovery_conflict(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_cancel_request_57014_is_not_connection_error() {
+        // Regression: statement cancellation (57014, e.g. user cancel or
+        // statement_timeout) aborts the query but the connection stays
+        // usable — neither a connection error nor a recovery conflict.
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "canceling statement due to user request".to_string(),
+        ));
+        assert!(!is_connection_error(&err));
+        assert!(!is_recovery_conflict(&err));
+    }
+
+    #[test]
+    fn test_is_recovery_conflict_positive() {
+        // Transaction-level variant: "canceling transaction due to conflict
+        // with recovery" must also match.
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "canceling transaction due to conflict with recovery".to_string(),
+        ));
+        assert!(is_recovery_conflict(&err));
+    }
+
+    #[test]
+    fn test_is_recovery_conflict_ignores_conn_variant() {
+        // Only DbErr::Query carries query-level messages; a DbErr::Conn with
+        // a coincidental substring must not match.
+        let err = DbErr::Conn(RuntimeErr::Internal("conflict with recovery".to_string()));
+        assert!(!is_recovery_conflict(&err));
     }
 
     #[test]

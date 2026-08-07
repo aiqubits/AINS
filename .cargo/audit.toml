@@ -11,4 +11,13 @@ ignore = [
     # 上游至今无修复版本（无 fixed release）。
     # 回收条件：若未来启用 MySQL 后端，或 rsa 发布修复版，移除本条并升级。
     "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0235: rkyv 0.7.x 存档校验不足，含 Rc/Arc 的存档可致
+    # 越界读（修复需升级 >=0.8.17）。论证：rkyv 仅经 rust_decimal 的
+    # optional feature `rkyv`（dep:rkyv，version = "0.7.46"）解析进
+    # Cargo.lock；本 workspace 未启用该 feature（`cargo tree -i rkyv` 在
+    # 默认 target 与 --target all 下均无结果），不进入任何编译目标，运行时
+    # 不存在攻击面。上游 rust_decimal 正式依赖仍绑定 rkyv 0.7.x（0.8 迁移
+    # 仅见于其 dev-dependencies），当前无可用修复版本。
+    # 回收条件：rust_decimal 发布切换 rkyv 0.8 的版本并升级后移除本条。
+    "RUSTSEC-2026-0235",
 ]
