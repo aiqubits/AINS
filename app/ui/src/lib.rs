@@ -81,7 +81,12 @@ mod agent_status;
 pub use agent_status::{AgentStatus, AgentStatusView};
 
 mod tool_panel;
-pub use tool_panel::{ToolCardView, ToolCategoryView, ToolPanel};
+pub use tool_panel::{
+    PERSIST_ERROR, PERSIST_IDLE, PERSIST_PENDING, PERSIST_RUNNING, PERSIST_STATE, TOOL_PANEL_CSS,
+    TOOL_STATE_LOAD_ERROR, ToolCardView, ToolCategoryView, ToolPanel, ToolStateBanner,
+    ToolStateBannerKind, persist_on_round_done, persist_on_toggle, persist_task_in_flight,
+    should_sync_persist_error, sync_persist_error,
+};
 
 mod memory_viewer;
 pub use memory_viewer::{MemoryCard, MemoryViewer};

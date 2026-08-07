@@ -15,9 +15,10 @@ use agent_core::policy::{PermissionEngine, PermissionMode};
 use client_api::Client;
 use ui::{
     AgentStatus, AgentStatusView, ChatInput, ChatView, ChatViewState, I18nContext, Modal,
-    NoticeItem, NoticeKind, NoticeToast, PermissionChoice, PermissionDialog,
-    PermissionModeSwitcher, PermissionModeView, PlanModeIndicator, SlashCommandView, TodoItemView,
-    TodoList, parse_todo_markdown,
+    NoticeItem, NoticeKind, NoticeToast, PERSIST_ERROR, PermissionChoice, PermissionDialog,
+    PermissionModeSwitcher, PermissionModeView, PlanModeIndicator, SlashCommandView,
+    TOOL_STATE_LOAD_ERROR, TodoItemView, TodoList, ToolStateBanner, ToolStateBannerKind,
+    parse_todo_markdown,
 };
 
 use crate::agent::permission_bridge::{InteractionMsg, PermissionPromptMsg};
@@ -50,6 +51,13 @@ pub fn AgentChat() -> Element {
     let mut chat = use_signal(ChatViewState::default);
     let mut mode = use_signal(PermissionModeView::default);
     let mut init_error = use_signal(|| None::<String>);
+    // 工具状态横幅（恢复失败 + 持久化失败）不再用组件信号/装配时快照：
+    // 直接订阅 ui crate 的进程级信号 TOOL_STATE_LOAD_ERROR / PERSIST_ERROR
+    // （与 /tools 视图共享同一状态源，review Minor 1 修复）——
+    // - 恢复失败（TOOL_STATE_LOAD_ERROR）：由 /tools 挂载或本会话装配的
+    //   加载失败置位、任一加载成功清空；
+    // - 持久化失败（PERSIST_ERROR）：落盘任务失败置位、成功清空，会话
+    //   存活期间实时反映 /tools 面板或本会话内切换的落盘结果。
     let mut ready = use_signal(|| false);
     let mut event_tx_sig = use_signal(|| None::<futures::channel::mpsc::Sender<AgentEvent>>);
     let mut engine_sig = use_signal(|| None::<Arc<PermissionEngine>>);
@@ -87,6 +95,16 @@ pub fn AgentChat() -> Element {
             event_tx_sig.set(Some(bridge.event_tx.clone()));
             engine_sig.set(Some(Arc::clone(&bridge.engine)));
             interrupt_sig.set(Some(Arc::clone(&bridge.interrupt)));
+            // 上次切换未落盘的失败标记：从存储同步到进程级 PERSIST_ERROR
+            // 信号（与 /tools 挂载对称）——跨挂载/跨进程的 marker 只在视图
+            // 挂载时读取可见；会话存活期间的落盘结果由落盘任务失败/成功
+            // 直接写信号，本视图实时反映。t 为 &'static，随任务存活安全。
+            // 在途保护 + 陈旧 marker 竞态修复（review Minor 1/2）：
+            // sync_persist_error_on_mount 在途且无 marker 时跳过同步（避免
+            // 误清任务即将写入的失败信号）；无在途任务时重读存储 marker 作为
+            // 权威值再同步（避免首次读取在任务成功收敛前读到陈旧 marker 而
+            // 置位假"保存失败"横幅，任务完成路径不再写信号、无自愈手段）。
+            service::sync_persist_error_on_mount(t.tool_states_save_failed).await;
             mode.set(to_view_mode(bridge.engine.mode()));
             ready.set(true);
 
@@ -440,6 +458,10 @@ pub fn AgentChat() -> Element {
         .map(|msg| msg.question.clone());
 
     rsx! {
+        // 工具状态横幅样式（review 低风险 5）：ToolStateBanner 不再内联
+        // `<link>`，由本页面经 ui crate 导出的 asset 句柄统一加载一次
+        // tool_panel.css（与 /tools 视图一致）。
+        document::Link { rel: "stylesheet", href: ui::TOOL_PANEL_CSS }
         div { style: "display:flex;flex-direction:column;height:calc(100vh - 132px);min-height:420px;",
             // 顶部：权限模式切换 + Plan 指示器 + Agent 状态（6.5）
             div { style: "display:flex;align-items:center;gap:12px;padding:0 16px 8px;",
@@ -451,9 +473,46 @@ pub fn AgentChat() -> Element {
             }
 
             if let Some(err) = init_error.read().as_ref() {
-                div { style: "padding:16px;color:var(--color-error-text);", "{t.agent_init_failed}: {err}" }
+                div { style: "padding:16px;color:var(--color-error-text);",
+                    "{t.agent_init_failed}: {err}"
+                }
             } else if !ready() {
                 div { style: "padding:16px;color:var(--color-text-muted);", {t.agent_initializing} }
+            }
+
+            // 工具状态恢复失败横幅（与 /tools 视图对称，进程级信号
+            // TOOL_STATE_LOAD_ERROR 共享订阅）：fail-open 回退为全部工具
+            // 活跃，需显式告知用户此前停用可能未生效。本进程已有未落盘
+            // 切换时（review 中等问题 3）加载被跳过、内存清单保留，文案
+            // 需区分，避免误导用户以为停用已失效。文案依据写入信号时的
+            // 失败时刻快照，不随会话期间 dirty 变化而漂移。
+            if let Some((err, retained)) = TOOL_STATE_LOAD_ERROR.read().as_ref() {
+                div { style: "margin:0 16px 8px;",
+                    ToolStateBanner {
+                        message: format!(
+                            "{}: {err}",
+                            if *retained {
+                                t.tool_states_load_failed_local
+                            } else {
+                                t.tool_states_load_failed
+                            },
+                        ),
+                    }
+                }
+            }
+
+            // 上次切换未落盘横幅（与 /tools 视图对称，进程级信号
+            // PERSIST_ERROR 共享订阅）：落盘任务失败置位、成功清空——会话
+            // 存活期间实时反映 /tools 面板或本会话内切换的落盘结果，替代
+            // 原 AgentBridge 装配时一次性快照。Warning 变体与恢复失败
+            // （Error）区分（review Minor 1）。
+            if let Some(err) = PERSIST_ERROR.read().as_ref() {
+                div { style: "margin:0 16px 8px;",
+                    ToolStateBanner {
+                        kind: ToolStateBannerKind::Warning,
+                        message: err.clone(),
+                    }
+                }
             }
 
             ChatView { state: chat }

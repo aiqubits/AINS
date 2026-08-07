@@ -5,11 +5,10 @@
 //! 输出 inline/preview 字符预算 → post_tool_use hook。任何环节的拒绝/失败
 //! 都归一化为 `is_error` 的 ToolResult 回填，不中止 Agent Loop。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::{Map, Value};
 
@@ -25,11 +24,25 @@ use crate::tools::{Tool, ToolContext, ToolDef, ToolMetadata, ToolResult};
 /// 工具注册表 + 分发管线。权限引擎始终存在；`new()` 默认
 /// 使用 `default` 模式且无确认回调，因此写操作 fail-closed。hooks 与
 /// 外置存储仍可选注入。
+///
+/// 工具活跃状态：`disabled` 保存被用户禁用的工具名（默认空 = 全部活跃）。
+/// 禁用的工具既不进入模型上下文（[`Self::api_schemas`] 过滤），也会在
+/// 执行时被拒绝（[`Self::dispatch`] fail-closed 兜底），双保险保证
+/// 小模型即使不遵循上下文也无法触发被禁工具。
 pub struct ToolRuntime {
     /// 保持注册序（api_schemas 下发顺序确定性；同名重注册原位替换，
     /// 对齐 Python dict 覆盖语义）。
     tools: Vec<Box<dyn Tool>>,
     index: HashMap<String, usize>,
+    /// 被禁用的工具名集合（默认空 = 全部活跃）。Arc 共享：宿主装配时经
+    /// [`Self::share_disabled`] 注入同一引用，/tools 面板修改后 Kernel
+    /// 下一轮 api_schemas 即自动生效，无需跨会话通知。
+    disabled: Arc<RwLock<HashSet<String>>>,
+    /// 共享集合被修改时的通知回调（宿主注入）：ToolStateService 用它递增
+    /// dirty 版本号，使 runtime 侧直写（[`Self::set_tool_enabled`] /
+    /// [`Self::import_disabled`]）与面板侧修改统一记账，存储加载不会用
+    /// 陈旧值覆盖未落盘修改（见 [`Self::share_disabled`]）。
+    disabled_mutation_observer: Option<Arc<dyn Fn() + Send + Sync>>,
     permissions: Arc<PermissionEngine>,
     permission_prompt: Option<Arc<dyn PermissionPrompt>>,
     hooks: Option<Arc<HookExecutor>>,
@@ -39,11 +52,50 @@ pub struct ToolRuntime {
     query_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
+// 写锁内 observer 调用的重入哨兵状态（所有构建生效）：
+// [`ToolRuntime::notify_disabled_mutated`] 在 disabled 写锁内调用 observer，
+// 契约要求回调内不得访问 disabled 集合（RwLock 不可重入，回读会死锁）。
+// 哨兵在回调执行区间置位，runtime 公开入口（`set_tool_enabled` /
+// `is_tool_enabled` / `disabled_snapshot` / `import_disabled` /
+// `api_schemas`）检测到置位即 panic——把"未来误用（如 metrics 钩子回读
+// 集合）在线上静默死锁"转为立即 panic 暴露（review 建议 1：哨兵不随
+// release 构建编译掉，死锁类缺陷必须在线上一出现即崩溃提示，而非挂起）。
+// 检查成本为单次 TLS 读（纳秒级），仅在工具分发/注册表遍历路径上执行，
+// 可忽略；observer 的正确用法（无锁记账，如原子计数器递增）不受影响。
+thread_local! {
+    static IN_OBSERVER_CALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// RAII 复位哨兵：observer 正常返回或 panic 时均恢复置位前状态，避免异常
+/// 路径把哨兵永久留在置位区间。
+struct ObserverCallGuard;
+
+impl Drop for ObserverCallGuard {
+    fn drop(&mut self) {
+        IN_OBSERVER_CALL.with(|flag| flag.set(false));
+    }
+}
+
+/// 公开入口的哨兵检查：在 observer 回调区间内调用即 panic，提示违反
+/// "回调内不得访问 disabled 集合"契约（review 中等问题 2 加固）。
+fn assert_not_in_observer_call(entry: &str) {
+    IN_OBSERVER_CALL.with(|flag| {
+        assert!(
+            !flag.get(),
+            "{entry} called from within the disabled mutation observer: \
+             observer runs inside the disabled write lock and must not touch \
+             the disabled set (RwLock is not reentrant)"
+        );
+    });
+}
+
 impl Default for ToolRuntime {
     fn default() -> Self {
         Self {
             tools: Vec::new(),
             index: HashMap::new(),
+            disabled: Arc::new(RwLock::new(HashSet::new())),
+            disabled_mutation_observer: None,
             permissions: PermissionEngine::new(
                 crate::policy::PermissionMode::Default,
                 crate::policy::PermissionSettings::default(),
@@ -70,6 +122,136 @@ impl ToolRuntime {
                 self.index.insert(name, self.tools.len());
                 self.tools.push(tool);
             }
+        }
+    }
+
+    /// 设置工具活跃状态：`enabled=false` 时该工具不再进入模型上下文
+    /// （[`Self::api_schemas`] 过滤）且执行被拒（[`Self::dispatch`]）。
+    /// 默认所有工具活跃。仅在状态实际变化时通知共享集合的变更回调
+    /// （宿主注入的 dirty 记账）。
+    ///
+    /// 单一事实源契约（review Nit）：宿主生产装配路径经
+    /// [`Self::share_disabled`] 注入共享源后，状态读写统一由宿主层
+    /// `ToolStateService`（`set_enabled` / `apply_from_store`）管理，本
+    /// 方法不进入生产读写路径，保留用于框架独立使用与单元测试（observer
+    /// 记账契约验证）。记账语义（仅在集合实际变化时通知）必须与
+    /// `ToolStateService::set_enabled` 保持一致——修改其一须同步另一。
+    pub fn set_tool_enabled(&self, name: &str, enabled: bool) {
+        // 变更与 observer 记账在同一写锁临界区内（review 中等问题 2 修复）：
+        // 消除"集合已变、dirty 未递增"的 check-then-act 窗口——并发加载
+        // 持写锁检查版本号时，要么看到变更前的集合、要么看到已记账的版本
+        // 号，不存在中间态。observer 仅做无锁记账（如原子 fetch_add），不得
+        // 访问 disabled 集合（RwLock 不可重入，锁内回读会死锁）；重入哨兵
+        // 把误用转为立即 panic（见 [`assert_not_in_observer_call`]）。
+        assert_not_in_observer_call("set_tool_enabled");
+        let mut guard = self.disabled.write().expect("tool disabled lock poisoned");
+        let changed = if enabled {
+            guard.remove(name)
+        } else {
+            guard.insert(name.to_string())
+        };
+        if changed {
+            self.notify_disabled_mutated();
+        }
+    }
+
+    /// 查询工具活跃状态（缺省 true）。
+    pub fn is_tool_enabled(&self, name: &str) -> bool {
+        assert_not_in_observer_call("is_tool_enabled");
+        !self
+            .disabled
+            .read()
+            .expect("tool disabled lock poisoned")
+            .contains(name)
+    }
+
+    /// 共享禁用集合引用：宿主（/tools 面板）与 Kernel 的 ToolRuntime 经同一
+    /// Arc 读写，面板变更在 Kernel 下一轮 api_schemas 自动生效。取回对称
+    /// API（与 [`Self::share_disabled`] 对应）：生产装配经宿主层
+    /// `ToolStateService::shared()` 注入，本方法保留用于框架独立使用/测试。
+    pub fn disabled_source(&self) -> Arc<RwLock<HashSet<String>>> {
+        Arc::clone(&self.disabled)
+    }
+
+    /// 以外部共享源替换内部禁用集合，并注入集合被修改时的通知回调：
+    /// 宿主装配时传入 ToolStateService 的 dirty 递增回调（`Some`），使
+    /// runtime 侧直写（[`Self::set_tool_enabled`]/[`Self::import_disabled`]）
+    /// 与面板侧修改统一记账——存储加载（`apply_from_store`）不会因版本号
+    /// 未递增而用陈旧值覆盖这些修改。无持久化记账语义的场景（如集成测试
+    /// 仅验证共享源翻转）传 `None`。
+    ///
+    /// 回调契约（review 中等问题 2 修复）：observer 在 `disabled` 写锁**内**
+    /// 调用——把记账移入临界区，消除"集合已变、dirty 未递增"的
+    /// check-then-act 窗口（并发加载持写锁检查版本号时无中间态可观察）。
+    /// 代价是回调内**不得访问 disabled 集合**：`RwLock` 不可重入，持锁
+    /// 路径上回读会直接死锁；仅允许执行无锁记账（如原子计数器递增）。
+    pub fn share_disabled(
+        &mut self,
+        source: Arc<RwLock<HashSet<String>>>,
+        mutation_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.disabled = source;
+        self.disabled_mutation_observer = mutation_observer;
+    }
+
+    /// 当前禁用集合快照（持久化用；框架独立使用 / 测试）。宿主生产路径的
+    /// 持久化读经 `ToolStateService::disabled_snapshot`（同一共享源，语义
+    /// 一致），本方法不进入生产读写路径（review Nit 单一事实源契约）。
+    pub fn disabled_snapshot(&self) -> Vec<String> {
+        assert_not_in_observer_call("disabled_snapshot");
+        let guard = self.disabled.read().expect("tool disabled lock poisoned");
+        let mut names: Vec<String> = guard.iter().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// 批量导入禁用集合（框架独立使用 / 测试）。集合实际内容变化时才
+    /// 通知共享集合的变更回调（避免无意义的 dirty 递增）。
+    ///
+    /// 语义边界（review Nit）：本方法**无条件替换**集合并记账，不检查
+    /// 宿主层的未落盘修改版本号——存储恢复路径必须走宿主层
+    /// `ToolStateService::apply_from_store`（本地存在未落盘切换时跳过
+    /// 陈旧值，fail-closed 保护），误用本方法恢复存储会覆盖用户刚做的
+    /// 切换（破坏 fail-closed 语义）。
+    pub fn import_disabled<I: IntoIterator<Item = String>>(&self, names: I) {
+        // 同 [`Self::set_tool_enabled`]：observer 记账在写锁内完成（见
+        // [`Self::share_disabled`] 的回调契约），重入哨兵同样生效。
+        assert_not_in_observer_call("import_disabled");
+        let mut guard = self.disabled.write().expect("tool disabled lock poisoned");
+        // 集合相等判断（而非长度+包含）：重复输入（如 ["a","a"]）不应
+        // 误报"已变化"而触发无意义的 dirty 记账（误判方向 fail-safe，但
+        // 语义不严谨）。
+        let incoming: HashSet<String> = names.into_iter().collect();
+        let changed =
+            incoming.len() != guard.len() || incoming.iter().any(|name| !guard.contains(name));
+        guard.clear();
+        guard.extend(incoming);
+        if changed {
+            self.notify_disabled_mutated();
+        }
+    }
+
+    /// 通知共享集合被修改（宿主注入的 dirty 记账回调）。调用点在写锁**内**
+    ///（见 [`Self::share_disabled`] 的回调契约）：observer 不得访问 disabled
+    /// 集合（RwLock 不可重入），仅做无锁记账。回调执行期间重入哨兵置位，
+    /// runtime 公开入口检测到即 panic——未来误用立即暴露而非线上死锁
+    /// （review 中等问题 2 加固 + review 建议 1 全构建生效）。
+    ///
+    /// panic 隔离（review 建议 1 加固）：observer 在写锁内执行，若其 panic
+    /// 穿过写锁 guard，RwLock 被 poison——之后所有工具入口
+    /// （`is_tool_enabled` / `api_schemas` / `dispatch`）的 `.expect(...)`
+    /// 都会 panic，整个工具系统永久瘫痪（含 Kernel 的 dispatch，中止
+    /// agent loop）。用 `catch_unwind` 在写锁内拦截 observer panic：guard
+    /// 正常 drop 不 poison，调用方（`set_tool_enabled` / `import_disabled`）
+    /// 不感知异常。代价是本次记账可能缺失（dirty 未递增）——宿主的记账
+    /// observer 自身不应 panic，此处仅防止宿主缺陷瘫痪工具系统，panic
+    /// 语义降级为“该次变更未记账”，由存储加载的 dirty 保护兜底（宁缺
+    /// 记账不瘫痪）。
+    fn notify_disabled_mutated(&self) {
+        if let Some(observer) = &self.disabled_mutation_observer {
+            IN_OBSERVER_CALL.with(|flag| flag.set(true));
+            let _guard = ObserverCallGuard;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer()));
         }
     }
 
@@ -146,21 +328,68 @@ impl ToolRuntime {
     }
 
     /// 全部工具的 API schema（对齐 `ToolRegistry.to_api_schema`）。
+    /// 过滤被禁用的工具（非活跃工具不进入模型上下文）。
     pub fn api_schemas(&self) -> Vec<ToolDef> {
+        assert_not_in_observer_call("api_schemas");
+        // 先取禁用集合快照再遍历：`tool.definition()` 可能执行工具注册方
+        // 代码，持读锁期间调用存在潜在死锁面（RwLock 非重入），以快照
+        // 缩短持锁区间。
+        let disabled: HashSet<String> = self
+            .disabled
+            .read()
+            .expect("tool disabled lock poisoned")
+            .clone();
+        self.tools
+            .iter()
+            .filter_map(|tool| {
+                let definition = tool.definition();
+                (!disabled.contains(&definition.name)).then_some(definition)
+            })
+            .collect()
+    }
+
+    /// 全部工具的 schema（不经过禁用过滤，保持注册序）——快照/面板展示用：
+    /// 需包含已禁用的工具（面板卡片是重新启用的唯一入口），且不依赖"新建
+    /// runtime 禁用集合为空"的隐式前提（`api_schemas` 过滤被禁工具；若快照
+    /// 路径未来注入共享禁用源，已禁用工具会从面板消失且无法重新启用）。语义
+    /// 与 [`Self::registered_names`] 一致（注册表全量视角），对比模型上下文
+    /// 视角的 [`Self::api_schemas`]。
+    pub fn all_schemas(&self) -> Vec<ToolDef> {
         self.tools.iter().map(|tool| tool.definition()).collect()
+    }
+
+    /// 当前已注册的全部工具名（不经过禁用过滤）——宿主注册契约断言与调试
+    /// 用。`api_schemas` 过滤被禁用的工具（模型上下文视角），本方法返回原始
+    /// 注册集，语义与落盘过滤用的已知工具集（宿主 REGISTERED_TOOL_NAMES
+    /// 缓存）一致；契约断言若用带过滤的 `api_schemas` 比较，禁用集合非空时
+    /// 必然不一致而误报（见 web service.rs `register_tools`）。
+    pub fn registered_names(&self) -> HashSet<String> {
+        self.tools
+            .iter()
+            .map(|tool| tool.definition().name)
+            .collect()
     }
 
     /// 单个 tool_use 的完整分发管线。未知工具与执行异常均归一化为
     /// is_error 的 ToolResult（对齐基线合成 error tool_result 语义）。
     pub async fn dispatch(&self, tool_use: &ToolUse, ctx: &mut ToolContext<'_>) -> ToolResult {
-        // Stop may arrive while another tool in this batch is awaiting a
-        // permission reply.  Never start a later hook/prompt/tool after it;
-        // the Kernel remains responsible for consuming the flag at the batch
-        // boundary and reporting QUERY_INTERRUPTED_STATUS.
+        // 0. Stop may arrive while another tool in this batch is awaiting a
+        //    permission reply.  Never start a later hook/prompt/tool after it;
+        //    the Kernel remains responsible for consuming the flag at the batch
+        //    boundary and reporting QUERY_INTERRUPTED_STATUS.
         if self.query_is_cancelled() {
             return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
         }
-        // 1. pre_tool_use hook：任一 blocked 即拒绝执行
+        // 1. 活跃状态检查（fail-closed）：禁用的工具即使被模型输出也拒绝执行。
+        //    置于 hooks 之前，避免为已禁用的工具触发 hook 副作用。
+        if !self.is_tool_enabled(&tool_use.name) {
+            let result = ToolResult::err(format!(
+                "Tool '{}' is disabled and cannot be called",
+                tool_use.name
+            ));
+            return self.apply_output_budget(tool_use, result, ctx);
+        }
+        // 2. pre_tool_use hook：任一 blocked 即拒绝执行
         if let Some(hooks) = &self.hooks {
             let mut payload = Map::new();
             payload.insert("tool_name".into(), Value::String(tool_use.name.clone()));
@@ -181,13 +410,13 @@ impl ToolRuntime {
             }
         }
 
-        // 2. 工具解析
+        // 3. 工具解析
         let Some(tool) = self.get(&tool_use.name) else {
             let result = ToolResult::err(format!("Unknown tool: {}", tool_use.name));
             return self.apply_output_budget(tool_use, result, ctx);
         };
 
-        // 3. 三态权限：路径/命令归一化后求值（对齐 _resolve_permission_file_path）
+        // 4. 三态权限：路径/命令归一化后求值（对齐 _resolve_permission_file_path）
         {
             let engine = &self.permissions;
             let file_path = resolve_permission_file_path(&tool_use.name, ctx.cwd, &tool_use.input);
@@ -321,7 +550,7 @@ impl ToolRuntime {
             }
         }
 
-        // 4. 执行（Err 归一化为 is_error tool_result）。先注入查询级取消标志
+        // 5. 执行（Err 归一化为 is_error tool_result）。先注入查询级取消标志
         //    （含 None 清除旧值），长时工具据此响应 UI 中断。
         if self.query_is_cancelled() {
             return self.apply_output_budget(tool_use, Self::cancelled_result(), ctx);
@@ -332,10 +561,10 @@ impl ToolRuntime {
             Err(error) => ToolResult::err(format!("Tool {} failed: {error}", tool_use.name)),
         };
 
-        // 5. 输出预算：超长外置 + 内联预览
+        // 6. 输出预算：超长外置 + 内联预览
         let result = self.apply_output_budget(tool_use, result, ctx);
 
-        // 6. post_tool_use hook：观察性执行，结果不改写 tool_result（对齐基线）
+        // 7. post_tool_use hook：观察性执行，结果不改写 tool_result（对齐基线）
         if let Some(hooks) = &self.hooks {
             let mut payload = Map::new();
             payload.insert("tool_name".into(), Value::String(tool_use.name.clone()));
@@ -824,6 +1053,358 @@ mod tests {
             .map(|def| def.name)
             .collect();
         assert_eq!(names, vec!["beta", "alpha"]);
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_excluded_from_api_schemas() {
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "keep",
+            read_only: true,
+        }));
+        runtime.register(Box::new(EchoTool {
+            name: "drop",
+            read_only: true,
+        }));
+        // 默认全部活跃
+        assert!(runtime.is_tool_enabled("drop"));
+        runtime.set_tool_enabled("drop", false);
+        assert!(!runtime.is_tool_enabled("drop"));
+        let names: Vec<String> = runtime
+            .api_schemas()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["keep"],
+            "disabled tool must be filtered from model context"
+        );
+        // 重新启用恢复
+        runtime.set_tool_enabled("drop", true);
+        assert!(runtime.is_tool_enabled("drop"));
+        let names: Vec<String> = runtime
+            .api_schemas()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert_eq!(names, vec!["keep", "drop"]);
+    }
+
+    #[test]
+    fn registered_names_ignores_disabled_filter() {
+        // 契约（review Nit 1）：registered_names 返回无过滤的原始注册集——
+        // 宿主用它校验 REGISTERED_TOOL_NAMES 缓存一致性。若带禁用过滤，
+        // 断言在禁用集合非空时误报 panic，掩盖真实缓存失效（此前 web 侧
+        // 用 api_schemas 比较正是如此，见 service.rs register_tools）。
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "keep",
+            read_only: true,
+        }));
+        runtime.register(Box::new(EchoTool {
+            name: "drop",
+            read_only: true,
+        }));
+        runtime.set_tool_enabled("drop", false);
+        assert_eq!(
+            runtime.api_schemas().len(),
+            1,
+            "model context must be filtered"
+        );
+        let names = runtime.registered_names();
+        assert!(names.contains("keep"));
+        assert!(
+            names.contains("drop"),
+            "registered_names must ignore the disabled filter"
+        );
+    }
+
+    #[tokio::test]
+    async fn all_schemas_includes_disabled_tools_and_keeps_order() {
+        // 契约（review 建议 4）：all_schemas 是注册表全量视角（无禁用过滤、
+        // 保持注册序），与模型上下文视角的 api_schemas 相对——面板/快照需
+        // 展示已禁用工具（卡片是重新启用的唯一入口），且不依赖"新建 runtime
+        // 禁用集合为空"的隐式前提（若未来注入共享禁用源，api_schemas 过滤
+        // 会让已禁用工具从面板消失且无法重新启用）。
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "keep",
+            read_only: true,
+        }));
+        runtime.register(Box::new(EchoTool {
+            name: "drop",
+            read_only: true,
+        }));
+        runtime.set_tool_enabled("drop", false);
+        // 模型上下文视角：过滤被禁工具
+        assert_eq!(runtime.api_schemas().len(), 1);
+        // 注册表全量视角：包含被禁工具且保持注册序
+        let names: Vec<String> = runtime
+            .all_schemas()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec!["keep", "drop"],
+            "all_schemas must include disabled tools and keep registration order"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_tool_dispatch_is_rejected_fail_closed() {
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "blocked",
+            read_only: true,
+        }));
+        runtime.set_tool_enabled("blocked", false);
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(
+                &tool_use("blocked", serde_json::json!({"text": "echo-leak-marker"})),
+                &mut ctx,
+            )
+            .await;
+        assert!(result.is_error, "disabled tool dispatch must fail closed");
+        assert!(result.output.contains("disabled"), "{}:", result.output);
+        // 禁用工具不得触发执行：若 EchoTool 被误执行，输出会包含回显的
+        // "echo-leak-marker"，此处断言即真实拦截副作用泄露。
+        assert!(
+            !result.output.contains("echo-leak-marker"),
+            "side effect leaked: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_takes_precedence_over_disabled_check() {
+        // dispatch 管线顺序（review 建议补测）：查询级取消检查位于活跃状态
+        // 检查之前——用户按下 Stop 后，即便工具已被禁用也返回统一的
+        // "interrupted" 结果，Kernel 在批边界消费取消标志并上报
+        // QUERY_INTERRUPTED_STATUS。若顺序颠倒（禁用优先），取消语义会被
+        // 禁用结果掩盖：UI 无法区分"用户主动中断"与"工具被禁"，且取消
+        // 后的后续批内工具会继续执行（破坏 Stop 语义）。
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "blocked",
+            read_only: true,
+        }));
+        runtime.set_tool_enabled("blocked", false);
+        assert!(!runtime.is_tool_enabled("blocked"));
+        runtime.set_query_cancel(Some(Arc::new(AtomicBool::new(true))));
+        let mut metadata = ToolMetadata::new();
+        let mut ctx = ToolContext {
+            cwd: Path::new("/tmp"),
+            metadata: &mut metadata,
+        };
+        let result = runtime
+            .dispatch(&tool_use("blocked", Value::Null), &mut ctx)
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("interrupted"),
+            "cancellation must take precedence over the disabled check: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("disabled"),
+            "cancelled result must not be masked by the disabled message: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn import_disabled_and_snapshot_roundtrip() {
+        let mut runtime = ToolRuntime::new();
+        runtime.register(Box::new(EchoTool {
+            name: "a",
+            read_only: true,
+        }));
+        runtime.register(Box::new(EchoTool {
+            name: "b",
+            read_only: true,
+        }));
+        runtime.import_disabled(["a".to_string(), "b".to_string()]);
+        assert!(!runtime.is_tool_enabled("a"));
+        assert!(!runtime.is_tool_enabled("b"));
+        assert_eq!(
+            runtime.disabled_snapshot(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // 快照返回禁用名集合；清空后全部恢复
+        runtime.import_disabled(Vec::<String>::new());
+        assert!(runtime.is_tool_enabled("a"));
+        assert!(runtime.is_tool_enabled("b"));
+        assert!(runtime.disabled_snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_disabled_source_reflects_external_mutation() {
+        let runtime = ToolRuntime::new();
+        let source = runtime.disabled_source();
+        // 宿主（面板）持有共享引用直接修改，runtime 下一轮立即感知
+        source.write().expect("lock").insert("external".to_string());
+        assert!(!runtime.is_tool_enabled("external"));
+    }
+
+    #[tokio::test]
+    async fn shared_disabled_observer_notifies_only_on_actual_mutation() {
+        // 修复回归（review P3-1）：runtime 侧直写共享集合必须经注入的
+        // observer 统一记账——否则宿主经 ToolStateService 持久化路径判断
+        // 的 dirty 版本号不递增，存储加载会用陈旧值覆盖直写修改。
+        let mut runtime = ToolRuntime::new();
+        let source: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let notified = Arc::new(AtomicUsize::new(0));
+        let observer = Arc::new({
+            let notified = Arc::clone(&notified);
+            move || {
+                notified.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        runtime.share_disabled(source, Some(observer));
+
+        // 实际变化才通知：与 ToolStateService::set_enabled 递增语义一致
+        runtime.set_tool_enabled("a", false);
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+        runtime.set_tool_enabled("a", false);
+        assert_eq!(
+            notified.load(Ordering::SeqCst),
+            1,
+            "no-op disable must not notify"
+        );
+        runtime.set_tool_enabled("a", true);
+        assert_eq!(notified.load(Ordering::SeqCst), 2);
+
+        // import_disabled 全量替换：内容变化才通知
+        runtime.import_disabled(["b".to_string()]);
+        assert_eq!(notified.load(Ordering::SeqCst), 3);
+        runtime.import_disabled(["b".to_string()]);
+        assert_eq!(
+            notified.load(Ordering::SeqCst),
+            3,
+            "identical import must not notify"
+        );
+        // 外部直写共享 Arc（宿主面板等价物）不经 runtime 方法，不触发回调
+        // ——那是 ToolStateService::set_enabled 自己的记账职责。
+        runtime
+            .disabled
+            .write()
+            .expect("lock")
+            .insert("c".to_string());
+        assert_eq!(notified.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn observer_call_scope_is_restored_after_notify() {
+        // 契约（review 中等问题 2 加固）：observer 在 disabled 写锁内执行，
+        // 重入哨兵在回调执行区间置位；回调返回后必须复位（RAII guard），
+        // 否则后续正常调用会被误判为重入而 panic。哨兵不随构建配置编译掉
+        // （review 建议 1），本测试无条件运行。
+        let mut runtime = ToolRuntime::new();
+        let source: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let observed = Arc::new(AtomicBool::new(false));
+        let observer = Arc::new({
+            let observed = Arc::clone(&observed);
+            move || {
+                observed.store(
+                    super::IN_OBSERVER_CALL.with(|flag| flag.get()),
+                    Ordering::SeqCst,
+                );
+            }
+        });
+        runtime.share_disabled(source, Some(observer));
+
+        runtime.set_tool_enabled("a", false);
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "observer must run inside the reentry scope"
+        );
+        assert!(
+            !super::IN_OBSERVER_CALL.with(|flag| flag.get()),
+            "scope must be restored after notify (RAII guard)"
+        );
+        // 复位后正常入口不受影响（哨兵无残留）
+        assert!(!runtime.is_tool_enabled("a"));
+    }
+
+    #[test]
+    fn read_entrypoints_panic_inside_observer_call_scope() {
+        // 契约（review 中等问题 2 加固）：observer 在 disabled 写锁内执行，
+        // 回调内回读集合会死锁——重入哨兵（所有构建生效，review 建议 1）
+        // 把置位区间内的公开入口调用转为立即 panic，未来误用（如 metrics
+        // 钩子回读集合）一出现即崩溃提示，而非线上静默死锁。逐个验证读锁
+        // 入口（含 dispatch 依赖的 is_tool_enabled）。
+        for entry in [
+            "is_tool_enabled",
+            "disabled_snapshot",
+            "api_schemas",
+            "set_tool_enabled",
+            "import_disabled",
+        ] {
+            super::IN_OBSERVER_CALL.with(|flag| flag.set(true));
+            let result = std::panic::catch_unwind(|| {
+                let runtime = ToolRuntime::new();
+                match entry {
+                    "is_tool_enabled" => {
+                        let _ = runtime.is_tool_enabled("a");
+                    }
+                    "disabled_snapshot" => {
+                        let _ = runtime.disabled_snapshot();
+                    }
+                    "api_schemas" => {
+                        let _ = runtime.api_schemas();
+                    }
+                    "set_tool_enabled" => {
+                        runtime.set_tool_enabled("a", false);
+                    }
+                    "import_disabled" => {
+                        runtime.import_disabled(["a".to_string()]);
+                    }
+                    _ => unreachable!(),
+                }
+            });
+            super::IN_OBSERVER_CALL.with(|flag| flag.set(false));
+            assert!(
+                result.is_err(),
+                "{entry} must panic when called from within the observer call scope"
+            );
+        }
+    }
+
+    #[test]
+    fn observer_panic_is_contained_and_tool_system_stays_usable() {
+        // 修复（review 建议 1）：observer 在 disabled 写锁内执行，若其 panic
+        // 穿过写锁 guard 会 poison 锁——之后 is_tool_enabled / api_schemas /
+        // dispatch 的 `.expect(...)` 全部 panic，整个工具系统永久瘫痪。
+        // catch_unwind 在写锁内拦截后：guard 正常 drop 不 poison，集合修改
+        // 生效（observer panic 发生在记账前，但集合已变），后续调用全部
+        // 正常；哨兵由 RAII guard 复位，不残留置位区间。
+        let mut runtime = ToolRuntime::new();
+        let source: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        let observer = Arc::new(|| panic!("observer exploded"));
+        runtime.share_disabled(source, Some(observer));
+
+        // 调用不传播 panic（notify 内部 catch_unwind 拦截）
+        runtime.set_tool_enabled("a", false);
+        // 集合修改生效
+        assert!(!runtime.is_tool_enabled("a"));
+        // 锁未 poison：后续写/读入口全部正常
+        runtime.set_tool_enabled("a", true);
+        assert!(runtime.is_tool_enabled("a"));
+        runtime.import_disabled(["b".to_string()]);
+        assert!(!runtime.is_tool_enabled("b"));
+        assert!(runtime.api_schemas().is_empty());
+        // 哨兵复位：不在 observer 调用区间
+        assert!(
+            !super::IN_OBSERVER_CALL.with(|flag| flag.get()),
+            "sentinel must be restored after observer panic (RAII guard)"
+        );
     }
 
     #[tokio::test]

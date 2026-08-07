@@ -119,9 +119,10 @@ COPY app/ui/src ./app/ui/src
 COPY app/ui/assets ./app/ui/assets
 COPY crates/i18n/src ./crates/i18n/src
 COPY app/client-api/src ./app/client-api/src
+COPY crates/agent-core/src ./crates/agent-core/src
 
 # Touch all copied crate source files to invalidate pre-build cache
-RUN find app/web/src app/ui/src crates/i18n/src app/client-api/src \
+RUN find app/web/src app/ui/src crates/i18n/src app/client-api/src crates/agent-core/src \
     -type f -name '*.rs' -exec touch {} +
 
 # Build the Dioxus frontend (from workspace root for correct path resolution)

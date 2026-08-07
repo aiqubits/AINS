@@ -596,7 +596,7 @@ translate! {
 
     // tool_panel.rs（Phase 6.7）
     tool_panel_title: "Available Tools" => "可用工具",
-    tool_panel_subtitle: "Tools the agent can call in the current runtime." => "当前运行时中智能体可调用的工具。",
+    tool_panel_subtitle: "Tools the agent can call in the current runtime. Disabled tools are hidden from the agent." => "当前运行时中智能体可调用的工具。停用的工具不会出现在智能体上下文中。",
     tool_panel_empty: "No tools registered." => "未注册任何工具。",
     tool_cat_compute: "Compute" => "计算",
     tool_cat_filesystem: "Files" => "文件",
@@ -605,6 +605,16 @@ translate! {
     tool_cat_browser: "Browser" => "浏览器",
     tool_cat_meta: "Meta" => "元工具",
     tool_cat_mcp: "MCP" => "MCP 远程",
+    tool_toggle_on: "Disable tool" => "停用该工具",
+    tool_toggle_off: "Enable tool" => "启用该工具",
+    tool_meta_disable_hint: "Disabling a meta tool removes it from the agent's context; the UI toggle remains available." => "停用元工具后，该工具将不再出现在智能体上下文中；界面上的手动开关仍可用。",
+    tool_states_load_failed: "Failed to restore tool states; all tools are currently active" => "工具状态恢复失败，所有工具当前均为活跃状态",
+    // 本进程内存仍有需保留的工具状态（未落盘切换或已落盘禁用清单）时
+    // 存储加载失败：禁用清单原样保留（并非全部活跃），文案需与全量回退
+    // 区分（review 中等问题 3 修复扩展）——措辞同时覆盖"未保存切换保留"
+    // 与"已保存禁用保留"两种场景，避免把已保存状态误称未保存。
+    tool_states_load_failed_local: "Failed to restore tool states; local state was kept" => "工具状态恢复失败，本地已有状态已保留",
+    tool_states_save_failed: "Failed to save tool states; this change may not be kept" => "工具状态保存失败，本次切换可能不会保留",
 
     // memory_viewer.rs（Phase 6.6）
     memory_title: "Memory" => "记忆库",

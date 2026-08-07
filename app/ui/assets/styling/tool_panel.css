@@ -116,6 +116,79 @@
   color: var(--color-text-tertiary);
 }
 
+/* 活跃开关（Phase 6.7 扩展）：胶囊滑块，右侧为开（活跃），
+   关闭时整体变灰并左移，明确“不会进入智能体上下文”。 */
+.ains-tools__toggle {
+  margin-left: auto;
+  width: 34px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--color-success-bg);
+  cursor: pointer;
+  transition: background 0.15s ease;
+  flex-shrink: 0;
+}
+
+.ains-tools__toggle--off {
+  background: var(--color-border-default);
+}
+
+/* 键盘可达性（review 建议 6）：胶囊开关仅靠颜色区分状态，鼠标/触摸
+   有视觉反馈，键盘聚焦必须也有可见焦点环——用 brand 色 outline 而非
+   box-shadow，避免与关闭态变灰/阴影混淆。 */
+.ains-tools__toggle:focus-visible {
+  outline: 2px solid var(--color-brand-indigo-deep);
+  outline-offset: 2px;
+}
+
+.ains-tools__toggle-knob {
+  display: block;
+  width: 14px;
+  height: 14px;
+  margin: 2px 2px 2px auto;
+  border-radius: var(--radius-full);
+  background: #ffffff;
+  box-shadow: var(--shadow-sm);
+  transition: margin 0.15s ease;
+}
+
+.ains-tools__toggle--off .ains-tools__toggle-knob {
+  margin: 2px auto 2px 2px;
+}
+
+/* 元工具提示：停用后仅影响智能体上下文，界面手动开关仍可用 */
+.ains-tools__meta-hint {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--color-warning-text);
+}
+
+/* 状态恢复/持久化失败横幅：恢复失败（存储不可读，fail-open 回退为全部
+   活跃）或持久化失败（切换未落盘，跨挂载/重启可能回滚）时提示用户。
+   /tools 视图与 agent 会话视图共用此样式。 */
+.ains-tools__load-error {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-error-bg);
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--color-error-text);
+}
+
+/* 持久化失败横幅变体：影响面较小（仅最近一次切换未落盘，下次成功
+   落盘即自愈），用 warning 色系与恢复失败（error 色系，全部工具回退
+   活跃）区分，两类横幅可能同时展示。 */
+.ains-tools__load-error--warn {
+  background: var(--color-warning-bg);
+  border-color: var(--color-warning-border);
+  color: var(--color-warning-text);
+}
+
 /* Mobile 适配（Phase 6.10） */
 @media (max-width: 640px) {
   .ains-tools__grid {

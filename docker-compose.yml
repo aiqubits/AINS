@@ -62,6 +62,11 @@ services:
         condition: service_healthy
     networks:
       - ains-net
+      # 外部 ollama（同宿主 keycompute 项目的 compose 网络）：ain-server 经
+      # 服务名 keycompute-ollama:11434 访问 OpenAI 兼容端点。不同自定义 bridge
+      # 网络默认隔离且 ollama 端口未发布宿主机，故必须加入该外部网络；容器
+      # 重建后配置仍生效（external 网络需精确 name 声明，见底部 networks）。
+      - keycompute-public
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/api/health"]
@@ -161,3 +166,8 @@ volumes:
 networks:
   ains-net:
     driver: bridge
+  # 同宿主其它 compose 项目（keycompute）的 ollama 网络：external 网络必须
+  # external: true + 精确 name（docker compose 默认不会自动发现外部网络）。
+  keycompute-public:
+    external: true
+    name: keycompute-replicas_keycompute-public

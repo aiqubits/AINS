@@ -6,6 +6,7 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -1932,5 +1933,287 @@ async fn interrupt_at_tool_boundary_fires_stop_hook() {
             .text()
             .contains("\"stop_reason\":\"interrupted\""),
         "{stop_payload:?}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_tool_excluded_from_model_context_and_rejected_on_call() {
+    // 工具活跃状态双保险集成回归：
+    // 1) 禁用 echo 后，Kernel 每轮 ModelRequest.tools 不含 echo（模型上下文过滤）；
+    // 2) 模型仍输出 echo 的 tool_use 时，执行层 fail-closed 返回 is_error，
+    //    且会话继续存活（脚本第二段文本回答正常落地）。
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(None, "tu_echo", "echo", json!({"text": "x"})),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let mut runtime = ToolRuntime::new();
+    runtime.register(Box::new(EchoTool));
+    runtime.set_tool_enabled("echo", false);
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+            Arc::clone(&model) as Arc<_>,
+            runtime,
+            test_config(),
+        );
+    event_tx.try_send(user_message("start")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    // 模型上下文过滤：所有轮次的工具清单都不得包含被禁工具
+    let requests = model.recorded_requests();
+    assert!(!requests.is_empty(), "kernel must have queried the model");
+    for request in &requests {
+        let names: Vec<&str> = request
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"echo"),
+            "disabled tool leaked into model context: {names:?}"
+        );
+    }
+
+    // 执行兜底：echo 的 tool_use 被拒绝为 is_error 的 tool_result
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolExecutionCompleted {
+                tool_name,
+                is_error: true,
+                ..
+            } if tool_name == "echo"
+        )),
+        "disabled tool dispatch must fail closed: {events:?}"
+    );
+    // 会话存活：后续文本回答已落地（完整 turn 结束）
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::AssistantTurnComplete { .. })),
+        "kernel must continue after disabled-tool rejection: {events:?}"
+    );
+}
+
+/// 会话进行中翻转共享禁用集合的工具：宿主（/tools 面板）修改共享 Arc 后，
+/// Kernel 下一轮 api_schemas 应立即感知（无需重启会话）。
+struct FlipperTool {
+    disabled: Arc<std::sync::RwLock<HashSet<String>>>,
+}
+
+#[async_trait::async_trait]
+impl Tool for FlipperTool {
+    fn definition(&self) -> ToolDef {
+        ToolDef {
+            name: "flipper".into(),
+            description: "flip echo availability in the shared disabled set".into(),
+            input_schema: json!({"type": "object", "properties": {"enable": {"type": "boolean"}}}),
+        }
+    }
+
+    fn is_read_only(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn category(&self) -> ToolCategory {
+        ToolCategory::AgentInternal
+    }
+
+    async fn execute(
+        &self,
+        input: Value,
+        _ctx: &mut ToolContext<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let enable = input
+            .get("enable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let mut guard = self
+            .disabled
+            .write()
+            .expect("shared disabled lock poisoned");
+        if enable {
+            guard.remove("echo");
+        } else {
+            guard.insert("echo".to_string());
+        }
+        Ok(ToolResult::ok(format!("echo enabled={enable}")))
+    }
+}
+
+fn request_tool_names(request: &ModelRequest) -> Vec<&str> {
+    request
+        .tools
+        .iter()
+        .map(|tool| tool.name.as_str())
+        .collect()
+}
+
+#[tokio::test]
+async fn shared_disabled_source_flips_live_kernel_context_and_execution() {
+    // share_disabled 注入的共享源在会话进行中被外部（宿主面板等价物）修改：
+    // - turn1 flipper(disable) 后，turn2 的模型请求上下文不再含 echo；
+    // - turn2 flipper(enable) 后，turn3 的上下文恢复包含 echo 且可正常执行。
+    // 覆盖“会话进行中重新启用工具、下一轮上下文恢复包含”的方向。
+    let shared: Arc<std::sync::RwLock<HashSet<String>>> = Arc::new(Default::default());
+    let mut runtime = ToolRuntime::new();
+    runtime.register(Box::new(EchoTool));
+    runtime.register(Box::new(FlipperTool {
+        disabled: Arc::clone(&shared),
+    }));
+    // 集成测试无持久化记账语义（无 ToolStateService/dirty），observer 传
+    // None；仅验证共享源翻转。生产装配在 service.rs 注入 dirty 递增回调。
+    runtime.share_disabled(Arc::clone(&shared), None);
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(
+                None,
+                "tu_f1",
+                "flipper",
+                json!({"enable": false}),
+            ),
+            usage(),
+        ),
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(
+                None,
+                "tu_f2",
+                "flipper",
+                json!({"enable": true}),
+            ),
+            usage(),
+        ),
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(None, "tu_e", "echo", json!({"text": "hi"})),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+            Arc::clone(&model) as Arc<_>,
+            runtime,
+            test_config(),
+        );
+    event_tx.try_send(user_message("start")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    // 上下文过滤随共享源翻转：turn1 含 echo → turn2 不含 → turn3 恢复
+    let requests = model.recorded_requests();
+    assert!(
+        requests.len() >= 3,
+        "expected at least 3 model turns, got {}",
+        requests.len()
+    );
+    assert!(request_tool_names(&requests[0]).contains(&"echo"));
+    assert!(
+        !request_tool_names(&requests[1]).contains(&"echo"),
+        "turn2 must exclude echo after flipper disabled it: {:?}",
+        request_tool_names(&requests[1])
+    );
+    assert!(
+        request_tool_names(&requests[2]).contains(&"echo"),
+        "turn3 must include echo after re-enable: {:?}",
+        request_tool_names(&requests[2])
+    );
+
+    // 执行层：echo 在 turn3 重新启用后正常执行成功
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolExecutionCompleted {
+                tool_name,
+                is_error: false,
+                ..
+            } if tool_name == "echo"
+        )),
+        "re-enabled echo must execute successfully: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn disabled_tool_dispatch_skips_pre_tool_use_hook() {
+    // 禁用检查位于 pre_tool_use hook 之前（review 建议补测）：被禁工具
+    // 不得触发任何 hook 副作用——若 hook 先于禁用检查执行，观测/拦截类
+    // hook（如审计、安全过滤）会为从未执行的工具产生事件，且禁用状态
+    // 的语义被 hook 结果污染。用记录请求的 prompt hook model 断言：
+    // echo 被禁用后 dispatch 直接拒绝，hook model 零请求。
+    let mut registry = HookRegistry::new();
+    let hook_model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn(r#"{"ok":true}"#, usage()),
+    ]));
+    registry.register(
+        HookEvent::PreToolUse,
+        HookDefinition::Prompt(PromptHookDefinition {
+            prompt: "$ARGUMENTS".into(),
+            model: None,
+            timeout_seconds: 5,
+            matcher: None,
+            block_on_failure: false,
+            priority: 0,
+        }),
+    );
+    let hooks = Arc::new(
+        HookExecutor::new(registry, std::env::temp_dir())
+            .with_model(Arc::clone(&hook_model) as Arc<_>, None),
+    );
+    let mut runtime = ToolRuntime::new().with_hooks(hooks);
+    runtime.register(Box::new(EchoTool));
+    runtime.set_tool_enabled("echo", false);
+
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::turn(
+            ScriptedModelClient::assistant_tool_use(
+                None,
+                "tu_echo",
+                "echo",
+                json!({ "text": "x" }),
+            ),
+            usage(),
+        ),
+        ScriptedModelClient::text_turn("done", usage()),
+    ]));
+    let (mut kernel, mut event_tx, mut stream_rx) =
+        AgentKernel::<TokioRuntimeAdapter>::with_runtime(
+            Arc::clone(&model) as Arc<_>,
+            runtime,
+            test_config(),
+        );
+    event_tx.try_send(user_message("start")).unwrap();
+    drop(event_tx);
+    kernel.run().await.unwrap();
+
+    let mut events = Vec::new();
+    while let Ok(event) = stream_rx.try_recv() {
+        events.push(event);
+    }
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::ToolExecutionCompleted {
+                tool_name,
+                is_error: true,
+                ..
+            } if tool_name == "echo"
+        )),
+        "disabled echo must be rejected by dispatch: {events:?}"
+    );
+    assert!(
+        hook_model.recorded_requests().is_empty(),
+        "pre_tool_use hook must not fire for a disabled tool: {:?}",
+        hook_model.recorded_requests()
     );
 }
