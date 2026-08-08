@@ -3,9 +3,10 @@ use parking_lot::Mutex;
 use rand::Rng;
 use sea_orm::{
     AccessMode, ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DatabaseTransaction,
-    DbBackend, DbErr, ExecResult, IsolationLevel, QueryResult, Statement, TransactionError,
-    TransactionTrait,
+    DbBackend, DbErr, ExecResult, IsolationLevel, QueryResult, RuntimeErr, Statement,
+    TransactionError, TransactionTrait,
 };
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -323,7 +324,7 @@ impl AutoRouter {
     /// Uses owned `DatabaseConnection` to avoid lifetime issues with async closures.
     async fn execute_read_retry<T, F, Fut>(&self, stmt: Statement, op: F) -> Result<T, DbErr>
     where
-        F: Fn(DatabaseConnection, Statement) -> Fut + Copy,
+        F: Fn(DatabaseConnection, Statement) -> Fut,
         Fut: std::future::Future<Output = Result<T, DbErr>>,
     {
         if self.reads.is_empty() {
@@ -624,14 +625,38 @@ fn cte_main_stmt_is_write(uppercase_sql: &str) -> bool {
     false
 }
 
+/// Extract the SQLSTATE code from a `DbErr` when it wraps a PostgreSQL
+/// server-reported error (sqlx `Error::Database`).
+///
+/// 仅用于读路径：sea-orm 将 `query_one`/`query_all` 的 sqlx 错误包装为
+/// `DbErr::Query(RuntimeErr::SqlxError(...))`（见 sqlx_common.rs 的
+/// `sqlx_error_to_query_err`）；写路径的错误为 `DbErr::Exec` 形态，不经由
+/// 此函数（写操作不参与读路由重试）。与 sea-orm 内部 `DbErr::sql_err()`
+/// 的 downcast 形态一致：
+/// `DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(e)))`.
+fn pg_sqlstate(e: &DbErr) -> Option<&str> {
+    let DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(db_err))) = e else {
+        return None;
+    };
+    // `code()` 返回 `Cow<'_, str>`：PG 路径恒为 `Cow::Borrowed`（数据借用自
+    // `db_err`，与 `e` 同生命周期），直接解构取出 `&str`；`Cow::Owned` 在真实
+    // 驱动中不会出现，保守返回 `None`（避免借用局部变量导致 E0515）。
+    match db_err.as_ref().code()? {
+        Cow::Borrowed(s) => Some(s),
+        Cow::Owned(_) => None,
+    }
+}
+
 /// Determine whether a `DbErr` likely represents a connection-level
 /// failure rather than a query-level error.
 ///
 /// - `DbErr::Conn` is always a connection-level failure (pool timeout,
 ///   connection refused, etc.).
 /// - `DbErr::Query` may wrap sqlx-level connectivity errors (e.g., broken
-///   pipe mid-query). A conservative keyword set is used to avoid false
-///   positives from legitimate query error messages.
+///   pipe mid-query) or PostgreSQL server-reported FATAL errors (57P01 /
+///   57P02 / 57P03). Server-side terminations are classified by their
+///   SQLSTATE code; client/OS errors fall back to a conservative keyword
+///   set to avoid false positives from legitimate query error messages.
 /// - All other variants are never considered connection errors.
 fn is_connection_error(e: &DbErr) -> bool {
     // Primary: DbErr::Conn is always a connection-level failure
@@ -648,9 +673,23 @@ fn is_connection_error(e: &DbErr) -> bool {
     }
 
     // Secondary: sqlx may report mid-query connection failures (e.g., broken
-    // pipe, transport EOF) as DbErr::Query. Use a conservative keyword set
-    // that is extremely unlikely to appear in actual query error messages.
+    // pipe, transport EOF) as DbErr::Query. PostgreSQL server-side connection
+    // termination classes also surface here as FATAL database errors:
+    // 57P01 admin_shutdown / 57P02 crash_shutdown terminate the backend
+    // mid-query (not a socket-level EOF), 57P03 cannot_connect_now is
+    // returned during startup recovery / shutdown. They are classified by
+    // SQLSTATE code rather than message text: server messages are localized
+    // per LC_MESSAGES and 57P03 has several variants ("starting up" / "in
+    // recovery mode" / "shutting down"), while the code is stable. All three
+    // indicate the server dropped the connection — the replica must be marked
+    // down and the query retried/fallback.
     if matches!(e, DbErr::Query(_)) {
+        if matches!(pg_sqlstate(e), Some("57P01" | "57P02" | "57P03")) {
+            return true;
+        }
+        // Keyword fallback for sqlx-level client/OS errors that carry no
+        // SQLSTATE code (e.g. sqlx::Error::Io). Conservative set that is
+        // extremely unlikely to appear in actual query error messages.
         let s = e.to_string().to_ascii_lowercase();
         let hints = [
             "broken pipe",
@@ -659,15 +698,6 @@ fn is_connection_error(e: &DbErr) -> bool {
             "network",
             "eof",
             "transport",
-            // PostgreSQL server-side connection termination classes:
-            // 57P01 admin_shutdown / 57P02 crash_shutdown terminate the
-            // backend mid-query and report FATAL via the normal protocol
-            // (not a socket-level EOF), so they surface as DbErr::Query.
-            // 57P03 cannot_connect_now is returned during startup recovery.
-            // All three indicate the server dropped the connection — the
-            // replica must be marked down and the query retried/fallback.
-            "terminating connection",
-            "database system is starting up",
         ];
         return hints.iter().any(|h| s.contains(h));
     }
@@ -685,16 +715,12 @@ fn is_connection_error(e: &DbErr) -> bool {
 /// itself is healthy, so the query should be retried on another replica
 /// WITHOUT marking this one down.
 ///
-/// The match is message-based ("conflict with recovery") rather than on the
-/// 40001 code: 40001 also covers business serialization failures, which never
-/// occur on the read-only standby path this function is used for.
+/// The match is on the stable SQLSTATE code rather than the message text,
+/// which is localized per server LC_MESSAGES. 40001 also covers business
+/// serialization failures, which never occur on the read-only standby path
+/// this function is used for.
 fn is_recovery_conflict(e: &DbErr) -> bool {
-    if matches!(e, DbErr::Query(_)) {
-        let s = e.to_string().to_ascii_lowercase();
-        s.contains("conflict with recovery")
-    } else {
-        false
-    }
+    matches!(pg_sqlstate(e), Some("40001"))
 }
 
 // ---- connection helpers ----
@@ -1010,34 +1036,130 @@ mod tests {
         assert!(!is_connection_error(&err));
     }
 
+    // ── PostgreSQL server-reported errors (SQLSTATE classification) ──────
+    //
+    // 真实错误路径说明：sea-orm 从不将 sqlx 错误字符串化为
+    // RuntimeErr::Internal —— sqlx_common.rs 的 sqlx_error_to_query_err
+    // 始终保留 RuntimeErr::SqlxError 形态。下方部分测试（如
+    // ignores_internal_string_query）使用 Internal 字符串形态，属于防御性
+    // 断言（非真实路径），用于锁定"分类逻辑不依赖消息文本"这一行为。
+
+    /// Mock of sqlx's PostgreSQL server error: mirrors `PgDatabaseError`'s
+    /// surface (Display shows only the message) with a fixed SQLSTATE code.
+    /// `code` 为 `None` 时模拟 `DatabaseError::code()` 的默认返回（sqlx-core
+    /// 默认实现返回 None，如无码错误）。`owned_code` toggles `code()`
+    /// between `Cow::Borrowed` (the real PG driver's behaviour) and
+    /// `Cow::Owned` (defensive branch coverage).
+    #[derive(Debug)]
+    struct MockPgError {
+        code: Option<&'static str>,
+        message: &'static str,
+        owned_code: bool,
+    }
+
+    impl std::fmt::Display for MockPgError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for MockPgError {}
+
+    impl sqlx::error::DatabaseError for MockPgError {
+        fn message(&self) -> &str {
+            self.message
+        }
+
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            let code = self.code?;
+            if self.owned_code {
+                Some(std::borrow::Cow::Owned(code.to_string()))
+            } else {
+                Some(std::borrow::Cow::Borrowed(code))
+            }
+        }
+
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+    }
+
+    /// Build a `DbErr` with the exact shape sea-orm surfaces for a PostgreSQL
+    /// server-reported error: `DbErr::Query(RuntimeErr::SqlxError(
+    /// sqlx::Error::Database(...)))` (Display: "Query Error: error returned
+    /// from database: <message>").
+    fn pg_db_err(code: &'static str, message: &'static str) -> DbErr {
+        DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(Box::new(
+            MockPgError {
+                code: Some(code),
+                message,
+                owned_code: false,
+            },
+        ))))
+    }
+
     #[test]
     fn test_is_connection_error_pg_admin_shutdown_57p01() {
         // PostgreSQL 57P01: backend terminated mid-query by pg_terminate_backend
         // or server shutdown. Reported as a FATAL PgDatabaseError, NOT a
         // socket-level EOF — must still be treated as a connection error so
         // the replica is marked down and the query retried/falls back.
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "Database(PgDatabaseError { severity: Fatal, code: \"57P01\", \
-             message: \"terminating connection due to administrator command\" })"
-                .to_string(),
-        ));
+        let err = pg_db_err(
+            "57P01",
+            "terminating connection due to administrator command",
+        );
         assert!(is_connection_error(&err));
     }
 
     #[test]
     fn test_is_connection_error_pg_crash_shutdown_57p02() {
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "message: \"terminating connection due to crash of another server process\""
-                .to_string(),
-        ));
+        let err = pg_db_err(
+            "57P02",
+            "terminating connection due to crash of another server process",
+        );
         assert!(is_connection_error(&err));
     }
 
     #[test]
     fn test_is_connection_error_pg_cannot_connect_now_57p03() {
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "message: \"the database system is starting up\"".to_string(),
-        ));
+        let err = pg_db_err("57P03", "the database system is starting up");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_cannot_connect_now_recovery_mode_57p03() {
+        // 57P03 has several message variants; SQLSTATE classification must
+        // not depend on the exact wording.
+        let err = pg_db_err("57P03", "the database system is in recovery mode");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_cannot_connect_now_shutting_down_57p03() {
+        let err = pg_db_err("57P03", "the database system is shutting down");
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_pg_localized_message_still_matches_by_code() {
+        // Regression: server messages are localized per LC_MESSAGES and must
+        // not be the basis of classification — the SQLSTATE code is stable.
+        let err = pg_db_err(
+            "57P01",
+            "connexion interrompue par la commande de l'administrateur",
+        );
         assert!(is_connection_error(&err));
     }
 
@@ -1046,11 +1168,7 @@ mod tests {
         // Regression: hot-standby recovery conflict (40001) cancels the
         // statement but leaves the connection usable — must NOT be treated
         // as a connection error (no mark_down), but IS retryable.
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "Database(PgDatabaseError { severity: Error, code: \"40001\", \
-             message: \"canceling statement due to conflict with recovery\" })"
-                .to_string(),
-        ));
+        let err = pg_db_err("40001", "canceling statement due to conflict with recovery");
         assert!(!is_connection_error(&err));
         assert!(is_recovery_conflict(&err));
     }
@@ -1060,9 +1178,7 @@ mod tests {
         // Regression: statement cancellation (57014, e.g. user cancel or
         // statement_timeout) aborts the query but the connection stays
         // usable — neither a connection error nor a recovery conflict.
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "canceling statement due to user request".to_string(),
-        ));
+        let err = pg_db_err("57014", "canceling statement due to user request");
         assert!(!is_connection_error(&err));
         assert!(!is_recovery_conflict(&err));
     }
@@ -1070,19 +1186,92 @@ mod tests {
     #[test]
     fn test_is_recovery_conflict_positive() {
         // Transaction-level variant: "canceling transaction due to conflict
-        // with recovery" must also match.
-        let err = DbErr::Query(RuntimeErr::Internal(
-            "canceling transaction due to conflict with recovery".to_string(),
-        ));
+        // with recovery" shares SQLSTATE 40001 and must also match.
+        let err = pg_db_err(
+            "40001",
+            "canceling transaction due to conflict with recovery",
+        );
         assert!(is_recovery_conflict(&err));
     }
 
     #[test]
     fn test_is_recovery_conflict_ignores_conn_variant() {
-        // Only DbErr::Query carries query-level messages; a DbErr::Conn with
-        // a coincidental substring must not match.
+        // Only DbErr::Query carrying a server-reported Database error can
+        // expose a SQLSTATE code; a DbErr::Conn with a coincidental substring
+        // must not match.
         let err = DbErr::Conn(RuntimeErr::Internal("conflict with recovery".to_string()));
         assert!(!is_recovery_conflict(&err));
+    }
+
+    #[test]
+    fn test_is_recovery_conflict_ignores_internal_string_query() {
+        // A plain-string DbErr::Query carries no SQLSTATE code, so even a
+        // message containing "conflict with recovery" must not match.
+        let err = DbErr::Query(RuntimeErr::Internal(
+            "canceling statement due to conflict with recovery".to_string(),
+        ));
+        assert!(!is_recovery_conflict(&err));
+    }
+
+    #[test]
+    fn test_is_connection_error_query_sqlx_io_broken_pipe() {
+        // sqlx-level I/O error mid-query surfaces as DbErr::Query wrapping
+        // sqlx::Error::Io — no SQLSTATE code, matched via keyword fallback.
+        let err = DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ))));
+        assert!(is_connection_error(&err));
+    }
+
+    #[test]
+    fn test_pg_sqlstate_returns_none_for_non_database_errors() {
+        assert_eq!(
+            pg_sqlstate(&DbErr::Conn(RuntimeErr::Internal("boom".to_string()))),
+            None
+        );
+        assert_eq!(
+            pg_sqlstate(&DbErr::Query(RuntimeErr::Internal("boom".to_string()))),
+            None
+        );
+        // sqlx-level I/O error is not a server-reported Database error.
+        let io_err = DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ))));
+        assert_eq!(pg_sqlstate(&io_err), None);
+    }
+
+    #[test]
+    fn test_pg_sqlstate_returns_none_for_owned_code() {
+        // Defensive branch: no real driver returns `Cow::Owned` from
+        // `code()`, but if one ever did, the code cannot be borrowed from
+        // the temporary `Cow` — conservatively report no SQLSTATE code.
+        let err = DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(Box::new(
+            MockPgError {
+                code: Some("57P01"),
+                message: "terminating connection due to administrator command",
+                owned_code: true,
+            },
+        ))));
+        assert_eq!(pg_sqlstate(&err), None);
+    }
+
+    #[test]
+    fn test_pg_sqlstate_returns_none_when_database_error_has_no_code() {
+        // `DatabaseError::code()` 的默认实现返回 None（sqlx-core）；此时没有
+        // SQLSTATE 码可分类，pg_sqlstate 必须返回 None 且不 panic。同时验证
+        // is_connection_error 走 keyword fallback：消息不含保守关键词（broken
+        // pipe 等）时不得误判为连接错误——分类不依赖消息文本这一行为由此锁定。
+        let err = DbErr::Query(RuntimeErr::SqlxError(sqlx::Error::Database(Box::new(
+            MockPgError {
+                code: None,
+                message: "terminating connection due to administrator command",
+                owned_code: false,
+            },
+        ))));
+        assert_eq!(pg_sqlstate(&err), None);
+        assert!(!is_connection_error(&err));
     }
 
     #[test]
@@ -1512,5 +1701,218 @@ mod tests {
     fn test_is_connection_error_attr_not_set_not_connection() {
         let err = DbErr::AttrNotSet("name".to_string());
         assert!(!is_connection_error(&err));
+    }
+
+    // ---- execute_read_retry 集成测试（假 op + Disconnected 连接）──────────
+    //
+    // 不启用 sea-orm mock feature（启用后 DatabaseConnection 不再实现 Clone，
+    // 会破坏生产代码的 conn.clone()）。改用公开的 DatabaseConnection::Disconnected
+    // 变体 + 计数器闭包：execute_read_retry 内部对每个副本调用传入的 op，
+    // 由计数器区分调用次序（第 N 个副本返回预置结果/错误），从而验证
+    // mark_down / 重试 / fallback 编排与 SQLSTATE 分类的联动。
+
+    /// 构造一个写库 + 两个读副本（RoundRobin，连接均为 Disconnected）的
+    /// AutoRouter。`fallback_to_write` 控制全部失败后的写库回退，
+    /// `retry_attempts` 控制 Phase 2 重试轮数。
+    fn mock_router(fallback_to_write: bool, retry_attempts: usize) -> AutoRouter {
+        AutoRouter {
+            write: DatabaseConnection::Disconnected,
+            reads: vec![
+                ReadReplica {
+                    conn: DatabaseConnection::Disconnected,
+                    original_index: 0,
+                    weight: 1,
+                },
+                ReadReplica {
+                    conn: DatabaseConnection::Disconnected,
+                    original_index: 1,
+                    weight: 1,
+                },
+            ],
+            strategy: ReadStrategy::RoundRobin,
+            rr_counter: AtomicUsize::new(0),
+            health: Mutex::new(HealthState {
+                down_until: vec![None, None],
+            }),
+            circuit_break: Duration::from_secs(30),
+            retry_attempts,
+            fallback_to_write,
+        }
+    }
+
+    fn select_stmt() -> Statement {
+        Statement::from_string(DbBackend::Postgres, "SELECT 1".to_string())
+    }
+
+    /// 测试用 op 类型：模拟一次读查询（忽略传入的连接与语句）。
+    type FailingOp = Box<
+        dyn Fn(
+            DatabaseConnection,
+            Statement,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DbErr>> + Send>>,
+    >;
+
+    /// 构造一个按调用次数返回错误的 op：前 `err_count` 次调用返回 `err`
+    /// （每次通过 `fn() -> DbErr` 构造新错误），其余返回 `Ok(())`。
+    /// `err_count == 0` 时恒成功。`Fn` 即可多次调用（execute_read_retry
+    /// 内部从不 clone op，故无需 Copy）。
+    /// 返回 `(op, calls)`：`calls` 记录实际调用次数，用于断言"恰好尝试了
+    /// 预期的副本数"（含 Phase 2 与 fallback）。
+    ///
+    /// 注意：`err_count` 按调用次序消费，调用次序 = RoundRobin 策略 +
+    /// `retry_attempts` 配置下的副本次序（由 mock_router 固定）。若修改
+    /// 策略或重试次数，需同步调整 `err_count` 的语义。
+    fn failing_op(err_count: usize, err: fn() -> DbErr) -> (FailingOp, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_ref = Arc::clone(&calls);
+        (
+            Box::new(move |_conn, _stmt| {
+                let n = calls_ref.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move { if n < err_count { Err(err()) } else { Ok(()) } })
+            }),
+            calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_57p01_marks_down_and_retries_healthy_replica() {
+        // 副本 0 返回 57P01（连接被服务端终止）→ 应被 mark_down；
+        // 副本 1 健康 → 查询成功，且健康副本不被误标。
+        let router = mock_router(false, 0);
+        let (op, calls) = failing_op(1, || {
+            pg_db_err(
+                "57P01",
+                "terminating connection due to administrator command",
+            )
+        });
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_ok());
+
+        let health = router.health.lock();
+        assert!(health.down_until[0].is_some(), "57P01 副本应被标记 down");
+        assert!(health.down_until[1].is_none(), "健康副本不应被标记 down");
+        drop(health);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "每个副本恰好尝试一次");
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_recovery_conflict_does_not_mark_down() {
+        // 40001（热备恢复冲突）取消语句但连接可用 → 不 mark_down，
+        // 重试另一副本成功。
+        let router = mock_router(false, 0);
+        let (op, calls) = failing_op(1, || {
+            pg_db_err("40001", "canceling statement due to conflict with recovery")
+        });
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_ok());
+
+        let health = router.health.lock();
+        assert!(
+            health.down_until[0].is_none(),
+            "40001 副本保持健康（不 mark_down）"
+        );
+        assert!(health.down_until[1].is_none());
+        drop(health);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "每个副本恰好尝试一次");
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_all_replicas_down_returns_error() {
+        // 两个副本都返回连接终止类错误 → 全部 mark_down；
+        // 无 fallback 时返回错误。
+        let router = mock_router(false, 0);
+        let (op, calls) = failing_op(2, || {
+            pg_db_err(
+                "57P01",
+                "terminating connection due to administrator command",
+            )
+        });
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_err());
+
+        let health = router.health.lock();
+        assert!(health.down_until[0].is_some());
+        assert!(health.down_until[1].is_some());
+        drop(health);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "每个副本恰好尝试一次");
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_all_replicas_down_falls_back_to_write() {
+        // 两个副本均失败且 fallback_to_write=true → 回退到写库成功
+        // （op 第 3 次调用——即写库——返回 Ok）。
+        let router = mock_router(true, 0);
+        let (op, calls) = failing_op(2, || pg_db_err("57P01", "connection terminated"));
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_ok());
+
+        let health = router.health.lock();
+        assert!(health.down_until[0].is_some());
+        assert!(health.down_until[1].is_some());
+        drop(health);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "两个副本各一次 + fallback 一次"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_phase2_gives_failed_replica_second_chance() {
+        // retry_attempts=1：首轮两个副本均 57P01（均 mark_down）；Phase 2
+        // 绕过熔断直接重试副本 0（n=2）成功——验证"第二次机会"语义：
+        // 查询成功且两个副本都曾被标记 down。
+        let router = mock_router(false, 1);
+        let (op, calls) = failing_op(2, || pg_db_err("57P01", "connection terminated"));
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_ok());
+
+        let health = router.health.lock();
+        assert!(
+            health.down_until[0].is_some(),
+            "Phase 1 中副本 0 被 mark_down"
+        );
+        assert!(
+            health.down_until[1].is_some(),
+            "Phase 1 中副本 1 被 mark_down"
+        );
+        drop(health);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "Phase 1 两次 + Phase 2 一次"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_read_retry_phase2_recovery_conflict_does_not_mark_down() {
+        // retry_attempts=1：首轮两个副本均 40001（不 mark_down）；Phase 2
+        // 重试副本 0 仍 40001 → 仍不 mark_down；无 fallback → 返回错误。
+        let router = mock_router(false, 1);
+        let (op, calls) = failing_op(3, || {
+            pg_db_err("40001", "canceling statement due to conflict with recovery")
+        });
+
+        let result = router.execute_read_retry(select_stmt(), op).await;
+        assert!(result.is_err());
+
+        let health = router.health.lock();
+        assert!(
+            health.down_until[0].is_none(),
+            "40001 在 Phase 2 也不 mark_down"
+        );
+        assert!(health.down_until[1].is_none());
+        drop(health);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "Phase 1 两次 + Phase 2 一次"
+        );
     }
 }
