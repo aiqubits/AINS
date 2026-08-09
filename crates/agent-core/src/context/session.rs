@@ -85,11 +85,36 @@ pub struct SessionSaveInput {
 /// 会话持久化存储（KvStore 后端）。
 pub struct SessionStore {
     kv: Arc<dyn KvStore>,
+    /// 可选的持久化 owner 分区。Web 的 IndexedDB 在同一浏览器 profile 中
+    /// 被所有账户共享，不能只用 cwd 作为隔离键；Native 保持空以兼容既有
+    /// 单用户 session key。
+    owner_scope: Option<String>,
 }
 
 impl SessionStore {
     pub fn new(kv: Arc<dyn KvStore>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            owner_scope: None,
+        }
+    }
+
+    /// 构造按不可逆 owner key 分区的 session store。空 scope 退化为
+    /// [`Self::new`]，防止调用方意外写入 `owner//` 前缀。
+    pub fn new_scoped(kv: Arc<dyn KvStore>, owner_scope: impl Into<String>) -> Self {
+        let owner_scope = owner_scope.into();
+        Self {
+            kv,
+            owner_scope: (!owner_scope.trim().is_empty()).then_some(owner_scope),
+        }
+    }
+
+    fn scoped_slug(&self, cwd: &str) -> String {
+        let project = project_slug(cwd);
+        match &self.owner_scope {
+            Some(owner) => format!("owner/{owner}/{project}"),
+            None => project,
+        }
     }
 
     /// 持久化快照：sanitize → 白名单过滤 → 双写（按 id + latest）。返回 session_id。
@@ -117,7 +142,7 @@ impl SessionStore {
         let value = serde_json::to_value(&snapshot)
             .map_err(|e| AgentError::Model(format!("session snapshot encode failed: {e}")))?;
 
-        let slug = project_slug(&input.cwd);
+        let slug = self.scoped_slug(&input.cwd);
         // 先写按 id 的完整条目，再更新 latest 指针（崩溃时按 id 条目仍完整）。
         self.kv
             .set(&entry_key(&slug, &session_id), &value, None)
@@ -128,7 +153,7 @@ impl SessionStore {
 
     /// 读取项目最近快照（latest 指针）；回载时再 sanitize 一次。
     pub async fn load_latest(&self, cwd: &str) -> Result<Option<SessionSnapshot>, AgentError> {
-        let slug = project_slug(cwd);
+        let slug = self.scoped_slug(cwd);
         self.load_key(&latest_key(&slug)).await
     }
 
@@ -138,7 +163,7 @@ impl SessionStore {
         cwd: &str,
         session_id: &str,
     ) -> Result<Option<SessionSnapshot>, AgentError> {
-        let slug = project_slug(cwd);
+        let slug = self.scoped_slug(cwd);
         if let Some(snapshot) = self.load_key(&entry_key(&slug, session_id)).await? {
             return Ok(Some(snapshot));
         }
@@ -155,7 +180,7 @@ impl SessionStore {
     /// 无法反序列化的损坏条目跳过而非整表失败（对齐基线 `list_sessions`
     /// 对 JSONDecodeError/OSError 逐条 continue）。
     pub async fn list(&self, cwd: &str, limit: usize) -> Result<Vec<SessionSummary>, AgentError> {
-        let slug = project_slug(cwd);
+        let slug = self.scoped_slug(cwd);
         let prefix = entry_prefix(&slug);
         let keys = self.kv.list_prefix(&prefix).await?;
         let mut summaries = Vec::new();
@@ -219,16 +244,34 @@ fn latest_key(slug: &str) -> String {
     format!("session/{slug}/latest")
 }
 
-/// 生成 12 位十六进制 session_id（now_ms + 进程内单调计数 + cwd 的
-/// sha256 摘要）。计数器消除同毫秒同 cwd 两次 save 的 id 碰撞（碰撞会
-/// 静默覆盖彼此的按 id 快照），且无 RNG 依赖、wasm32 可用。
-fn generate_session_id(now_ms: i64, cwd: &str) -> String {
+/// 生成 12 位十六进制 session_id（now_ms + 进程内单调计数 + cwd +
+/// CSPRNG 熵的 sha256 摘要）。计数器消除单进程同毫秒同 cwd 两次 save
+/// 的 id 碰撞；随机熵再隔离不同 Web 标签页/进程中各自从零开始的计数器，
+/// 否则它们在同一毫秒初始化会静默覆盖同一按 id 快照。
+///
+/// 公开供 app 装配层在新会话预生成 session_id：与 `SessionStore::save`
+/// 的自动生成路径同源，保证 MemoryService 的 checkpoint / digest / status
+/// key 与后续快照落盘使用同一 id（避免字面量占位跨会话污染）。
+pub fn generate_session_id(now_ms: i64, cwd: &str) -> String {
     static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut entropy = [0u8; 12];
+    if let Err(error) = getrandom::getrandom(&mut entropy) {
+        // Session IDs are not authentication secrets. Preserve the existing
+        // availability behavior if a platform RNG is temporarily unavailable;
+        // the counter still protects same-process writes, while this warning
+        // makes the weaker cross-process collision resistance observable.
+        tracing::warn!(error = %error, "session id RNG unavailable; using deterministic fallback");
+    }
+    session_id_from_components(now_ms, counter, cwd, entropy)
+}
+
+fn session_id_from_components(now_ms: i64, counter: u64, cwd: &str, entropy: [u8; 12]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(now_ms.to_le_bytes());
     hasher.update(counter.to_le_bytes());
     hasher.update(cwd.as_bytes());
+    hasher.update(entropy);
     let digest = hasher.finalize();
     digest
         .iter()
@@ -304,6 +347,33 @@ mod tests {
         assert_eq!(loaded.model.as_deref(), Some("gpt-test"));
         assert_eq!(loaded.summary, "first goal");
         assert_eq!(loaded.message_count, 2);
+    }
+
+    #[tokio::test]
+    async fn scoped_stores_isolate_same_workspace_between_owners() {
+        let shared_kv = kv();
+        let owner_a = SessionStore::new_scoped(Arc::clone(&shared_kv), "owner-a-hash");
+        let owner_b = SessionStore::new_scoped(shared_kv, "owner-b-hash");
+        owner_a
+            .save(SessionSaveInput {
+                cwd: "/ains-web".into(),
+                messages: vec![user_msg("account A private chat")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            owner_b.load_latest("/ains-web").await.unwrap().is_none(),
+            "a shared Web backend must not restore another owner's latest session"
+        );
+        assert!(
+            owner_b
+                .list("/ains-web", DEFAULT_LIST_LIMIT)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -488,6 +558,16 @@ mod tests {
             a, b,
             "same-millisecond saves must yield distinct session ids"
         );
+    }
+
+    #[test]
+    fn session_id_entropy_separates_independent_tab_initializations() {
+        // Independent browser tabs have independent statics, so both can
+        // begin with the same timestamp, cwd, and local counter. Entropy must
+        // make those otherwise identical inputs produce different session IDs.
+        let a = session_id_from_components(42, 0, "/proj/same", [1; 12]);
+        let b = session_id_from_components(42, 0, "/proj/same", [2; 12]);
+        assert_ne!(a, b);
     }
 
     #[test]

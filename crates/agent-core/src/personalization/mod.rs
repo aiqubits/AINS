@@ -132,7 +132,12 @@ fn is_bogus_ip(value: &str) -> bool {
 /// 分隔的值，如 `"my password hunter2"` / `"use the token abcdef"` /
 /// `"password, hunter2"`）。宁可放弃一条偏好（误杀如 `"password managers"`
 /// 的正常陈述），也不能把凭据写入 `PreferenceStore`。
-fn contains_secret_material(value: &str) -> bool {
+/// Returns whether text contains a common credential representation that must
+/// not be persisted or injected into a future system prompt.
+///
+/// This is intentionally conservative rather than a complete secret scanner:
+/// false positives are preferable to retaining a credential in durable state.
+pub fn contains_secret_material(value: &str) -> bool {
     static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
             r"(?i)\b(?:api[ _-]?key|access[ _-]?token|authorization|auth|password|passwd|secret|token)\s*[:=]\s*\S+",
@@ -144,28 +149,67 @@ fn contains_secret_material(value: &str) -> bool {
     });
     static URL_USERINFO: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"://[^/\s@]+:[^/\s@]+@").expect("valid regex"));
+    static PEM_PRIVATE_KEY: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----").expect("valid regex")
+    });
     // 宽松凭据形态（review 修复）：敏感关键词 + 空格 + 值。显式赋值正则要求
     // `key=value` / `key: value`，而自由文本陈述（`I prefer my password
     // hunter2` / `Always use the token abcdef`）会绕过它进入偏好事实。
-    // password/passwd/secret/api key/access token 后的任意单词均视为凭据
-    // （误杀正常陈述可接受）；token 单独出现太宽泛（"token in the file"），
-    // 仅当其值呈密钥样式（≥6 位字母数字）时拒绝。
+    // `password` / `passwd` / `api key` / `access token` 后的值即使只含字母
+    // 也必须拒绝：字母型密码和 passphrase 是合法且常见的凭据，要求数字或
+    // 符号会让 `my password correcthorsebatterystaple` 进入持久化状态。裸
+    // `secret` / `token` 的日常含义更宽泛（例如 "project secret detail"、
+    // "token in the file"），仍要求值呈密钥样式以控制误报。
     // 分隔符覆盖空白与常见标点（`,` `;` `/` `\` `|`）及换行：
     // `"password, hunter2"` / `"secret/passw0rd"` 等形态此前只要求空白
     // 分隔，标点紧贴敏感词时会绕过过滤进入偏好事实（跨会话持久化 + 注入
     // System Prompt）。换行同样按分隔处理（rule/preference 捕获层以换行
     // 截断，此处为纵深防御）。
-    static LOOSE_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+    static LOOSE_DIRECT_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(
-            r"(?i)\b(?:password|passwd|secret|api[ _-]?key|access[ _-]?token)\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*\S+|(?i)\btoken\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*[A-Za-z0-9._~+/=-]{6,}",
+            r"(?i)\b(?:password|passwd|api[ _-]?key|access[ _-]?token)\b(?:[^\S\n]+|[,\\\\/|;]|\n)[^\S\n]*[A-Za-z0-9._~+/=-]{5,}",
         )
         .expect("valid regex")
     });
+    static LOOSE_NAMED_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\bsecret\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*(?P<value>[A-Za-z0-9._~+/=-]{5,})",
+        )
+        .expect("valid regex")
+    });
+    static LOOSE_TOKEN_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"(?i)\btoken\b(?:[^\S\n]+|[,\\/|;]|\n)[^\S\n]*(?P<value>[A-Za-z0-9._~+/=-]{6,})",
+        )
+        .expect("valid regex")
+    });
+    // Natural-language phrasing such as "my secret is s3cr3t-value" has an
+    // intervening verb, so it is not covered by the direct keyword/value
+    // pattern above.
+    static SECRET_IS_CREDENTIAL: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\bsecret\s+(?:is\s+)?(?P<value>[A-Za-z0-9._~+/=-]{5,})")
+            .expect("valid regex")
+    });
+
+    let has_credential_shaped_value = |pattern: &Regex| {
+        pattern.captures_iter(value).any(|captures| {
+            captures.name("value").is_some_and(|candidate| {
+                candidate
+                    .as_str()
+                    .chars()
+                    .any(|character| character.is_ascii_digit() || !character.is_ascii_alphabetic())
+            })
+        })
+    };
 
     SECRET_ASSIGNMENT.is_match(value)
         || BEARER_CREDENTIAL.is_match(value)
         || URL_USERINFO.is_match(value)
-        || LOOSE_CREDENTIAL.is_match(value)
+        || PEM_PRIVATE_KEY.is_match(value)
+        || LOOSE_DIRECT_CREDENTIAL.is_match(value)
+        || has_credential_shaped_value(&LOOSE_NAMED_CREDENTIAL)
+        || has_credential_shaped_value(&LOOSE_TOKEN_CREDENTIAL)
+        || has_credential_shaped_value(&SECRET_IS_CREDENTIAL)
 }
 
 fn is_safe_ssh_target(value: &str) -> bool {
@@ -601,6 +645,7 @@ mod tests {
             "use token; abcdef123",
             "password\nhunter2",
             "use token\nabcdef123",
+            "-----BEGIN PRIVATE KEY-----",
         ] {
             assert!(
                 contains_secret_material(value),
@@ -609,7 +654,15 @@ mod tests {
         }
         // 空白分隔原有行为不回退；无敏感词的值不受影响。
         assert!(contains_secret_material("use password hunter2"));
+        assert!(contains_secret_material(
+            "my password correcthorsebatterystaple"
+        ));
+        assert!(contains_secret_material("the api key alphakeymaterial"));
         assert!(!contains_secret_material("use dark mode, concise answers"));
+        assert!(
+            !contains_secret_material("project secret detail"),
+            "ordinary project wording must not be treated as a credential"
+        );
         assert!(!contains_secret_material("token in the file"));
     }
 

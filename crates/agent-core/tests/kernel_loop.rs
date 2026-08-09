@@ -748,11 +748,19 @@ async fn tool_loop_executes_and_backfills_tool_result() {
     assert_eq!(completed.len(), 1);
     assert!(matches!(
         completed[0],
-        StreamEvent::ToolExecutionCompleted { tool_use_id, output, is_error, metadata, .. }
+        StreamEvent::ToolExecutionCompleted {
+            tool_use_id,
+            output,
+            is_error,
+            metadata,
+            tool_metadata,
+            ..
+        }
             if tool_use_id == "toolu_1"
                 && output == "echo: ping"
                 && !is_error
                 && metadata == &json!({"echo_length": 4})
+                && tool_metadata.work_log == vec!["echo: ping"]
     ));
 
     // user / assistant+tool_use / user+tool_result / assistant（对齐基线 len==4）

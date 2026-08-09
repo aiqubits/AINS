@@ -292,9 +292,15 @@ pub trait VectorIndex: MaybeSendSync {
 
     /// 物理槽位是否已饱和（槽位全占且无墓碑可回收）。默认实现保守返回
     /// `false`（线性表后端无独立物理槽位概念）；Native HNSW 覆盖为真实
-    /// 判定——饱和时管理器确定性拒绝写入，避免"写→重建→仍满→写"的
-    /// O(N) 每写全量重建（review 修复）。
+    /// 判定。管理器会拒绝饱和索引中的新增节点；已有节点的刷新则可从
+    /// 已更新的 SoT 重建，回收该刷新产生的旧物理节点。
     fn is_physically_saturated(&self) -> bool {
+        false
+    }
+
+    /// 当前是否包含一个活跃节点。物理槽位饱和时，管理器据此区分会增加
+    /// 活跃条目的新增写入（应拒绝）与同 id 刷新（可请求从 SoT 重建）。
+    fn contains_node(&self, _node_id: &str) -> bool {
         false
     }
 
@@ -355,6 +361,19 @@ pub trait VectorIndexManager: MaybeSendSync {
         query: &[f32],
         top_k: usize,
     ) -> Result<Vec<(String, f32)>, MemoryError>;
+
+    /// 将指定 namespace 的派生数据落盘（Native 写 hnsw_cache；Web no-op）。
+    /// 尚未物化（Pending）的索引无内存派生数据可持久化，跳过。
+    /// `embeddings` 是 Source of Truth，hnsw_cache 缺失不影响正确性（§15）。
+    async fn save_index(&self, _namespace: MemoryNamespace) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    /// 关闭前保存全部**已物化**索引的派生数据（默认 no-op；Native 覆盖为
+    /// HNSW 落盘）。不得阻塞每次 assistant stream（§15 生命周期约定）。
+    async fn save_all(&self) -> Result<(), MemoryError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

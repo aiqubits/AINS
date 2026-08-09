@@ -5,15 +5,20 @@ use serde_json::Value;
 use crate::kernel::messages::ConversationMessage;
 use crate::kernel::state::CompactTrigger;
 use crate::model_client::UsageSnapshot;
+use crate::tools::ToolMetadata;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StreamEvent {
     /// 助手文本增量（基线 AssistantTextDelta）。
     AssistantTextDelta { text: String },
-    /// 一个模型 turn 完成，携带完整 assistant 消息与用量（基线 AssistantTurnComplete）。
+    /// 一个模型 turn 完成，携带完整 assistant 消息、用量与 turn 级
+    /// tool metadata（基线 AssistantTurnComplete）。
     AssistantTurnComplete {
         message: ConversationMessage,
         usage: UsageSnapshot,
+        /// P2（§10.2）：turn 级结构化 tool metadata；checkpoint 的
+        /// current_state / active_artifacts 等字段由此映射。
+        tool_metadata: ToolMetadata,
     },
     /// 工具开始执行（基线 ToolExecutionStarted）。
     ToolExecutionStarted {
@@ -31,6 +36,10 @@ pub enum StreamEvent {
         output: String,
         is_error: bool,
         metadata: Value,
+        /// Tool dispatch has completed before this event is emitted, so this
+        /// is the current session-wide metadata. Hosts persist it alongside
+        /// the tool-result conversation snapshot for crash-safe recovery.
+        tool_metadata: ToolMetadata,
     },
     /// 错误上报（基线 ErrorEvent）；`recoverable = false` 表示会话已不可续。
     Error { message: String, recoverable: bool },
@@ -40,5 +49,16 @@ pub enum StreamEvent {
     CompactProgress {
         phase: String,
         trigger: CompactTrigger,
+    },
+    /// 压缩**完成**事件（§11.1）：仅 `run_compaction` 实际发生压缩
+    /// （`was_compacted == true`）后 emit 一次。宿主以它为 checkpoint /
+    /// extraction 的触发器，但必须使用自己保留的未折叠 ConversationMirror
+    /// 快照；不能把 Kernel 的压缩工作上下文覆盖到会话持久化中。
+    /// `tool_metadata` 是压缩发生时的当前状态，不能复用工具调用前的
+    /// `AssistantTurnComplete` 快照。`CompactProgress` 是多次进度事件，
+    /// 不可作为生产写入触发。
+    Compacted {
+        trigger: CompactTrigger,
+        tool_metadata: ToolMetadata,
     },
 }

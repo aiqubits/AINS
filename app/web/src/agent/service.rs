@@ -4,17 +4,20 @@
 //! 工具集；桥接协议（channel 结构）双端一致。desktop 端经 `#[path]`
 //! 引用本文件复用同一实现。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use futures::channel::mpsc;
 
-use agent_core::context::session::{SessionSaveInput, SessionStore};
+use agent_core::context::session::{SessionSaveInput, SessionStore, project_slug};
 use agent_core::kernel::{
-    AgentEvent, AgentKernel, AgentKernelConfig, ConversationMessage, StreamEvent,
+    AgentEvent, AgentKernel, AgentKernelConfig, AsyncSystemPromptProvider, ConversationMessage,
+    StreamEvent,
 };
-use agent_core::memory::{KvStore, MemdirStore};
+use agent_core::memory::{
+    KvStore, MemdirStore, MemoryContext, MemoryHit, MemoryService, MemoryStores, open_memory_stores,
+};
 use agent_core::model_client::UsageSnapshot;
 use agent_core::model_service::GatewayModelClient;
 use agent_core::policy::{PermissionEngine, PermissionMode, PermissionSettings, SandboxPolicy};
@@ -24,7 +27,7 @@ use agent_core::tools::compute::{CalculatorTool, DateTool, JsonTool, MarkdownToo
 use agent_core::tools::interact::TodoWriteTool;
 use agent_core::tools::interact::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool};
 use agent_core::tools::network::WebFetchTool;
-use agent_core::tools::{ToolCategory, ToolRuntime};
+use agent_core::tools::{ToolCategory, ToolMetadata, ToolRuntime};
 use client_api::Client;
 use ui::{
     PERSIST_IDLE, PERSIST_PENDING, PERSIST_STATE, TOOL_STATE_LOAD_ERROR, persist_task_in_flight,
@@ -499,11 +502,16 @@ pub struct AgentBridge {
     /// turn / 工具批边界中止本次查询并原子消费标志。宿主不应在发送新消息时
     /// 主动清除它，否则 Stop→Send 的竞态可能让旧查询恢复执行。
     pub interrupt: Arc<AtomicBool>,
-    pub session_store: Arc<SessionStore>,
+    /// Account-scoped persistent sessions. Web owner resolution failure leaves
+    /// this absent so an unaffiliated shared IndexedDB store is never read or
+    /// written; the live Agent remains usable without persistence.
+    pub session_store: Option<Arc<SessionStore>>,
     /// 上次会话恢复的历史（已 sanitize；用于首屏渲染与镜像初始化）。
     pub restored_messages: Vec<ConversationMessage>,
     pub session_id: Option<String>,
     pub cwd: String,
+    /// 生产 MemoryService（每 session 实例；禁用时为 None）。
+    pub memory: Option<Arc<MemoryService>>,
 }
 
 impl AgentBridge {
@@ -513,58 +521,513 @@ impl AgentBridge {
     }
 }
 
+/// 打开平台存储 backend（Web: IndexedDB；Native: redb）。
+///
+/// 进程内共享单例：redb 为单进程独占锁，MemoryService 与 SessionStore /
+/// skills / tool states 必须复用同一 backend（§6.1：native 不得为
+/// MemoryService 二次打开同一 redb 文件）；IndexedDB 虽支持多连接，
+/// 为行为一致同样缓存。
+// 双端统一用 Arc（native 多线程需要；wasm 单线程下非 Send 无害）
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+async fn open_backend() -> Result<Arc<agent_core::memory::MemoryBackend>, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::rc::Rc;
+        thread_local! {
+            static BACKEND_CACHE: Rc<AsyncInitCache<Arc<agent_core::memory::MemoryBackend>>> =
+                Rc::new(AsyncInitCache::new());
+        }
+        // A RefCell check-then-await cache is racy even on wasm's single
+        // thread: another task can enter while IndexedDB::open is pending.
+        // Serialize initialization and re-check the cache after acquiring the
+        // gate so every caller receives the same backend handle.
+        let cache = BACKEND_CACHE.with(Rc::clone);
+        cache
+            .get_or_try_init(async {
+                use agent_core::memory::IndexedDbBackend;
+                let backend = IndexedDbBackend::open("ains-agent")
+                    .await
+                    .map_err(|e| format!("IndexedDB: {e}"))?;
+                Ok(Arc::new(agent_core::memory::MemoryBackend::Web(Arc::new(
+                    backend,
+                ))))
+            })
+            .await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use agent_core::memory::RedbBackend;
+        use std::sync::Mutex;
+        static BACKEND_CACHE: Mutex<Option<Arc<agent_core::memory::MemoryBackend>>> =
+            Mutex::new(None);
+        let mut cache = BACKEND_CACHE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(backend) = cache.as_ref() {
+            return Ok(Arc::clone(backend));
+        }
+        let path = native_data_path()?;
+        let backend =
+            RedbBackend::open(&path).map_err(|e| format!("redb {}: {e}", path.display()))?;
+        let backend = Arc::new(agent_core::memory::MemoryBackend::Native(Arc::new(backend)));
+        *cache = Some(Arc::clone(&backend));
+        Ok(backend)
+    }
+}
+
+/// 打开 5 张逻辑表的统一句柄集合（MemoryStores，§6.2）。
+/// 加密装配：kv 表 legacy 兼容模式，其余 4 表 table domain 模式。
+/// Web（IndexedDB）由浏览器安全边界保护，不引入 native storage key。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+async fn open_memory_stores_handle() -> Result<MemoryStores, String> {
+    // MemoryStores 不只是五张表的 handle：它还承载跨 session 共享的
+    // MemoryEngine/VectorIndex。与 backend 一样必须进程内缓存，否则不同
+    // Agent session 会各自 materialize 一份索引，写入无法即时互相可见。
+    #[cfg(target_arch = "wasm32")]
+    {
+        use std::rc::Rc;
+        thread_local! {
+            static STORES_CACHE: Rc<AsyncInitCache<MemoryStores>> =
+                Rc::new(AsyncInitCache::new());
+        }
+        // See open_backend: the stores cache also contains the shared engine
+        // and vector indexes, so it needs the same in-flight initialization
+        // gate rather than a check-then-await RefCell cache.
+        let cache = STORES_CACHE.with(Rc::clone);
+        cache
+            .get_or_try_init(async {
+                let backend = open_backend().await?;
+                Ok(open_memory_stores(&backend, None))
+            })
+            .await
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::sync::Mutex;
+        static STORES_CACHE: Mutex<Option<MemoryStores>> = Mutex::new(None);
+        if let Some(stores) = STORES_CACHE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .as_ref()
+            .cloned()
+        {
+            return Ok(stores);
+        }
+        let backend = open_backend().await?;
+        let key = native_storage_encryption_key()?;
+        if let Some(key) = key.as_ref() {
+            // 先检测 plaintext→encrypted 转换，禁止直接套 wrapper。需要清空
+            // 旧数据时必须由部署方显式设置 reset 开关；默认返回可操作错误。
+            agent_core::memory::prepare_encryption(
+                &backend,
+                key,
+                native_storage_encryption_reset_requested()?,
+            )
+            .await
+            .map_err(|e| format!("storage encryption transition: {e}"))?;
+        }
+        let stores = open_memory_stores(&backend, key);
+        let mut cache = STORES_CACHE
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if let Some(existing) = cache.as_ref() {
+            return Ok(existing.clone());
+        }
+        *cache = Some(stores.clone());
+        Ok(stores)
+    }
+}
+
+/// A task-local async singleton used by Web's thread-local backend caches.
+///
+/// `RefCell<Option<T>>` alone cannot protect an async initializer: every task
+/// that observes `None` before the first await can construct a separate value.
+/// The mutex is intentionally held across initialization, then the cache is
+/// rechecked after acquiring it. This type is only used on wasm in production;
+/// native unit tests exercise the interleaving behavior.
+#[cfg(any(target_arch = "wasm32", test))]
+struct AsyncInitCache<T> {
+    value: std::cell::RefCell<Option<T>>,
+    gate: futures::lock::Mutex<()>,
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+impl<T: Clone> AsyncInitCache<T> {
+    const fn new() -> Self {
+        Self {
+            value: std::cell::RefCell::new(None),
+            gate: futures::lock::Mutex::new(()),
+        }
+    }
+
+    async fn get_or_try_init<E>(
+        &self,
+        initializer: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        if let Some(value) = self.value.borrow().clone() {
+            return Ok(value);
+        }
+        let _gate = self.gate.lock().await;
+        if let Some(value) = self.value.borrow().clone() {
+            return Ok(value);
+        }
+        let value = initializer.await?;
+        *self.value.borrow_mut() = Some(value.clone());
+        Ok(value)
+    }
+}
+
 /// 打开平台 KvStore 后端（Web: IndexedDB；Native: redb）。
 ///
 /// 进程内共享单例：redb 为单进程独占锁，/agent 与 /skills 视图必须
 /// 复用同一句柄；IndexedDB 虽支持多连接，为行为一致同样缓存。
+/// backend 层缓存见 [`open_backend`]（MemoryService 与既有调用方共享
+/// 同一 backend，避免二次打开 redb 独占锁文件）。
 // 双端统一用 Arc（native 多线程需要；wasm 单线程下非 Send 无害）
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 async fn open_kv_store() -> Result<Arc<dyn KvStore>, String> {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use std::cell::RefCell;
-        thread_local! {
-            static KV_CACHE: RefCell<Option<Arc<dyn KvStore>>> = const { RefCell::new(None) };
-        }
-        if let Some(kv) = KV_CACHE.with(|cache| cache.borrow().clone()) {
-            return Ok(kv);
-        }
-        use agent_core::memory::IndexedDbKvStore;
-        let kv: Arc<dyn KvStore> = Arc::new(
-            IndexedDbKvStore::open("ains-agent")
-                .await
-                .map_err(|e| format!("IndexedDB: {e}"))?,
-        );
-        KV_CACHE.with(|cache| *cache.borrow_mut() = Some(Arc::clone(&kv)));
-        Ok(kv)
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        use agent_core::memory::{EncryptedKvStore, RedbKvStore};
-        use std::sync::Mutex;
-        // 仅缓存成功句柄：瞬时打开失败（如另一进程持锁）不被永久缓存，
-        // 重访 /agent 或 /skills 可重试。持锁期间完成“查缓存→打开→
-        // 写缓存”（open 为同步调用，无跨 await 持锁）：并发首次调用
-        // 不会双开 redb 独占锁文件而误报初始化失败。
-        static KV_CACHE: Mutex<Option<Arc<dyn KvStore>>> = Mutex::new(None);
-        let mut cache = KV_CACHE.lock().unwrap_or_else(|poison| poison.into_inner());
-        if let Some(kv) = cache.as_ref() {
-            return Ok(Arc::clone(kv));
-        }
-        let path = native_data_path()?;
-        let raw: Arc<dyn KvStore> = Arc::new(
-            RedbKvStore::open(&path).map_err(|e| format!("redb {}: {e}", path.display()))?,
-        );
-        // 静态加密的密钥必须来自数据库之外的秘密管理面。故不自动生成并写入
-        // `AINS_DATA_DIR`（那样的“加密”在磁盘失窃时无法提供保护）。运维可以从系统钥匙串 /
-        // secrets manager 注入 AINS_STORAGE_KEY_HEX，以显式启用。
-        let store: Arc<dyn KvStore> = match native_storage_encryption_key()? {
-            Some(key) => Arc::new(EncryptedKvStore::new(raw, key)),
-            None => raw,
+    let stores = open_memory_stores_handle().await?;
+    Ok(stores.kv)
+}
+
+/// 动态 memory recall provider（§12）：Kernel Querying 构造 ModelRequest
+/// 前 await 一次，以最近 human user 文本为查询做 scoped recall。
+/// embed/search 任一失败返回 `None`（回落 base system prompt + permission
+/// mode；Memory 失败不阻断主 Agent）。
+/// 同一 human query 的召回缓存窗口（§12.1）：工具循环内多次 Querying 轮
+/// 复用已注入结果，避免重复 embed/search。缓存同时绑定 MemoryService 的
+/// content revision；成功写入后下一轮即失效，不能牺牲 Turn N→N+1 的召回
+/// 正确性。
+const MEMORY_PROVIDER_CACHE_TTL_MS: i64 = 15_000;
+/// Bound the session-local cache even when a long-running conversation has a
+/// stream of unique prompts. Entries are cheap, but retaining every expired
+/// query for the lifetime of a session makes the nominal TTL ineffective.
+const MEMORY_PROVIDER_CACHE_MAX_ENTRIES: usize = 64;
+
+struct MemoryProvider {
+    service: Arc<MemoryService>,
+    /// session-local query → (prompt, cache_until_ms, content_revision) 缓存。
+    /// provider 每 session 一个实例，缓存天然 session 隔离；`cache_until_ms`
+    /// 同时受窗口与召回结果最早 TTL 限制，避免到期记忆继续进入 prompt。
+    cache: RwLock<HashMap<String, (String, i64, u64)>>,
+}
+
+impl MemoryProvider {
+    /// Replace one cached recall result while pruning expired values and
+    /// keeping a deterministic hard upper bound. We evict the earliest-expiry
+    /// live entry when the cache is full; correctness is preserved because a
+    /// miss simply performs a fresh scoped recall.
+    fn cache_result(
+        &self,
+        query: String,
+        prompt: String,
+        cache_until: i64,
+        revision: u64,
+        now: i64,
+    ) {
+        let Ok(mut cache) = self.cache.write() else {
+            return;
         };
-        *cache = Some(Arc::clone(&store));
-        Ok(store)
+        cache.retain(|_, (_, expires_at, _)| *expires_at > now);
+        if !cache.contains_key(&query) {
+            while cache.len() >= MEMORY_PROVIDER_CACHE_MAX_ENTRIES {
+                let eviction = cache
+                    .iter()
+                    .min_by_key(|(_, (_, expires_at, _))| *expires_at)
+                    .map(|(key, _)| key.clone());
+                let Some(eviction) = eviction else {
+                    break;
+                };
+                cache.remove(&eviction);
+            }
+        }
+        cache.insert(query, (prompt, cache_until, revision));
     }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl AsyncSystemPromptProvider for MemoryProvider {
+    async fn provide(&self, messages: &[ConversationMessage]) -> Option<String> {
+        // §12.1：取最近 human user 文本；跳过只包含 ToolResult 的 user 消息。
+        let query = messages.iter().rev().find_map(|message| {
+            if message.role != agent_core::kernel::Role::User {
+                return None;
+            }
+            let text = message.text();
+            let has_tool_result = message
+                .content
+                .iter()
+                .any(|block| matches!(block, agent_core::kernel::ContentBlock::ToolResult { .. }));
+            (!has_tool_result && !text.trim().is_empty()).then_some(text)
+        })?;
+        // 短窗口内同 query 复用（含空结果，避免对无记忆 query 反复 embed）。
+        let now = agent_core::memory::now_ms();
+        let revision = self.service.revision();
+        if let Ok(cache) = self.cache.read()
+            && let Some((prompt, cache_until, cached_revision)) = cache.get(&query)
+            && now < *cache_until
+            && *cached_revision == revision
+        {
+            return (!prompt.is_empty()).then_some(prompt.clone());
+        }
+        let top_k = self.service.top_k_inject();
+        let (prompt, earliest_expiry) = self.service.memory_prompt_with_expiry(&query, top_k).await;
+        let cache_until = now
+            .saturating_add(MEMORY_PROVIDER_CACHE_TTL_MS)
+            .min(earliest_expiry.unwrap_or(i64::MAX));
+        // 用检索开始时的版本标记结果。若其他 session 在 await 期间写入，
+        // 当前 prompt 可能尚未包含该写入；把它标成结束后的新 revision 会
+        // 让旧结果在缓存窗口内被错误复用。保留旧 revision 使下一次调用
+        // 必然失效并重新检索。
+        self.cache_result(query, prompt.clone(), cache_until, revision, now);
+        (!prompt.is_empty()).then_some(prompt)
+    }
+}
+
+/// 装配生产 MemoryService（每 session 实例；配置禁用或装配失败时返回
+/// `None`——Memory 任一失败不阻断主 Agent，观测信息记录在 service 内）。
+/// 配置来自 [`MemoryServiceConfig::from_env`]（§18；web 无 env 走默认值），
+/// 不再硬编码 enabled。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+async fn build_memory_service(
+    model: &Arc<agent_core::model_service::GatewayModelClient<Rt>>,
+    cwd: &str,
+    session_id: Option<&str>,
+    owner_id: &str,
+) -> Option<Arc<MemoryService>> {
+    let config = agent_core::memory::MemoryServiceConfig::from_env();
+    if !config.enabled {
+        tracing::info!("memory service disabled by config");
+        return None;
+    }
+    let stores = match open_memory_stores_handle().await {
+        Ok(stores) => stores,
+        Err(e) => {
+            tracing::warn!("memory service stores unavailable: {e}");
+            return None;
+        }
+    };
+    // 与 SessionStore 的项目身份来源一致（§3.1）：project_slug(cwd)。
+    let project_key = project_slug(cwd);
+    // 防御分支：正常由 initialize 预生成提供（同源 generate_session_id），
+    // 此处仅防未来调用方漏传——不再退化为跨会话共享的字面量占位。
+    let session_id = match session_id {
+        Some(id) => id.to_string(),
+        None => {
+            agent_core::context::session::generate_session_id(agent_core::memory::now_ms(), cwd)
+        }
+    };
+    let context = MemoryContext::for_owner(project_key, session_id, owner_id);
+    match MemoryService::new(
+        stores,
+        Arc::clone(model) as Arc<dyn agent_core::model_client::ModelClient>,
+        context,
+        config,
+    )
+    .await
+    {
+        Ok(service) => {
+            let service = Arc::new(service);
+            // P3 documents：配置显式开启时，在会话装配阶段索引受限的项目
+            // 指令文件；随后 MemoryProvider 的动态 prompt 会消费 scoped
+            // `search_project_docs` 结果。失败只降级 documents，不阻断 Agent。
+            #[cfg(not(target_arch = "wasm32"))]
+            if service.project_document_index_enabled()
+                && let Err(e) = service.index_project_docs(std::path::Path::new(cwd)).await
+            {
+                tracing::warn!("project document indexing failed: {e}");
+            }
+            Some(service)
+        }
+        Err(e) => {
+            tracing::warn!("memory service init failed: {e}");
+            None
+        }
+    }
+}
+
+/// Run durable extraction under the strongest session lock available on the
+/// host. `MemoryStores` already serializes independent service instances in a
+/// single runtime; browsers additionally need an origin-wide lock because each
+/// tab has its own WASM runtime but can restore the same IndexedDB snapshot.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn extract_durable_serialized(
+    memory: Arc<MemoryService>,
+    messages: Vec<ConversationMessage>,
+    reason: agent_core::memory::ExtractionReason,
+) -> Result<agent_core::memory::ExtractionOutcome, agent_core::error::MemoryError> {
+    memory.extract_durable(messages, reason).await
+}
+
+/// The Web Locks API is an origin-wide mutex: unlike an in-memory Rust mutex,
+/// it coordinates separate browser tabs that share IndexedDB. If unavailable,
+/// extraction fails closed while the primary Agent conversation remains usable;
+/// running without a lock would reintroduce duplicate, non-deterministic
+/// durable-memory writes.
+#[cfg(target_arch = "wasm32")]
+async fn with_web_lock<T>(
+    lock_name: &str,
+    operation: impl std::future::Future<Output = Result<T, agent_core::error::MemoryError>>,
+) -> Result<T, agent_core::error::MemoryError> {
+    use futures::channel::oneshot;
+    use wasm_bindgen::{JsCast, JsValue, closure::Closure};
+    use wasm_bindgen_futures::{JsFuture, future_to_promise};
+
+    let navigator = web_sys::window()
+        .ok_or_else(|| agent_core::error::MemoryError::Storage("window unavailable".into()))?
+        .navigator();
+    let locks = js_sys::Reflect::get(&navigator, &JsValue::from_str("locks"))
+        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks unavailable".into()))?;
+    if locks.is_null() || locks.is_undefined() {
+        return Err(agent_core::error::MemoryError::Storage(
+            "Web Locks unavailable".into(),
+        ));
+    }
+    let request = js_sys::Reflect::get(&locks, &JsValue::from_str("request"))
+        .map_err(|_| {
+            agent_core::error::MemoryError::Storage("Web Locks request unavailable".into())
+        })?
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| {
+            agent_core::error::MemoryError::Storage("Web Locks request unavailable".into())
+        })?;
+
+    let (acquired_tx, acquired_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let callback = Closure::once_into_js(move |_lock: JsValue| -> js_sys::Promise {
+        let _ = acquired_tx.send(());
+        future_to_promise(async move {
+            // Sender drop (for example, task cancellation) releases the lock.
+            let _ = release_rx.await;
+            Ok(JsValue::UNDEFINED)
+        })
+    });
+    let callback = callback.dyn_into::<js_sys::Function>().map_err(|_| {
+        agent_core::error::MemoryError::Storage("Web Locks callback unavailable".into())
+    })?;
+    let request_promise = request
+        .call2(&locks, &JsValue::from_str(lock_name), &callback)
+        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks request failed".into()))?
+        .dyn_into::<js_sys::Promise>()
+        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks request failed".into()))?;
+
+    acquired_rx.await.map_err(|_| {
+        agent_core::error::MemoryError::Storage("Web Locks acquisition failed".into())
+    })?;
+    let result = operation.await;
+    let _ = release_tx.send(());
+    if JsFuture::from(request_promise).await.is_err() && result.is_ok() {
+        return Err(agent_core::error::MemoryError::Storage(
+            "Web Locks release failed".into(),
+        ));
+    }
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn extract_durable_serialized(
+    memory: Arc<MemoryService>,
+    messages: Vec<ConversationMessage>,
+    reason: agent_core::memory::ExtractionReason,
+) -> Result<agent_core::memory::ExtractionOutcome, agent_core::error::MemoryError> {
+    let lock_name = memory.extraction_lock_name();
+    with_web_lock(&lock_name, memory.extract_durable(messages, reason)).await
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod web_lock_tests {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use gloo_timers::future::TimeoutFuture;
+    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
+
+    use super::with_web_lock;
+    use agent_core::error::MemoryError;
+
+    wasm_bindgen_test_configure!(run_in_browser);
+
+    #[wasm_bindgen_test]
+    async fn web_locks_serialize_same_name_operations_and_release_after_completion() {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let lock_name = format!("ains-web-lock-regression-{}", agent_core::memory::now_ms());
+
+        let first_trace = Rc::clone(&trace);
+        let first = with_web_lock(&lock_name, async move {
+            first_trace.borrow_mut().push("first-acquired");
+            // Keep the critical section pending long enough for the second
+            // request to enqueue against the same browser-global lock.
+            TimeoutFuture::new(20).await;
+            first_trace.borrow_mut().push("first-released");
+            Ok::<(), MemoryError>(())
+        });
+        let second_trace = Rc::clone(&trace);
+        let second = with_web_lock(&lock_name, async move {
+            second_trace.borrow_mut().push("second-acquired");
+            Ok::<(), MemoryError>(())
+        });
+
+        let (first, second) = futures::join!(first, second);
+        first.expect("first lock operation succeeds");
+        second.expect("second lock operation succeeds after the first releases");
+        assert_eq!(
+            trace.borrow().clone(),
+            ["first-acquired", "first-released", "second-acquired"],
+            "the same Web Locks name must serialize the critical sections"
+        );
+    }
+}
+
+/// Resolve the durable-memory owner before creating a Web memory context.
+/// IndexedDB is shared by every account that uses the same browser profile,
+/// so using the workspace alone would expose the prior account's Private and
+/// Project memories after logout/login. Native builds retain their existing
+/// single-local-user semantics.
+#[cfg(target_arch = "wasm32")]
+async fn resolve_memory_owner(client: &Client) -> Result<String, String> {
+    let user = client
+        .get_me()
+        .await
+        .map_err(|e| format!("resolve memory owner: {e}"))?;
+    if user.id.trim().is_empty() {
+        return Err("resolve memory owner: authenticated user id is empty".to_string());
+    }
+    Ok(user.id)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_memory_owner(_client: &Client) -> Result<String, String> {
+    Ok("local".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::arc_with_non_send_sync)]
+fn session_store_for_owner(kv: Arc<dyn KvStore>, owner_id: &str) -> Arc<SessionStore> {
+    Arc::new(SessionStore::new_scoped(
+        kv,
+        agent_core::memory::owner_key_for_id(owner_id),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn session_store_for_owner(kv: Arc<dyn KvStore>, _owner_id: &str) -> Arc<SessionStore> {
+    // Preserve Native's existing single-user keys and migration compatibility.
+    Arc::new(SessionStore::new(kv))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::arc_with_non_send_sync)]
+fn memdir_store_for_owner(kv: Arc<dyn KvStore>, owner_id: &str) -> Arc<MemdirStore> {
+    Arc::new(MemdirStore::new_scoped(
+        kv,
+        agent_core::memory::owner_key_for_id(owner_id),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn memdir_store_for_owner(kv: Arc<dyn KvStore>, _owner_id: &str) -> Arc<MemdirStore> {
+    Arc::new(MemdirStore::new(kv))
 }
 
 /// Native storage-encryption key environment variable.  The value is exactly
@@ -575,6 +1038,10 @@ async fn open_kv_store() -> Result<Arc<dyn KvStore>, String> {
 /// requires the documented one-time migration through [`EncryptedKvStore`].
 #[cfg(not(target_arch = "wasm32"))]
 const STORAGE_KEY_ENV: &str = "AINS_STORAGE_KEY_HEX";
+/// 显式确认清空现有明文数据后再开启 `AINS_STORAGE_KEY_HEX`。这是不可逆
+/// 操作，缺省值 false；正常部署应先完成外部迁移，而不是设置该变量。
+#[cfg(not(target_arch = "wasm32"))]
+const STORAGE_ENCRYPTION_RESET_ENV: &str = "AINS_STORAGE_ENCRYPTION_RESET";
 
 /// Load a deployment-managed key for native local storage.  Invalid key
 /// material fails startup rather than silently disabling encryption.
@@ -588,6 +1055,23 @@ fn native_storage_encryption_key() -> Result<Option<agent_core::memory::Encrypti
         .map_err(|_| format!("{STORAGE_KEY_ENV} must contain ASCII hexadecimal key material"))?;
     let bytes = parse_storage_key_hex(&raw)?;
     Ok(Some(agent_core::memory::EncryptionKey::from_bytes(bytes)))
+}
+
+/// 读取一次性 reset 确认。只接受精确值 `1`，避免 `true` / 拼写错误等宽松
+/// 配置意外触发数据清空。
+#[cfg(not(target_arch = "wasm32"))]
+fn native_storage_encryption_reset_requested() -> Result<bool, String> {
+    match std::env::var(STORAGE_ENCRYPTION_RESET_ENV) {
+        Ok(value) if value == "1" => Ok(true),
+        Ok(value) if value.trim().is_empty() || value == "0" => Ok(false),
+        Ok(_) => Err(format!(
+            "{STORAGE_ENCRYPTION_RESET_ENV} must be exactly 1 to explicitly reset existing plaintext storage"
+        )),
+        Err(std::env::VarError::NotPresent) => Ok(false),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{STORAGE_ENCRYPTION_RESET_ENV} must be ASCII 1 when set"
+        )),
+    }
 }
 
 /// Decode exactly 256 bits of external key material without including the
@@ -627,10 +1111,53 @@ pub async fn open_skill_store() -> Result<Arc<KvSkillStore>, String> {
     Ok(Arc::new(KvSkillStore::new(open_kv_store().await?)))
 }
 
+/// 生产 durable memory manifest 的轻量入口（§9.4 / P2 `/memory` 向量搜索）：
+/// 无 MemoryService 实例，直接读 `memories` 表并按当前项目可见性过滤。
+/// 返回 `[{type}] {title} ({age}) - {description}` 行（≤80 条）。
+pub async fn open_durable_manifest(client: Client) -> Result<Vec<String>, String> {
+    use agent_core::memory::build_durable_manifest;
+    let stores = open_memory_stores_handle().await?;
+    let project_key = project_slug(&bridge_cwd()?);
+    let owner = resolve_memory_owner(&client).await?;
+    let context = MemoryContext::for_owner(project_key, "manifest", owner);
+    build_durable_manifest(&*stores.memories, &context)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// `/memory` 的 scoped semantic search 入口（P2）。与 Agent 的动态 provider
+/// 复用同一组 MemoryStores / embedding contract / scope + TTL 过滤；浏览器视图
+/// 不得直接扫描 embeddings 表绕过这些授权边界。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+pub async fn search_durable_memory(
+    client: Client,
+    query: &str,
+    top_k: usize,
+) -> Result<Vec<MemoryHit>, String> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    let cwd = bridge_cwd()?;
+    let owner = resolve_memory_owner(&client).await?;
+    let model = GatewayModelClient::<Rt>::shared(client.clone());
+    let service = build_memory_service(&model, &cwd, Some("memory-browser"), &owner)
+        .await
+        .ok_or_else(|| "memory service is unavailable or disabled".to_string())?;
+    service
+        .search(query, top_k.clamp(1, 20))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Memory 浏览器的轻量入口（Phase 6.6）：打开 memdir 长期记忆库。
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
-pub async fn open_memory_store() -> Result<Arc<MemdirStore>, String> {
-    Ok(Arc::new(MemdirStore::new(open_kv_store().await?)))
+pub async fn open_memory_store(client: Client) -> Result<Arc<MemdirStore>, String> {
+    // Unlike durable-vector reads, MemdirStore has no per-record visibility
+    // metadata. Resolve the account before opening it so a failed lookup never
+    // falls back to the legacy shared Web keys.
+    let owner = resolve_memory_owner(&client).await?;
+    Ok(memdir_store_for_owner(open_kv_store().await?, &owner))
 }
 
 /// snapshot 的 workspace 占位路径（native 端 cwd 不可用时回退）。
@@ -742,13 +1269,22 @@ fn bridge_cwd() -> Result<String, String> {
 ///   句柄相对文件系统实现；
 /// - Shell + 系统集成：仅 Desktop 原生（Mobile 的 Android/iOS 应用沙箱禁止/
 ///   无法有用地派生子进程；Web 由浏览器隔离）。
+///
+/// 返回 memory_read / memory_write 工具的共享句柄（P3）：工具在装配期始终
+/// 注册（注册集静态稳定），会话装配完成 MemoryService 后由调用方 attach。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 fn register_tools(
     runtime: &mut ToolRuntime,
     engine: &Arc<PermissionEngine>,
     interaction: Arc<UiInteraction>,
     policy: &SandboxPolicy,
     workspace: Option<&std::path::Path>,
+) -> (
+    Arc<agent_core::tools::memory::MemoryReadTool>,
+    Arc<agent_core::tools::memory::MemoryWriteTool>,
 ) {
+    let memory_read = Arc::new(agent_core::tools::memory::MemoryReadTool::new());
+    let memory_write = Arc::new(agent_core::tools::memory::MemoryWriteTool::new());
     #[cfg(target_arch = "wasm32")]
     let _ = workspace;
     runtime.register(Box::new(CalculatorTool));
@@ -765,6 +1301,10 @@ fn register_tools(
     runtime.register(Box::new(ExitPlanModeTool::new(Arc::clone(engine))));
     // web_fetch 携带网络域名策略（Layer 1，全平台生效；Web 仍 fail-closed）
     runtime.register(Box::new(WebFetchTool::new(policy.network.clone())));
+    // P3 Memory 工具：全平台注册（Web 端 MemoryService 同样可用）；
+    // service 由调用方在会话装配完成后 attach（clone 共享内部 RwLock）。
+    runtime.register(Box::new((*memory_read).clone()));
+    runtime.register(Box::new((*memory_write).clone()));
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -828,6 +1368,7 @@ fn register_tools(
              dynamic registration requires cache invalidation"
         );
     }
+    (memory_read, memory_write)
 }
 
 /// 装配 Agent 会话。`client` 由宿主提供（Web 复用已认证的 AuthState
@@ -858,8 +1399,6 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     // 从存储同步到进程级 PERSIST_ERROR 信号（与 /tools 挂载对称），此处
     // 不再桥接——会话存活期间的落盘结果由落盘任务失败/成功直接写信号
     // 实时反映（review Minor 1 修复）。
-    let session_store = Arc::new(SessionStore::new(Arc::clone(&kv)));
-
     // Sandbox 策略（Layer 1 + Layer 2 共用源）：默认把 Agent 工作区作为
     // 唯一可读写根目录。不要把空策略传给权限引擎，否则 read-only 文件工具
     // 会允许读取工作区之外的任意主机路径。
@@ -882,7 +1421,7 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     // 幂等：后续装配仅读取。
     let _ = registered_tool_names();
     let mut runtime = ToolRuntime::new();
-    register_tools(
+    let (memory_read, memory_write) = register_tools(
         &mut runtime,
         &engine,
         interaction,
@@ -902,24 +1441,79 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         cwd: cwd.clone().into(),
         ..AgentKernelConfig::default()
     };
-    let model = GatewayModelClient::<Rt>::shared(client);
-    let (mut kernel, event_tx, stream_rx) = AgentKernel::<Rt>::with_runtime(model, runtime, config);
-    let interrupt = kernel.interrupt_handle();
+    let model = GatewayModelClient::<Rt>::shared(client.clone());
+    // Web IndexedDB is shared by every account in a browser profile. Resolve
+    // the owner before touching session/memdir keys; if this lookup fails,
+    // persistence is disabled for this bridge rather than falling back to the
+    // legacy shared namespace.
+    let storage_owner = match resolve_memory_owner(&client).await {
+        Ok(owner) => Some(owner),
+        Err(e) => {
+            tracing::warn!("persistent storage owner unavailable: {e}");
+            None
+        }
+    };
+    let session_store = storage_owner
+        .as_deref()
+        .map(|owner| session_store_for_owner(Arc::clone(&kv), owner));
 
-    // 会话恢复：latest 快照种子进 Kernel 上下文（快照落盘前已 sanitize）
+    // 会话恢复：latest 快照种子进 Kernel 上下文（快照落盘前已 sanitize）。
+    // 先读取快照（不依赖 kernel），session_id 供 MemoryService 装配。
     let mut restored_messages = Vec::new();
     let mut session_id = None;
-    match session_store.load_latest(&cwd).await {
-        Ok(Some(snapshot)) => {
-            restored_messages = snapshot.messages.clone();
-            session_id = Some(snapshot.session_id);
-            kernel.context_mut().conversation = snapshot.messages;
+    let mut restored_snapshot = None;
+    if let Some(session_store) = &session_store {
+        match session_store.load_latest(&cwd).await {
+            Ok(Some(snapshot)) => {
+                restored_messages = snapshot.messages.clone();
+                session_id = Some(snapshot.session_id.clone());
+                restored_snapshot = Some(snapshot);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                // 恢复失败不阻断新会话（损坏快照会被下一次保存覆盖）
+                tracing::warn!("session restore failed: {err}");
+            }
         }
-        Ok(None) => {}
-        Err(err) => {
-            // 恢复失败不阻断新会话（损坏快照会被下一次保存覆盖）
-            tracing::warn!("session restore failed: {err}");
+    }
+
+    // 生产 MemoryService：每 session 实例；装配失败不阻断 Agent。
+    // 新会话预生成 session_id（与 SessionStore::save 自动生成路径同源）：
+    // MemoryService 的 checkpoint / digest / status key 与后续快照落盘使用
+    // 同一 id；save_snapshot 失败时也不会退化为跨会话共享的字面量占位。
+    if session_id.is_none() {
+        session_id = Some(agent_core::context::session::generate_session_id(
+            agent_core::memory::now_ms(),
+            &cwd,
+        ));
+    }
+    let memory = match storage_owner.as_deref() {
+        Some(owner) => build_memory_service(&model, &cwd, session_id.as_deref(), owner).await,
+        None => {
+            // Durable memory is fail-closed when the account cannot be resolved;
+            // the main Agent remains usable without recall/extraction.
+            None
         }
+    };
+    // P3：memory_read / memory_write 工具注入已装配的 MemoryService。
+    if let Some(service) = &memory {
+        memory_read.attach(Arc::clone(service));
+        memory_write.attach(Arc::clone(service));
+    }
+    // Kernel 动态 memory recall（§12）：Querying 前 await provider。
+    let mut config = config;
+    config.memory_provider = memory.as_ref().map(|service| {
+        let provider: Arc<dyn AsyncSystemPromptProvider> = Arc::new(MemoryProvider {
+            service: Arc::clone(service),
+            cache: RwLock::new(HashMap::new()),
+        });
+        provider
+    });
+    let (mut kernel, event_tx, stream_rx) = AgentKernel::<Rt>::with_runtime(model, runtime, config);
+    let interrupt = kernel.interrupt_handle();
+    if let Some(snapshot) = restored_snapshot {
+        kernel.context_mut().conversation = snapshot.messages;
+        kernel.context_mut().tool_metadata = snapshot.tool_metadata;
     }
 
     Ok(AgentBridge {
@@ -934,6 +1528,7 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         restored_messages,
         session_id,
         cwd,
+        memory,
     })
 }
 
@@ -944,6 +1539,7 @@ pub async fn save_snapshot(
     session_id: Option<String>,
     messages: Vec<ConversationMessage>,
     usage: UsageSnapshot,
+    tool_metadata: ToolMetadata,
 ) -> Option<String> {
     let input = SessionSaveInput {
         session_id,
@@ -952,7 +1548,7 @@ pub async fn save_snapshot(
         system_prompt: None,
         messages,
         usage,
-        tool_metadata: Default::default(),
+        tool_metadata,
     };
     match session_store.save(input).await {
         Ok(id) => Some(id),
@@ -967,12 +1563,15 @@ pub async fn save_snapshot(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::rc::Rc;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_core::error::MemoryError;
+    use agent_core::error::{AgentError, MemoryError};
+    use agent_core::model_client::{EventStream, ModelStreamEvent};
     use async_trait::async_trait;
+    use futures::StreamExt;
     // rsx! 宏展开需要 dioxus_elements 命名空间（tools.rs 同模式），且
     // GlobalSignal（PERSIST_ERROR）读写需 dioxus runtime（VirtualDom 提供）。
     use dioxus::prelude::*;
@@ -987,6 +1586,52 @@ mod tests {
     /// 持有 guard，`std::sync::Mutex` 会触发 clippy
     /// `async_await_holding_lock`（CI `-D warnings` 下失败）。
     static STATE_TEST_LOCK: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
+
+    #[tokio::test]
+    async fn async_init_cache_shares_one_concurrent_initialization() {
+        let cache = Rc::new(AsyncInitCache::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let first_cache = Rc::clone(&cache);
+        let first_calls = Arc::clone(&calls);
+        let first = async move {
+            first_cache
+                .get_or_try_init(async move {
+                    // Yield while holding the initialization gate so the
+                    // second caller observes the pre-initialized state first.
+                    let mut yielded = false;
+                    futures::future::poll_fn(|cx| {
+                        if yielded {
+                            std::task::Poll::Ready(())
+                        } else {
+                            yielded = true;
+                            cx.waker().wake_by_ref();
+                            std::task::Poll::Pending
+                        }
+                    })
+                    .await;
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(7usize)
+                })
+                .await
+        };
+
+        let second_cache = Rc::clone(&cache);
+        let second_calls = Arc::clone(&calls);
+        let second = async move {
+            second_cache
+                .get_or_try_init(async move {
+                    second_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<_, ()>(9usize)
+                })
+                .await
+        };
+
+        let (first, second) = futures::join!(first, second);
+        assert_eq!(first, Ok(7));
+        assert_eq!(second, Ok(7));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     /// 内存 KvStore 桩（仅实现 trait 必选方法，TTL/前缀清理用默认实现）。
     struct MemoryKvStore(Mutex<HashMap<String, Value>>);
@@ -1031,6 +1676,39 @@ mod tests {
                 .cloned()
                 .collect())
         }
+    }
+
+    #[tokio::test]
+    async fn save_snapshot_preserves_conversation_and_tool_metadata() {
+        let store = SessionStore::new(Arc::new(MemoryKvStore::new()));
+        let messages = vec![ConversationMessage::from_user_text(
+            "Remember this context.",
+        )];
+        let mut tool_metadata = ToolMetadata::default();
+        tool_metadata.record_active_artifact("artifact://report");
+
+        let session_id = save_snapshot(
+            &store,
+            "/workspace/project",
+            None,
+            messages.clone(),
+            UsageSnapshot::default(),
+            tool_metadata.clone(),
+        )
+        .await
+        .expect("snapshot should be persisted");
+
+        let restored = store
+            .load_by_id("/workspace/project", &session_id)
+            .await
+            .unwrap()
+            .expect("saved snapshot should be readable");
+        assert_eq!(restored.message_count, messages.len());
+        assert_eq!(restored.messages, messages);
+        assert_eq!(
+            restored.tool_metadata.active_artifacts,
+            tool_metadata.active_artifacts
+        );
     }
 
     /// marker 读取桩：对 `TOOL_STATES_PERSIST_ERROR_KEY` 的首次 `get` 返回
@@ -2210,5 +2888,169 @@ mod tests {
                 assert!(!error.contains(value));
             }
         }
+    }
+
+    /// 计数 embed 调用次数的 ModelClient 桩（MemoryProvider 缓存回归测试）。
+    struct CountingEmbedModel {
+        embed_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingEmbedModel {
+        fn new() -> (Self, Arc<AtomicUsize>) {
+            let counter = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    embed_calls: Arc::clone(&counter),
+                },
+                counter,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl agent_core::model_client::ModelClient for CountingEmbedModel {
+        async fn stream_response(
+            &self,
+            _request: agent_core::model_client::ModelRequest,
+        ) -> Result<EventStream<ModelStreamEvent>, AgentError> {
+            // provider 只走 memory_prompt → embed/search，不触发流式回复
+            Ok(futures::stream::empty().boxed())
+        }
+
+        async fn embed(&self, _text: &str) -> Result<Vec<f32>, AgentError> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.1; 8])
+        }
+
+        async fn stt(&self, _audio_data: &[u8]) -> Result<String, AgentError> {
+            Err(AgentError::Model("stt unsupported in mock".into()))
+        }
+
+        async fn tts(&self, _text: &str) -> Result<Vec<u8>, AgentError> {
+            Err(AgentError::Model("tts unsupported in mock".into()))
+        }
+    }
+
+    #[test]
+    fn memory_provider_caches_same_query_within_window() {
+        // §12.1 查询缓存回归：同一 human query 在窗口内复用召回结果，
+        // 工具循环内多次 Querying 轮不得重复 embed（性能项）。
+        futures::executor::block_on(async {
+            let stores = MemoryStores::from_parts(
+                Arc::new(MemoryKvStore::new()),
+                Arc::new(MemoryKvStore::new()),
+                Arc::new(MemoryKvStore::new()),
+                Arc::new(MemoryKvStore::new()),
+                Arc::new(MemoryKvStore::new()),
+            );
+            let (model, counter) = CountingEmbedModel::new();
+            let svc = Arc::new(
+                MemoryService::new(
+                    stores,
+                    Arc::new(model) as Arc<dyn agent_core::model_client::ModelClient>,
+                    MemoryContext::new("proj", "s1"),
+                    agent_core::memory::MemoryServiceConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let provider = MemoryProvider {
+                service: Arc::clone(&svc),
+                cache: RwLock::new(HashMap::new()),
+            };
+            let msgs = vec![ConversationMessage::from_user_text("how does auth work?")];
+            let _ = provider.provide(&msgs).await;
+            let calls_after_first = counter.load(Ordering::SeqCst);
+            assert!(calls_after_first >= 1, "首次 provide 必须 embed");
+            let _ = provider.provide(&msgs).await;
+            assert_eq!(
+                counter.load(Ordering::SeqCst),
+                calls_after_first,
+                "同 query 窗口内缓存命中不得重复 embed"
+            );
+            // Durable memory 可能在普通 15 秒窗口内到期。provider 必须把
+            // `memory_prompt_with_expiry` 给出的截止时间当作硬上限；过期
+            // cache entry 不能继续把旧 prompt 注入下一轮。
+            provider.cache.write().unwrap().insert(
+                "how does auth work?".to_string(),
+                (
+                    "stale prompt".to_string(),
+                    agent_core::memory::now_ms().saturating_sub(1),
+                    svc.revision(),
+                ),
+            );
+            let calls_before_expired_cache = counter.load(Ordering::SeqCst);
+            let refreshed = provider.provide(&msgs).await;
+            assert!(
+                counter.load(Ordering::SeqCst) > calls_before_expired_cache,
+                "过期 cache entry 必须触发重新 embed/search"
+            );
+            assert_ne!(refreshed.as_deref(), Some("stale prompt"));
+            // 成功写入会递增 service revision：即使 query 完全相同，也必须
+            // 让 Turn N+1 重新检索，不能继续复用 Turn N 的空 prompt。
+            svc.write_memory(agent_core::memory::NewMemoryEntry {
+                title: "auth".to_string(),
+                body: "authentication uses short lived tokens".to_string(),
+                description: "auth fact".to_string(),
+                memory_type: agent_core::memory::MemoryType::Project,
+                scope: agent_core::memory::MemoryScope::Project,
+                importance: 1.0,
+                source: "test".to_string(),
+                ttl_days: 0,
+                tags: Vec::new(),
+            })
+            .await
+            .unwrap();
+            let calls_after_write = counter.load(Ordering::SeqCst);
+            let _ = provider.provide(&msgs).await;
+            assert!(
+                counter.load(Ordering::SeqCst) > calls_after_write,
+                "成功写入后相同 query 的缓存必须失效并重新 embed"
+            );
+        });
+    }
+
+    #[test]
+    fn memory_provider_cache_prunes_expired_entries_and_stays_bounded() {
+        let (model, _counter) = CountingEmbedModel::new();
+        let stores = MemoryStores::from_parts(
+            Arc::new(MemoryKvStore::new()),
+            Arc::new(MemoryKvStore::new()),
+            Arc::new(MemoryKvStore::new()),
+            Arc::new(MemoryKvStore::new()),
+            Arc::new(MemoryKvStore::new()),
+        );
+        let service = futures::executor::block_on(MemoryService::new(
+            stores,
+            Arc::new(model) as Arc<dyn agent_core::model_client::ModelClient>,
+            MemoryContext::new("proj", "s1"),
+            agent_core::memory::MemoryServiceConfig::default(),
+        ))
+        .unwrap();
+        let provider = MemoryProvider {
+            service: Arc::new(service),
+            cache: RwLock::new(HashMap::new()),
+        };
+        let now = agent_core::memory::now_ms();
+        {
+            let mut cache = provider.cache.write().unwrap();
+            cache.insert("expired".into(), ("old".into(), now - 1, 0));
+            for index in 0..MEMORY_PROVIDER_CACHE_MAX_ENTRIES {
+                cache.insert(
+                    format!("live-{index}"),
+                    ("live".into(), now + 10_000 + index as i64, 0),
+                );
+            }
+        }
+
+        provider.cache_result("latest".into(), "fresh".into(), now + 10_000, 0, now);
+
+        let cache = provider.cache.read().unwrap();
+        assert_eq!(cache.len(), MEMORY_PROVIDER_CACHE_MAX_ENTRIES);
+        assert!(!cache.contains_key("expired"));
+        assert_eq!(
+            cache.get("latest").map(|entry| entry.0.as_str()),
+            Some("fresh")
+        );
     }
 }

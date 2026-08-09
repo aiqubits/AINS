@@ -7,6 +7,7 @@
 pub mod compute;
 pub mod interact;
 pub mod mcp;
+pub mod memory;
 pub mod network;
 pub mod outputs;
 pub mod runtime;
@@ -16,6 +17,7 @@ pub mod filesystem;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod system;
 
+pub use memory::{MemoryReadTool, MemoryWriteTool};
 pub use runtime::ToolRuntime;
 
 use std::path::Path;

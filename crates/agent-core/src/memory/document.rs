@@ -81,9 +81,14 @@ fn hash_key(source_hash: &str) -> String {
 
 /// 本地 DocumentStore 实现：`documents` 表存元数据，chunk 内容与向量经
 /// [`MemoryEngine`] 写入 `memories` / `embeddings` + Document namespace 索引。
+///
+/// 与 MemoryService 共享同一个 `Arc<futures::lock::Mutex<MemoryEngine>>`
+/// （生产路径约定，§14.1）：`embed(chunk)` 在 engine lock 外执行，仅
+/// `insert_with_id / forget / search` 持 engine lock；hash/meta/chunk 回滚
+/// 逻辑仍只保留在本类型一处。
 pub struct LocalDocumentStore {
     documents: Arc<dyn KvStore>,
-    engine: MemoryEngine,
+    engine: Arc<futures::lock::Mutex<MemoryEngine>>,
     model: Arc<dyn ModelClient>,
 }
 
@@ -91,7 +96,7 @@ impl LocalDocumentStore {
     /// `engine` 需已创建 `MemoryNamespace::Document` 索引。
     pub fn new(
         documents: Arc<dyn KvStore>,
-        engine: MemoryEngine,
+        engine: Arc<futures::lock::Mutex<MemoryEngine>>,
         model: Arc<dyn ModelClient>,
     ) -> Self {
         Self {
@@ -117,6 +122,8 @@ impl LocalDocumentStore {
             let chunk_id = format!("{doc_id}-c{i}");
             let _ = self
                 .engine
+                .lock()
+                .await
                 .forget(MemoryNamespace::Document, &chunk_id)
                 .await;
         }
@@ -167,7 +174,10 @@ impl LocalDocumentStore {
                     .await
                     .map_err(|e| MemoryError::Storage(format!("embedding failed: {e}")))?;
                 let chunk_id = format!("{doc_id}-c{i}");
+                // embed 在 engine lock 外（§16.1：锁内禁止模型调用）
                 self.engine
+                    .lock()
+                    .await
                     .insert_with_id(
                         MemoryNamespace::Document,
                         &chunk_id,
@@ -258,6 +268,12 @@ impl DocumentStore for LocalDocumentStore {
         top_k: usize,
         doc_ids: Option<&[String]>,
     ) -> Result<Vec<SearchResult>, MemoryError> {
+        // `top_k = 0` 是合法的“禁用本次注入”配置；空 doc_id filter 也表示
+        // 调用方明确不允许任何文档命中。两者都必须在 embed / 扩窗循环之前
+        // 短路，避免无意义的模型调用和全量向量检索。
+        if top_k == 0 || doc_ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         let vector = self
             .model
             .embed(query)
@@ -276,13 +292,19 @@ impl DocumentStore for LocalDocumentStore {
             top_k
         };
         let total = if doc_ids.is_some() {
-            self.engine.count(MemoryNamespace::Document).await?
+            self.engine
+                .lock()
+                .await
+                .count(MemoryNamespace::Document)
+                .await?
         } else {
             0
         };
         loop {
             let hits = self
                 .engine
+                .lock()
+                .await
                 .search(MemoryNamespace::Document, &vector, fetch_k)
                 .await?;
             let exhausted = fetch_k >= total;
@@ -360,13 +382,19 @@ impl DocumentStore for LocalDocumentStore {
             }
             Err(e) => return Err(e),
         };
-        // chunk 按实际存在的 id 前缀列举回收，不依赖可能损坏的 chunk_count
-        for chunk_id in self
+        // chunk 按实际存在的 id 前缀列举回收，不依赖可能损坏的 chunk_count。
+        // 注意：先取出 id 列表再释放 engine 锁——`for x in engine.lock()...` 中
+        // 临时 guard 会存活到整个 for 语句结束，循环体内的二次 lock 会自死锁。
+        let chunk_ids = self
             .engine
+            .lock()
+            .await
             .list_ids(MemoryNamespace::Document, &format!("{doc_id}-c"))
-            .await?
-        {
+            .await?;
+        for chunk_id in chunk_ids {
             self.engine
+                .lock()
+                .await
                 .forget(MemoryNamespace::Document, &chunk_id)
                 .await?;
         }

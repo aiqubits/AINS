@@ -13,6 +13,8 @@ pub enum MemoryError {
     Serialization(String),
     #[error("encryption error: {0}")]
     Encryption(String),
+    #[error("refusing to persist potentially sensitive memory content")]
+    SensitiveContent,
     #[error("vector index namespace not found: {0:?}")]
     NamespaceNotFound(MemoryNamespace),
     #[error("entry not found: {0}")]

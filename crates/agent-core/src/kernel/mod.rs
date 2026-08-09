@@ -6,6 +6,7 @@ pub mod fsm;
 pub mod messages;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod mock_model;
+pub mod provider;
 pub mod state;
 pub mod stream_events;
 
@@ -16,5 +17,6 @@ pub use messages::{
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use mock_model::ScriptedModelClient;
+pub use provider::AsyncSystemPromptProvider;
 pub use state::{AgentEvent, AgentState, Attachment, CompactTrigger, StateKind, SystemEventType};
 pub use stream_events::StreamEvent;

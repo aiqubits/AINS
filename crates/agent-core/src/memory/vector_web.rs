@@ -100,8 +100,17 @@ impl LinearVectorIndex {
             let Some(node_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
-            let Some(value) = embeddings.get(&key).await? else {
-                continue;
+            let value = match embeddings.get(&key).await {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                // Match native behavior: one damaged encrypted/serialized row
+                // must not prevent all valid IndexedDB embeddings from being
+                // materialized for recall.
+                Err(MemoryError::Serialization(e)) | Err(MemoryError::Encryption(e)) => {
+                    tracing::warn!(key, error = %e, "skipping unreadable embedding row during linear index load");
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             // 单行损坏（无法解码/维度不符/容量超限）跳过，不拖垮整个索引加载。
             let Ok(vector) = vector_from_value(&value) else {

@@ -10,8 +10,10 @@ use dioxus::prelude::*;
 use futures::{SinkExt, StreamExt};
 
 use agent_core::kernel::{AgentEvent, StreamEvent};
+use agent_core::memory::SessionCheckpoint;
 use agent_core::model_client::UsageSnapshot;
 use agent_core::policy::{PermissionEngine, PermissionMode};
+use agent_core::tools::ToolMetadata;
 use client_api::Client;
 use ui::{
     AgentStatus, AgentStatusView, ChatInput, ChatView, ChatViewState, I18nContext, Modal,
@@ -38,6 +40,34 @@ fn to_engine_mode(mode: PermissionModeView) -> PermissionMode {
         PermissionModeView::Plan => PermissionMode::Plan,
         PermissionModeView::FullAuto => PermissionMode::FullAuto,
     }
+}
+
+/// ToolMetadata → SessionCheckpoint 字段映射（§10.2）：
+/// - `active_artifacts` ← `ToolMetadata.active_artifacts`；
+/// - `current_state / next_step / verified_work` ← `extra["task_focus_state"]`
+///   （仅当真实上游已经生产该 key；否则保持空）。
+///
+/// “事件能携带 ToolMetadata”不等于“所有 Task state 字段必然有生产者”。
+fn checkpoint_from_tool_metadata(meta: &ToolMetadata) -> SessionCheckpoint {
+    let mut checkpoint = SessionCheckpoint {
+        active_artifacts: meta.active_artifacts.clone(),
+        ..Default::default()
+    };
+    if let Some(task_focus) = meta.extra.get("task_focus_state") {
+        if let Some(state) = task_focus.get("current_state").and_then(|v| v.as_str()) {
+            checkpoint.current_state = state.to_string();
+        }
+        if let Some(next) = task_focus.get("next_step").and_then(|v| v.as_str()) {
+            checkpoint.next_step = Some(next.to_string());
+        }
+        if let Some(verified) = task_focus.get("verified_work").and_then(|v| v.as_array()) {
+            checkpoint.verified_work = verified
+                .iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+        }
+    }
+    checkpoint
 }
 
 #[component]
@@ -157,19 +187,29 @@ pub fn AgentChat() -> Element {
 
             // Stream 泵：视图更新 + 会话镜像持久化 + 权限模式回读
             if let Some(mut stream_rx) = bridge.stream_rx.take() {
-                let store = Arc::clone(&bridge.session_store);
+                let store = bridge.session_store.clone();
                 let engine = Arc::clone(&bridge.engine);
                 let cwd = bridge.cwd.clone();
                 let mut session_id = bridge.session_id.clone();
+                // 生产 MemoryService（§8–§11）：final turn / compacted 时
+                // ordered checkpoint（await）+ background extraction（spawn）。
+                let memory = bridge.memory.clone();
                 spawn(async move {
                     let mut last_usage = UsageSnapshot::default();
+                    // P2（§10.2）：事件携带的 ToolMetadata → checkpoint 结构化字段
+                    let mut last_tool_metadata: Option<ToolMetadata> = None;
                     while let Some(event) = stream_rx.next().await {
                         // 镜像更新（在 event 移入视图前按引用处理）
                         let mut persist = false;
                         let mut final_turn = false;
                         match &event {
-                            StreamEvent::AssistantTurnComplete { message, usage } => {
+                            StreamEvent::AssistantTurnComplete {
+                                message,
+                                usage,
+                                tool_metadata,
+                            } => {
                                 last_usage = *usage;
+                                last_tool_metadata = Some(tool_metadata.clone());
                                 // 无 tool_use 的 turn 即本次查询的最终回复
                                 final_turn = message.tool_uses().is_empty();
                                 mirror.write().on_turn_complete(message.clone());
@@ -188,6 +228,7 @@ pub fn AgentChat() -> Element {
                                 tool_name,
                                 output,
                                 is_error,
+                                tool_metadata,
                                 ..
                             } => {
                                 // 本轮全部工具完成时才追加 tool_result 消息→持久化
@@ -196,6 +237,10 @@ pub fn AgentChat() -> Element {
                                     output.clone(),
                                     *is_error,
                                 );
+                                // Tool completion is emitted after dispatch,
+                                // so it carries mutations absent from the
+                                // preceding AssistantTurnComplete event.
+                                last_tool_metadata = Some(tool_metadata.clone());
                                 // todo_write 输出同步到待办列表（6.12）
                                 if tool_name == "todo_write" && !*is_error {
                                     todos.set(parse_todo_markdown(output));
@@ -207,6 +252,41 @@ pub fn AgentChat() -> Element {
                             }
                             StreamEvent::CompactProgress { .. } => {
                                 agent_status.set(AgentStatusView::Compacting);
+                            }
+                            StreamEvent::Compacted { tool_metadata, .. } => {
+                                agent_status.set(AgentStatusView::Thinking);
+                                // §11.2：Kernel 的压缩上下文仅用于下一次模型请求。
+                                // 会话持久化与 compaction archive 均必须保留 host
+                                // mirror 中未折叠的完整历史；这里不 save_snapshot，
+                                // 也不能以压缩摘要替换 mirror。
+                                let snapshot = mirror.read().snapshot();
+                                if let Some(memory) = &memory {
+                                    // Compacted 携带的是 tool dispatch 后的当前
+                                    // metadata，不能使用 AssistantTurnComplete 时的
+                                    // 旧快照。
+                                    let checkpoint = checkpoint_from_tool_metadata(tool_metadata);
+                                    if let Err(e) =
+                                        memory.save_checkpoint(&snapshot, Some(&checkpoint)).await
+                                    {
+                                        tracing::warn!(
+                                            "memory checkpoint (compaction) failed: {e}"
+                                        );
+                                    }
+                                    let extract = memory.clone();
+                                    spawn(async move {
+                                        if let Err(e) = service::extract_durable_serialized(
+                                            extract,
+                                            snapshot,
+                                            agent_core::memory::ExtractionReason::Compaction,
+                                        )
+                                        .await
+                                        {
+                                            tracing::warn!(
+                                                "durable extraction (compaction) failed: {e}"
+                                            );
+                                        }
+                                    });
+                                }
                             }
                             StreamEvent::Error { recoverable, .. } => {
                                 agent_status.set(if *recoverable {
@@ -239,19 +319,55 @@ pub fn AgentChat() -> Element {
                         if clear_stale_interrupt && let Some(flag) = interrupt_sig.read().as_ref() {
                             flag.store(false, Ordering::SeqCst);
                         }
-                        if persist {
+                        if persist && let Some(store) = &store {
                             // 先 clone 快照再 await，不跨 await 持有 Signal 读写守卫
                             let snapshot = mirror.read().snapshot();
                             if let Some(id) = service::save_snapshot(
-                                &store,
+                                store,
                                 &cwd,
                                 session_id.clone(),
-                                snapshot,
+                                snapshot.clone(),
                                 last_usage,
+                                last_tool_metadata.clone().unwrap_or_default(),
                             )
                             .await
                             {
+                                // §3：新会话首轮生成稳定 session_id 后同步给
+                                // MemoryService，保证 checkpoint / digest /
+                                // status key 与 SessionStore 同一 session id
+                                // （恢复会话已在装配时使用 snapshot 的 id）。
+                                if let Some(memory) = &memory {
+                                    memory.set_session_id(id.clone());
+                                }
                                 session_id = Some(id);
+                            }
+                            // final turn：ordered pipeline（§9.2）——checkpoint
+                            // 必须有序 await，只有 extraction 可 background。
+                            if final_turn && let Some(memory) = &memory {
+                                // P2（§10.2）：事件携带的 ToolMetadata 映射
+                                // checkpoint；P1 无上游生产时为 None。
+                                let checkpoint = last_tool_metadata
+                                    .as_ref()
+                                    .map(checkpoint_from_tool_metadata);
+                                if let Err(e) =
+                                    memory.save_checkpoint(&snapshot, checkpoint.as_ref()).await
+                                {
+                                    // checkpoint 失败只 warn/观测，不阻断 Agent
+                                    tracing::warn!("memory checkpoint failed: {e}");
+                                }
+                                let extract = memory.clone();
+                                spawn(async move {
+                                    if let Err(e) = service::extract_durable_serialized(
+                                        extract,
+                                        snapshot,
+                                        agent_core::memory::ExtractionReason::FinalTurn,
+                                    )
+                                    .await
+                                    {
+                                        // extraction 失败也只 warn/观测
+                                        tracing::warn!("durable extraction failed: {e}");
+                                    }
+                                });
                             }
                         }
                         // enter/exit_plan_mode 工具可能改写了模式，回读同步；
@@ -282,12 +398,21 @@ pub fn AgentChat() -> Element {
                     }
                     // 流关闭（Kernel 退出/异常终止且无末尾 Error 事件）：
                     // 复位忙碌位与状态指示器，避免永久 Thinking 脉冲。
-                    let mut state = chat.write();
-                    state.busy = false;
-                    state.interrupt_pending = false;
-                    drop(state);
+                    {
+                        let mut state = chat.write();
+                        state.busy = false;
+                        state.interrupt_pending = false;
+                    }
                     if agent_status() != AgentStatusView::Error {
                         agent_status.set(AgentStatusView::Idle);
+                    }
+                    // 会话优雅关闭：HNSW 派生缓存落盘（§15：Agent/session
+                    // graceful shutdown → save_all）。embeddings 是 SoT，
+                    // 保存失败不影响正确性。
+                    if let Some(memory) = &memory
+                        && let Err(e) = memory.save_all().await
+                    {
+                        tracing::warn!("memory hnsw cache save failed: {e}");
                     }
                 });
             }

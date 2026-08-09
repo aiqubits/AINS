@@ -310,7 +310,7 @@ async fn document_store_index_search_delete() {
     });
     let mut store = LocalDocumentStore::new(
         Arc::new(backend.table(TABLE_DOCUMENTS)),
-        engine,
+        Arc::new(futures::lock::Mutex::new(engine)),
         Arc::clone(&model),
     );
 
@@ -345,7 +345,7 @@ async fn document_search_filters_by_doc_ids() {
     });
     let mut store = LocalDocumentStore::new(
         Arc::new(backend.table(TABLE_DOCUMENTS)),
-        engine,
+        Arc::new(futures::lock::Mutex::new(engine)),
         Arc::clone(&model),
     );
 
@@ -450,6 +450,25 @@ async fn memdir_add_scan_remove_and_prompt() {
             .contains("build_setup.md")
     );
     assert!(!store.remove_entry("build_setup").await.unwrap());
+}
+
+#[tokio::test]
+async fn scoped_memdir_isolates_entries_between_owners() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+    let owner_a = MemdirStore::new_scoped(Arc::clone(&kv), "owner-a-hash");
+    let owner_b = MemdirStore::new_scoped(kv, "owner-b-hash");
+    owner_a
+        .add_entry(NewMemoryEntry {
+            title: "Account A note".into(),
+            body: "account A private durable note".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(owner_b.scan(10).await.unwrap().is_empty());
+    assert!(owner_b.read_index().await.unwrap().is_none());
 }
 
 #[test]
@@ -1131,6 +1150,52 @@ async fn capacity_full_remember_evicts_but_insert_with_id_errors() {
 }
 
 #[tokio::test]
+async fn capacity_eviction_never_deletes_another_dedupe_domain() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let mut engine = build_engine(&backend, MemoryNamespace::Personal)
+        .await
+        .with_max_entries(1);
+
+    let owner_a = engine
+        .remember_in_domain(
+            MemoryNamespace::Personal,
+            "personal:private:owner-a",
+            "owner A memory",
+            &embed_text("owner A memory"),
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // The shared physical Personal namespace is full, but owner B has no
+    // entry in its own dedupe domain.  It must fail rather than evict owner A.
+    let error = engine
+        .remember_in_domain(
+            MemoryNamespace::Personal,
+            "personal:private:owner-b",
+            "owner B memory",
+            &embed_text("owner B memory"),
+            json!({}),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, MemoryError::Storage(ref message) if message.contains("other isolated domains")),
+        "unexpected capacity error: {error:?}"
+    );
+    assert_eq!(engine.count(MemoryNamespace::Personal).await.unwrap(), 1);
+    assert!(
+        engine
+            .get(MemoryNamespace::Personal, &owner_a.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "owner A memory must survive owner B's capacity attempt"
+    );
+}
+
+#[tokio::test]
 async fn insert_with_id_updates_existing_entry_when_namespace_is_full() {
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -1294,7 +1359,7 @@ async fn document_index_failure_cleans_up_partial_chunks() {
     });
     let mut store = LocalDocumentStore::new(
         Arc::new(backend.table(TABLE_DOCUMENTS)),
-        engine,
+        Arc::new(futures::lock::Mutex::new(engine)),
         Arc::clone(&model),
     );
 
@@ -1456,8 +1521,11 @@ async fn document_index_partial_chunk_write_is_cleaned_up() {
     let model: Arc<dyn ModelClient> = Arc::new(MockModel {
         response: String::new(),
     });
-    let mut store =
-        LocalDocumentStore::new(Arc::new(backend.table(TABLE_DOCUMENTS)), engine, model);
+    let mut store = LocalDocumentStore::new(
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(futures::lock::Mutex::new(engine)),
+        model,
+    );
 
     let content = "# Setup\n\nInstall rustup and the stable toolchain.\n\n# Testing\n\nRun cargo test for the workspace.";
     assert!(store.index_content("guide.md", content).await.is_err());
@@ -1490,7 +1558,11 @@ async fn document_meta_write_failure_cleans_up_chunks() {
         });
         let documents: Arc<dyn KvStore> =
             Arc::new(FailingKv::new(backend.table(TABLE_DOCUMENTS), fail_on_set));
-        let mut store = LocalDocumentStore::new(documents, engine, model);
+        let mut store = LocalDocumentStore::new(
+            documents,
+            Arc::new(futures::lock::Mutex::new(engine)),
+            model,
+        );
 
         let content = "# Setup\n\nInstall rustup.\n\n# Testing\n\nRun cargo test.";
         assert!(store.index_content("guide.md", content).await.is_err());
@@ -2226,7 +2298,7 @@ async fn remember_falls_back_when_dedupe_target_corrupt() {
 }
 
 #[tokio::test]
-async fn evict_prefers_corrupt_rows() {
+async fn capacity_evicts_current_domain_before_unknown_corrupt_row() {
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
     let mut engine = build_engine(&backend, MemoryNamespace::Personal)
@@ -2242,7 +2314,9 @@ async fn evict_prefers_corrupt_rows() {
         )
         .await
         .unwrap();
-    // 损坏行占满容量；旧行为 evict 跳过它去淘汰低分有效条目
+    // 损坏行占满容量。它没有 dedupe_domain，因而无法安全判定所属 owner /
+    // project；容量回收不得为腾位而删除它，否则当前账户可删掉另一账户的
+    // 损坏但仍可恢复数据。
     let memories = backend.table(TABLE_MEMORIES);
     memories
         .set("personal/zzz-corrupt", &json!("just a string"), None)
@@ -2260,15 +2334,21 @@ async fn evict_prefers_corrupt_rows() {
         .await
         .unwrap();
 
-    // 损坏行被优先淘汰，两条有效记忆（含低分条）均存活
-    assert_eq!(memories.get("personal/zzz-corrupt").await.unwrap(), None);
+    // 未知归属的损坏行不得删除；当前 domain 中的低分有效条目可安全淘汰。
+    assert!(
+        memories
+            .get("personal/zzz-corrupt")
+            .await
+            .unwrap()
+            .is_some()
+    );
     assert_eq!(engine.count(MemoryNamespace::Personal).await.unwrap(), 2);
     let hits = engine
         .search(MemoryNamespace::Personal, &embed_text("good one"), 2)
         .await
         .unwrap();
     let contents: Vec<&str> = hits.iter().map(|(e, _)| e.content.as_str()).collect();
-    assert!(contents.contains(&"good one"), "hits: {hits:?}");
+    assert!(!contents.contains(&"good one"), "hits: {hits:?}");
     assert!(contents.contains(&"good two"), "hits: {hits:?}");
 }
 
@@ -2344,7 +2424,7 @@ async fn document_dedupe_and_list_survive_corrupt_meta() {
     });
     let mut store = LocalDocumentStore::new(
         Arc::new(backend.table(TABLE_DOCUMENTS)),
-        engine,
+        Arc::new(futures::lock::Mutex::new(engine)),
         Arc::clone(&model),
     );
 
@@ -2474,7 +2554,7 @@ async fn document_delete_survives_corrupt_meta() {
     });
     let mut store = LocalDocumentStore::new(
         Arc::new(backend.table(TABLE_DOCUMENTS)),
-        engine,
+        Arc::new(futures::lock::Mutex::new(engine)),
         Arc::clone(&model),
     );
 
@@ -2784,8 +2864,11 @@ async fn document_search_doc_filter_widens_oversampling() {
     let model: Arc<dyn ModelClient> = Arc::new(MockModel {
         response: String::new(),
     });
-    let mut store =
-        LocalDocumentStore::new(Arc::new(backend.table(TABLE_DOCUMENTS)), engine, model);
+    let mut store = LocalDocumentStore::new(
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(futures::lock::Mutex::new(engine)),
+        model,
+    );
 
     // 大文档：6 个与查询同向的 chunk（每段超过分块预算一半，
     // 段落无法打包，各自成块）
@@ -2929,18 +3012,18 @@ async fn document_search_empty_doc_filter_returns_empty() {
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
     let engine = build_engine(&backend, MemoryNamespace::Document).await;
-    let model: Arc<dyn ModelClient> = Arc::new(MockModel {
-        response: String::new(),
+    // 搜索若错误地继续执行 embed，会立即失败；空过滤器必须在此之前返回。
+    let model: Arc<dyn ModelClient> = Arc::new(FlakyEmbedModel {
+        fail_after: 0,
+        calls: std::sync::atomic::AtomicUsize::new(0),
     });
-    let mut store =
-        LocalDocumentStore::new(Arc::new(backend.table(TABLE_DOCUMENTS)), engine, model);
+    let store = LocalDocumentStore::new(
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(futures::lock::Mutex::new(engine)),
+        model,
+    );
 
-    store
-        .index_content("guide.txt", "Install rustup and the stable toolchain.")
-        .await
-        .unwrap();
-
-    // 空过滤器：全部命中被过滤，索引耗尽后终止并返回空
+    // 空过滤器：无需调用 embedding 服务或查询索引。
     let results = store
         .search("install toolchain", 3, Some(&[]))
         .await
@@ -2958,8 +3041,11 @@ async fn document_search_widening_survives_corrupt_backfill_rows() {
     let model: Arc<dyn ModelClient> = Arc::new(MockModel {
         response: String::new(),
     });
-    let mut store =
-        LocalDocumentStore::new(Arc::new(backend.table(TABLE_DOCUMENTS)), engine, model);
+    let mut store = LocalDocumentStore::new(
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(futures::lock::Mutex::new(engine)),
+        model,
+    );
 
     // 大文档：6 个与查询同向的 chunk（均比小文档相似度高）
     let paragraph = "alpha beta gamma delta ".repeat(80);

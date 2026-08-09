@@ -55,6 +55,12 @@ impl EncryptionKey {
         Self(bytes)
     }
 
+    /// 复制密钥字节（多份加密 wrapper 共享同一密钥材料时使用；
+    /// 每份 wrapper 持有独立副本，Drop 清零互不影响）。
+    pub fn clone_bytes(&self) -> [u8; KEY_LEN] {
+        self.0
+    }
+
     /// 随机生成新密钥（首次运行生成，需由调用方安全持久化后续复用）。
     pub fn generate() -> Result<Self, MemoryError> {
         let mut bytes = [0u8; KEY_LEN];
@@ -98,6 +104,46 @@ impl EncryptionKey {
 
     /// 加密一条 value 为密文信封（AAD = `storage_key`，绑定条目位置）。
     pub fn seal(&self, storage_key: &str, value: &Value) -> Result<Value, MemoryError> {
+        self.seal_with_aad(storage_key.as_bytes(), value)
+    }
+
+    /// 解密一条密文信封回原 value（AAD = `storage_key`，须与加密时一致）。
+    pub fn unseal(&self, storage_key: &str, sealed: &Value) -> Result<Value, MemoryError> {
+        self.unseal_with_aad(storage_key.as_bytes(), sealed)
+    }
+
+    /// 多表加密：AAD = `{table_name}\0{storage_key}`。共享同一 storage_key
+    /// 的不同表形成独立认证域——`memories` 与 `embeddings` 使用相同的
+    /// `namespace.storage_key(id)`，单靠 key 作 AAD 时同 key 密文可跨表搬运
+    /// 认证通过（完整性受损）；表名并入 AAD 后跨表搬运即认证失败。
+    pub fn seal_in_domain(
+        &self,
+        table_name: &str,
+        storage_key: &str,
+        value: &Value,
+    ) -> Result<Value, MemoryError> {
+        let mut aad = Vec::with_capacity(table_name.len() + 1 + storage_key.len());
+        aad.extend_from_slice(table_name.as_bytes());
+        aad.push(0);
+        aad.extend_from_slice(storage_key.as_bytes());
+        self.seal_with_aad(&aad, value)
+    }
+
+    /// 多表解密（AAD 须与 [`Self::seal_in_domain`] 一致）。
+    pub fn unseal_in_domain(
+        &self,
+        table_name: &str,
+        storage_key: &str,
+        sealed: &Value,
+    ) -> Result<Value, MemoryError> {
+        let mut aad = Vec::with_capacity(table_name.len() + 1 + storage_key.len());
+        aad.extend_from_slice(table_name.as_bytes());
+        aad.push(0);
+        aad.extend_from_slice(storage_key.as_bytes());
+        self.unseal_with_aad(&aad, sealed)
+    }
+
+    fn seal_with_aad(&self, aad: &[u8], value: &Value) -> Result<Value, MemoryError> {
         let plaintext =
             serde_json::to_vec(value).map_err(|e| MemoryError::Serialization(e.to_string()))?;
         let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -109,7 +155,7 @@ impl EncryptionKey {
                 Nonce::from_slice(&nonce_bytes),
                 Payload {
                     msg: &plaintext,
-                    aad: storage_key.as_bytes(),
+                    aad,
                 },
             )
             .map_err(|_| MemoryError::Encryption("AEAD encryption failed".into()))?;
@@ -120,8 +166,7 @@ impl EncryptionKey {
         }))
     }
 
-    /// 解密一条密文信封回原 value（AAD = `storage_key`，须与加密时一致）。
-    pub fn unseal(&self, storage_key: &str, sealed: &Value) -> Result<Value, MemoryError> {
+    fn unseal_with_aad(&self, aad: &[u8], sealed: &Value) -> Result<Value, MemoryError> {
         let obj = sealed.as_object().ok_or_else(|| {
             MemoryError::Encryption("stored value is not an AINS-sealed envelope".into())
         })?;
@@ -156,7 +201,7 @@ impl EncryptionKey {
                 Nonce::from_slice(&nonce_bytes),
                 Payload {
                     msg: &ciphertext,
-                    aad: storage_key.as_bytes(),
+                    aad,
                 },
             )
             // AEAD 失败不区分“错误密钥 / 篡改 / AAD 不匹配”，统一报解密失败。
@@ -189,11 +234,57 @@ impl std::fmt::Debug for EncryptionKey {
 pub struct EncryptedKvStore {
     inner: Arc<dyn KvStore>,
     key: EncryptionKey,
+    /// 多表加密的 table domain；`None` 为 legacy 兼容模式（AAD = storage_key，
+    /// 供 `kv` 表延续既有密文）。`Some(table)` 时 AAD = `{table}\0{storage_key}`，
+    /// 共享相同 storage_key 的 Memory 表形成独立认证域。
+    table_domain: Option<String>,
 }
 
 impl EncryptedKvStore {
+    /// 判断 value 是否为当前加密信封格式。供装配层在**套用 wrapper 前**
+    /// 检测 plaintext→encrypted 的转换，避免把已有明文直接当密文读取。
+    pub fn is_sealed_envelope(value: &Value) -> bool {
+        value
+            .as_object()
+            .and_then(|object| object.get(SEALED_MARKER))
+            .and_then(Value::as_u64)
+            == Some(SEALED_VERSION)
+    }
+
+    /// legacy 兼容模式：AAD = storage_key（既有 kv 表密文保持可读）。
     pub fn new(inner: Arc<dyn KvStore>, key: EncryptionKey) -> Self {
-        Self { inner, key }
+        Self {
+            inner,
+            key,
+            table_domain: None,
+        }
+    }
+
+    /// 多表加密模式：AAD = `{table_name}\0{storage_key}`。
+    pub fn with_table_domain(
+        inner: Arc<dyn KvStore>,
+        key: EncryptionKey,
+        table_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            inner,
+            key,
+            table_domain: Some(table_name.into()),
+        }
+    }
+
+    fn seal_value(&self, key: &str, value: &Value) -> Result<Value, MemoryError> {
+        match &self.table_domain {
+            Some(table) => self.key.seal_in_domain(table, key, value),
+            None => self.key.seal(key, value),
+        }
+    }
+
+    fn unseal_value(&self, key: &str, sealed: &Value) -> Result<Value, MemoryError> {
+        match &self.table_domain {
+            Some(table) => self.key.unseal_in_domain(table, key, sealed),
+            None => self.key.unseal(key, sealed),
+        }
     }
 }
 
@@ -208,7 +299,7 @@ impl std::fmt::Debug for EncryptedKvStore {
 impl KvStore for EncryptedKvStore {
     async fn get(&self, key: &str) -> Result<Option<Value>, MemoryError> {
         match self.inner.get(key).await? {
-            Some(sealed) => Ok(Some(self.key.unseal(key, &sealed)?)),
+            Some(sealed) => Ok(Some(self.unseal_value(key, &sealed)?)),
             None => Ok(None),
         }
     }
@@ -219,7 +310,7 @@ impl KvStore for EncryptedKvStore {
         value: &Value,
         ttl: Option<Duration>,
     ) -> Result<(), MemoryError> {
-        let sealed = self.key.seal(key, value)?;
+        let sealed = self.seal_value(key, value)?;
         self.inner.set(key, &sealed, ttl).await
     }
 

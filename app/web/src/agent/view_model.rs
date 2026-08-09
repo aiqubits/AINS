@@ -416,6 +416,9 @@ pub fn apply_stream_event(
             state.push_item(ChatItem::CompactNote { phase });
             None
         }
+        // 压缩完成事件（§11.1）：进度已由 CompactProgress 展示，本分支仅
+        // 保持 exhaustive match（宿主侧负责 ordered checkpoint + extraction）。
+        StreamEvent::Compacted { .. } => None,
     }
 }
 
@@ -568,6 +571,7 @@ mod tests {
         StreamEvent::AssistantTurnComplete {
             message: assistant_msg(text),
             usage: UsageSnapshot::default(),
+            tool_metadata: Default::default(),
         }
     }
 
@@ -648,6 +652,7 @@ mod tests {
                 output: "12 files".into(),
                 is_error: false,
                 metadata: json!({}),
+                tool_metadata: Default::default(),
             },
         );
         let statuses: Vec<_> = state
@@ -680,6 +685,7 @@ mod tests {
                 output: "denied".into(),
                 is_error: true,
                 metadata: json!({}),
+                tool_metadata: Default::default(),
             },
         );
         assert!(matches!(
@@ -700,6 +706,7 @@ mod tests {
                 output: "x".into(),
                 is_error: false,
                 metadata: json!({}),
+                tool_metadata: Default::default(),
             },
         );
         assert!(state.items.is_empty());
@@ -855,6 +862,7 @@ mod tests {
                     }],
                 },
                 usage: Default::default(),
+                tool_metadata: Default::default(),
             },
         );
         settle_idle(&mut state);
@@ -889,6 +897,7 @@ mod tests {
                 output: "2026".into(),
                 is_error: false,
                 metadata: json!({}),
+                tool_metadata: Default::default(),
             },
         );
         settle_idle(&mut state);

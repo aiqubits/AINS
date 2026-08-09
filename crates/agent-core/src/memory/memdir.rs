@@ -159,11 +159,41 @@ pub struct MemdirEntry {
 /// memdir 存储（挂在 kv 逻辑表上）。
 pub struct MemdirStore {
     kv: Arc<dyn KvStore>,
+    /// Web owner partition. Native uses the legacy unscoped keys to retain
+    /// existing single-user storage compatibility.
+    owner_scope: Option<String>,
 }
 
 impl MemdirStore {
     pub fn new(kv: Arc<dyn KvStore>) -> Self {
-        Self { kv }
+        Self {
+            kv,
+            owner_scope: None,
+        }
+    }
+
+    /// Construct a memdir store whose index and entries are isolated under an
+    /// owner-derived, non-empty namespace.
+    pub fn new_scoped(kv: Arc<dyn KvStore>, owner_scope: impl Into<String>) -> Self {
+        let owner_scope = owner_scope.into();
+        Self {
+            kv,
+            owner_scope: (!owner_scope.trim().is_empty()).then_some(owner_scope),
+        }
+    }
+
+    fn index_key(&self) -> String {
+        match &self.owner_scope {
+            Some(owner) => format!("owner/{owner}/{INDEX_KEY}"),
+            None => INDEX_KEY.to_string(),
+        }
+    }
+
+    fn entry_prefix(&self) -> String {
+        match &self.owner_scope {
+            Some(owner) => format!("owner/{owner}/{ENTRY_PREFIX}"),
+            None => ENTRY_PREFIX.to_string(),
+        }
     }
 
     /// 生成注入 system prompt 的 Memory 段（基线 `load_memory_prompt`，恒有输出）。
@@ -179,7 +209,7 @@ impl MemdirStore {
         lines.push(String::new());
         lines.push("## MEMORY.md".to_string());
 
-        match self.kv.get(INDEX_KEY).await? {
+        match self.kv.get(&self.index_key()).await? {
             Some(value) => {
                 let raw = value.as_str().unwrap_or_default().to_string();
                 let (text, reason) = truncate_entrypoint(&raw);
@@ -304,13 +334,14 @@ impl MemdirStore {
     pub async fn read_index(&self) -> Result<Option<String>, MemoryError> {
         Ok(self
             .kv
-            .get(INDEX_KEY)
+            .get(&self.index_key())
             .await?
             .and_then(|v| v.as_str().map(|s| s.to_string())))
     }
 
     async fn scan_raw(&self) -> Result<Vec<MemdirEntry>, MemoryError> {
-        let keys = self.kv.list_prefix(ENTRY_PREFIX).await?;
+        let entry_prefix = self.entry_prefix();
+        let keys = self.kv.list_prefix(&entry_prefix).await?;
         let mut entries = Vec::with_capacity(keys.len());
         for key in keys {
             // 单行损坏（JSON 载荷无法解码）跳过，不毒化整个 memdir；
@@ -325,7 +356,7 @@ impl MemdirStore {
                 Err(e) => return Err(e),
             };
             let Some(raw) = value.as_str() else { continue };
-            let filename = key.trim_start_matches(ENTRY_PREFIX).to_string();
+            let filename = key.trim_start_matches(&entry_prefix).to_string();
             if let Some(entry) = parse_entry_file(&filename, raw) {
                 entries.push(entry);
             }
@@ -335,7 +366,7 @@ impl MemdirStore {
 
     async fn write_entry(&self, entry: &MemdirEntry) -> Result<(), MemoryError> {
         let file = render_entry_file(entry);
-        let key = format!("{ENTRY_PREFIX}{}", entry.filename);
+        let key = format!("{}{}", self.entry_prefix(), entry.filename);
         self.kv.set(&key, &Value::String(file), None).await
     }
 
@@ -343,10 +374,11 @@ impl MemdirStore {
         let slug = slugify(title);
         // list_prefix 会跳过损坏行：其文件名视为可复用，新条目直接
         // 覆写该键（自愈；损坏行本就不可解析，无内容可保留）。
-        let existing = self.kv.list_prefix(ENTRY_PREFIX).await?;
+        let entry_prefix = self.entry_prefix();
+        let existing = self.kv.list_prefix(&entry_prefix).await?;
         let taken: Vec<&str> = existing
             .iter()
-            .map(|k| k.trim_start_matches(ENTRY_PREFIX))
+            .map(|k| k.trim_start_matches(&entry_prefix))
             .collect();
         let candidate = format!("{slug}.md");
         if !taken.contains(&candidate.as_str()) {
@@ -374,7 +406,9 @@ impl MemdirStore {
             index.push('\n');
         }
         index.push_str(&format!("- [{title}]({filename})\n"));
-        self.kv.set(INDEX_KEY, &Value::String(index), None).await
+        self.kv
+            .set(&self.index_key(), &Value::String(index), None)
+            .await
     }
 
     async fn drop_index_lines(&self, filename: &str) -> Result<(), MemoryError> {
@@ -391,7 +425,9 @@ impl MemdirStore {
         if index.ends_with('\n') && !text.is_empty() {
             text.push('\n');
         }
-        self.kv.set(INDEX_KEY, &Value::String(text), None).await
+        self.kv
+            .set(&self.index_key(), &Value::String(text), None)
+            .await
     }
 }
 

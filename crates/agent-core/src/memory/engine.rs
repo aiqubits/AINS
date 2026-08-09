@@ -6,8 +6,10 @@
 //! 查询：`vector.search(namespace, ...)`（首次命中懒加载重建）→ `memories.get(id)` 回填内容。
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::error::MemoryError;
 use crate::memory::kv::{KvStore, now_ms};
@@ -20,8 +22,64 @@ use crate::memory::vector::{
     vector_to_value,
 };
 
+/// metadata 中携带去重域的标准字段名（v2 scoped dedupe 契约）。
+/// [`MemoryEngine::forget`] 依赖该字段选择签名映射的清理路径；
+/// [`MemoryEngine::remember_in_domain`] 写入时以参数为准强制落该字段，
+/// 防止调用方漏写导致 v2 签名行永久残留。
+const DEDUPE_DOMAIN_FIELD: &str = "dedupe_domain";
+
+/// 进程内唯一序号：content signature 在不同 dedupe domain 中可以相同，且
+/// `now_ms()` 的精度不足以作为主键唯一性来源。与 CSPRNG 后缀组合后，既
+/// 保证单进程内不重复，也避免不同 Web tab / 进程在同一毫秒首次写入时复用
+/// 同一个 `memories` / `embeddings` storage key。
+static MEMORY_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn memory_id_from_components(now: i64, sequence: u64, random: [u8; 12], signature: &str) -> String {
+    let random = random
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("mem-{now}-{sequence}-{random}-{}", &signature[..12])
+}
+
+fn generate_memory_id(now: i64, signature: &str) -> Result<String, MemoryError> {
+    let sequence = MEMORY_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut random = [0u8; 12];
+    getrandom::getrandom(&mut random)
+        .map_err(|e| MemoryError::Storage(format!("generate durable memory id randomness: {e}")))?;
+    Ok(memory_id_from_components(now, sequence, random, signature))
+}
+
+/// v1 签名 key（防御性保留）：`sig/{namespace}/{signature}`。
+/// 当前产品全新部署、无 v1 存量数据；仅在未来存在旧版本升级数据时经
+/// [`entry_dedupe_domain`] 的 `None` 分支触发（全新部署下不可达）。
 fn sig_key(namespace: MemoryNamespace, signature: &str) -> String {
     format!("sig/{}/{signature}", namespace.as_str())
+}
+
+/// v2 scoped 签名 key：`sig/v2/{namespace}/{sha256(dedupe_domain)}/{signature}`。
+/// 相同正文在不同 dedupe_domain 下映射到不同签名行，互不刷新。
+fn sig_key_v2(namespace: MemoryNamespace, dedupe_domain: &str, signature: &str) -> String {
+    format!(
+        "sig/v2/{}/{}/{signature}",
+        namespace.as_str(),
+        hash_dedupe_domain(dedupe_domain)
+    )
+}
+
+fn hash_dedupe_domain(dedupe_domain: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(dedupe_domain.as_bytes());
+    let digest = hasher.finalize();
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 从 entry metadata 解析去重域：有 `dedupe_domain` → v2；无该字段（仅可能
+/// 来自旧版本写入的防御场景；全新部署下所有 entry 都经
+/// [`MemoryEngine::remember_in_domain`] 写入、必带该字段）→ 走 v1 签名
+/// 兼容路径。
+fn entry_dedupe_domain(metadata: &Value) -> Option<&str> {
+    metadata.get(DEDUPE_DOMAIN_FIELD).and_then(Value::as_str)
 }
 
 /// `search_ranked` 相似度过采样倍数（与 DocumentStore doc_ids 过滤检索同口径）。
@@ -29,6 +87,10 @@ const RANKED_OVERFETCH_FACTOR: usize = 4;
 
 fn sig_prefix(namespace: MemoryNamespace) -> String {
     format!("sig/{}/", namespace.as_str())
+}
+
+fn sig_v2_prefix(namespace: MemoryNamespace) -> String {
+    format!("sig/v2/{}/", namespace.as_str())
 }
 
 /// 写入前校验：向量分量必须全部有限（NaN/Inf 会破坏距离计算与序列化）。
@@ -77,8 +139,10 @@ impl MemoryEngine {
         self
     }
 
-    /// 写入一条长期记忆。相同归一化签名的写入合并为刷新（重要性取 max），
-    /// 容量满时按保留权重（重要性 × 时间衰减）淘汰最低分条目。
+    /// 写入一条长期记忆（公共 API 兼容入口；当前源码内无调用方，新代码
+    /// 一律走 [`Self::remember_in_domain`]）。相同归一化签名的写入合并为
+    /// 刷新（重要性取 max），容量满时按保留权重（重要性 × 时间衰减）淘汰
+    /// 最低分条目。等价于 `remember_in_domain(namespace, namespace.as_str(), ...)`。
     pub async fn remember(
         &mut self,
         namespace: MemoryNamespace,
@@ -86,9 +150,27 @@ impl MemoryEngine {
         vector: &[f32],
         metadata: Value,
     ) -> Result<MemoryEntry, MemoryError> {
+        self.remember_in_domain(namespace, namespace.as_str(), content, vector, metadata)
+            .await
+    }
+
+    /// 在指定去重域内写入长期记忆（生产隔离入口）。
+    ///
+    /// 去重域是 scope 语义的编码（如 `personal:private`、
+    /// `personal:project:{project_key}`、`personal:team:{team_id}`）：
+    /// 相同正文在不同去重域下互不刷新，避免 Project A 的写入刷新 Project B
+    /// 的条目。签名映射落 `sig/v2/` 前缀，key 含去重域哈希。
+    pub async fn remember_in_domain(
+        &mut self,
+        namespace: MemoryNamespace,
+        dedupe_domain: &str,
+        content: &str,
+        vector: &[f32],
+        metadata: Value,
+    ) -> Result<MemoryEntry, MemoryError> {
         ensure_finite(vector)?;
         let signature = content_signature(content, namespace.as_str());
-        let skey = sig_key(namespace, &signature);
+        let skey = sig_key_v2(namespace, dedupe_domain, &signature);
 
         // 去重合并：相同签名 → 刷新既有条目。签名行或目标行损坏时
         // 视为未命中，回落新建路径（损坏行交由容量淘汰优先回收），
@@ -132,11 +214,14 @@ impl MemoryEngine {
                 Value::Object(mut map) => {
                     map.insert("importance".into(), merged.into());
                     map.insert("refreshed_at".into(), now_ms().into());
+                    // 刷新路径同样强制去重域：forget 依赖该字段选择签名清理路径
+                    map.insert(DEDUPE_DOMAIN_FIELD.into(), dedupe_domain.into());
                     Value::Object(map)
                 }
                 Value::Null => serde_json::json!({
                     "importance": merged,
                     "refreshed_at": now_ms(),
+                    (DEDUPE_DOMAIN_FIELD): dedupe_domain,
                 }),
                 other => other,
             };
@@ -206,13 +291,19 @@ impl MemoryEngine {
         }
 
         let now = now_ms();
-        let id = format!("mem-{now}-{}", &signature[..12]);
+        let id = generate_memory_id(now, &signature)?;
+        // 去重域字段强制写入 metadata（以参数为准）：forget 依赖它选择签名
+        // 清理路径；刷新路径同样覆盖，保证同条目签名映射与元数据一致。
         let metadata = match metadata {
             Value::Object(mut map) => {
                 map.entry("importance").or_insert_with(|| 1.0.into());
+                map.insert(DEDUPE_DOMAIN_FIELD.into(), dedupe_domain.into());
                 Value::Object(map)
             }
-            Value::Null => serde_json::json!({ "importance": 1.0 }),
+            Value::Null => serde_json::json!({
+                "importance": 1.0,
+                (DEDUPE_DOMAIN_FIELD): dedupe_domain,
+            }),
             other => other,
         };
         let entry = MemoryEntry {
@@ -225,12 +316,23 @@ impl MemoryEngine {
         let entry_value =
             serde_json::to_value(&entry).map_err(|e| MemoryError::Serialization(e.to_string()))?;
 
-        // 容量淘汰：满则淘汰保留权重最低的一条。淘汰先于写入（生产默认下
-        // 索引容量与 max_entries 相等，先写后淘汰会被索引容量检查拒绝）；
-        // 后续任一写入失败时 best-effort 恢复被淘汰条目，避免“淘汰一条、
-        // 没写进一条”的净丢失。
+        // 容量淘汰：满则只淘汰**当前去重域**内保留权重最低的一条。Personal
+        // namespace 会被同一浏览器 profile 的不同 owner 共用；若按整个
+        // namespace 淘汰，账户 A 的写入能删除账户 B 的 Private/Project
+        // memory。无法在本域腾位时安全失败，而不越过隔离边界删除他人数据。
+        // 淘汰先于写入（生产默认下索引容量与 max_entries 相等，先写后淘汰
+        // 会被索引容量检查拒绝）；后续任一写入失败时 best-effort 恢复被淘汰
+        // 条目，避免“淘汰一条、没写进一条”的净丢失。
         let evicted = if self.count(namespace).await? >= self.max_entries {
-            self.evict_lowest(namespace).await?
+            self.evict_lowest_in_domain(namespace, dedupe_domain)
+                .await?
+                .ok_or_else(|| {
+                    MemoryError::Storage(
+                        "memory capacity is occupied by other isolated domains; no entry in the current domain can be evicted"
+                            .into(),
+                    )
+                })
+                .map(Some)?
         } else {
             None
         };
@@ -468,7 +570,13 @@ impl MemoryEngine {
             && let Ok(entry) = serde_json::from_value::<MemoryEntry>(raw)
         {
             let signature = content_signature(&entry.content, namespace.as_str());
-            let skey = sig_key(namespace, &signature);
+            // v2 条目按 metadata 中的去重域清理签名；无该字段（仅可能来自
+            // 旧版本写入的防御场景，全新部署无此数据）走 v1 签名兼容路径
+            // （不出现跨域误删）。
+            let skey = match entry_dedupe_domain(&entry.metadata) {
+                Some(domain) => sig_key_v2(namespace, domain, &signature),
+                None => sig_key(namespace, &signature),
+            };
             // 守卫：仅当签名仍指向本条时才删（同签名可能已被新条目接管）。
             if let Some(Value::String(mapped)) = self.memories.get(&skey).await?
                 && mapped == id
@@ -492,7 +600,11 @@ impl MemoryEngine {
         self.memories
             .delete_prefix(&namespace.storage_prefix())
             .await?;
+        // v1 与 v2 签名映射一并清除（v2 前缀含去重域哈希层）
         self.memories.delete_prefix(&sig_prefix(namespace)).await?;
+        self.memories
+            .delete_prefix(&sig_v2_prefix(namespace))
+            .await?;
         // remove_index 负责删除 embeddings 前缀与派生缓存
         self.vector.remove_index(namespace).await
     }
@@ -523,13 +635,14 @@ impl MemoryEngine {
             .collect())
     }
 
-    /// 淘汰保留权重（重要性 × 时间衰减）最低的一条记忆，返回其落盘快照
-    /// 供写入失败时恢复。损坏行（Envelope/JSON 无法解码）无检索价值，
-    /// 视为最低分优先淘汰，顺带回收其占用的容量；删除目标以 key 派生 id
-    /// 为准，避免行内 id 与 key 不一致时删空。
-    async fn evict_lowest(
+    /// 在指定去重域中淘汰保留权重（重要性 × 时间衰减）最低的一条记忆，
+    /// 返回其落盘快照供写入失败时恢复。域不匹配、损坏或缺少 domain 的
+    /// 旧行均跳过：容量回收绝不能以跨 owner/project 的数据删除为代价。
+    /// 删除目标以 key 派生 id 为准，避免行内 id 与 key 不一致时删空。
+    async fn evict_lowest_in_domain(
         &mut self,
         namespace: MemoryNamespace,
+        dedupe_domain: &str,
     ) -> Result<Option<EvictedSnapshot>, MemoryError> {
         let now = now_ms();
         let prefix = namespace.storage_prefix();
@@ -546,8 +659,11 @@ impl MemoryEngine {
                 Err(e) => return Err(e),
             };
             let score = match raw.and_then(|r| serde_json::from_value::<MemoryEntry>(r).ok()) {
-                Some(entry) => retention_score(&entry.metadata, entry.created_at, now),
-                None => f64::NEG_INFINITY,
+                Some(entry) if entry_dedupe_domain(&entry.metadata) == Some(dedupe_domain) => {
+                    retention_score(&entry.metadata, entry.created_at, now)
+                }
+                // 无法安全确认归属的行（包括旧 schema）一律不淘汰。
+                _ => continue,
             };
             if lowest.as_ref().is_none_or(|(_, s)| score < *s) {
                 lowest = Some((id.to_string(), score));
@@ -593,10 +709,11 @@ impl MemoryEngine {
         }
         // 签名映射恢复：仅当行可解码且签名槽位空闲（避免覆盖接管者）
         if let Ok(entry) = serde_json::from_value::<MemoryEntry>(raw.clone()) {
-            let skey = sig_key(
-                snapshot.namespace,
-                &content_signature(&entry.content, snapshot.namespace.as_str()),
-            );
+            let signature = content_signature(&entry.content, snapshot.namespace.as_str());
+            let skey = match entry_dedupe_domain(&entry.metadata) {
+                Some(domain) => sig_key_v2(snapshot.namespace, domain, &signature),
+                None => sig_key(snapshot.namespace, &signature),
+            };
             if matches!(self.memories.get(&skey).await, Ok(None)) {
                 let _ = self
                     .memories
@@ -625,5 +742,21 @@ impl MemoryEngine {
                 tracing::warn!(key = entry_key, error = %e, "evicted embedding snapshot undecodable; index node not restored");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::memory_id_from_components;
+
+    #[test]
+    fn memory_id_uses_randomness_to_separate_processes_in_same_millisecond() {
+        let signature = "0123456789abcdef0123456789abcdef";
+        // Separate processes/tabs both start their local counter at zero. The
+        // random component must still keep their physical storage keys apart.
+        let first = memory_id_from_components(42, 0, [1; 12], signature);
+        let second = memory_id_from_components(42, 0, [2; 12], signature);
+        assert_ne!(first, second);
+        assert!(first.starts_with("mem-42-0-"));
     }
 }

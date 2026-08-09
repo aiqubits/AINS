@@ -9023,6 +9023,9 @@ dependencies = [
  "tokio",
  "tracing",
  "ui",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
  "web-sys",
 ]
 

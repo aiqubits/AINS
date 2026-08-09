@@ -10,14 +10,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
+use wasm_bindgen::JsCast;
+use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::*;
+use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest};
 
 use agent_core::WasmRuntimeAdapter;
 use agent_core::memory::{
-    DefaultVectorIndexManager, IndexedDbBackend, KvStore, MemdirStore, MemoryEngine,
-    MemoryNamespace, Metric, NewMemoryEntry, TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_KV,
-    TABLE_MEMORIES, VectorIndexConfig, VectorIndexManager, format_iso_utc, now_ms,
-    spawn_ttl_sweeper,
+    DefaultVectorIndexManager, EncryptedKvStore, EncryptionKey, IndexedDbBackend, KvStore,
+    MemdirStore, MemoryEngine, MemoryNamespace, Metric, NewMemoryEntry, TABLE_EMBEDDINGS,
+    TABLE_HNSW_CACHE, TABLE_KV, TABLE_MEMORIES, VectorIndexConfig, VectorIndexManager,
+    format_iso_utc, now_ms, spawn_ttl_sweeper,
 };
 
 wasm_bindgen_test_configure!(run_in_browser);
@@ -49,6 +53,85 @@ fn test_config() -> VectorIndexConfig {
 
 async fn open_backend(db_name: &str) -> IndexedDbBackend {
     IndexedDbBackend::open(db_name).await.expect("open idb")
+}
+
+/// Create the database layout shipped before `MemoryStores`: schema version 1
+/// contains only the legacy generic KV object store. This lets the upgrade test
+/// exercise a real IndexedDB versionchange instead of merely opening a fresh
+/// v2 database.
+async fn create_legacy_v1_kv_only_database(db_name: &str) -> IdbDatabase {
+    let factory = web_sys::window()
+        .expect("no window")
+        .indexed_db()
+        .expect("indexedDB access")
+        .expect("indexedDB unavailable");
+    let open_req: IdbOpenDbRequest = factory
+        .open_with_u32(db_name, 1)
+        .expect("open legacy v1 database");
+
+    let request = open_req.clone();
+    let on_upgrade = Closure::once_into_js(move |_event: web_sys::Event| {
+        let db: IdbDatabase = request
+            .result()
+            .expect("legacy upgrade result")
+            .unchecked_into();
+        db.create_object_store(TABLE_KV)
+            .expect("create legacy kv store");
+    });
+    open_req.set_onupgradeneeded(Some(on_upgrade.unchecked_ref()));
+
+    let request: IdbRequest = open_req.into();
+    let opened = js_sys::Promise::new(&mut |resolve, reject| {
+        let request = request.clone();
+        let request_for_callback = request.clone();
+        let on_settled = Closure::once_into_js(move |event: web_sys::Event| {
+            if event.type_() == "error" {
+                let _ = reject.call1(
+                    &JsValue::UNDEFINED,
+                    &JsValue::from_str("legacy open failed"),
+                );
+            } else {
+                let value = request_for_callback.result().unwrap_or(JsValue::UNDEFINED);
+                let _ = resolve.call1(&JsValue::UNDEFINED, &value);
+            }
+        });
+        request.set_onsuccess(Some(on_settled.unchecked_ref()));
+        request.set_onerror(Some(on_settled.unchecked_ref()));
+    });
+    JsFuture::from(opened)
+        .await
+        .expect("open legacy v1 database")
+        .unchecked_into()
+}
+
+#[wasm_bindgen_test]
+async fn existing_v1_database_is_upgraded_with_all_memory_stores() {
+    let db_name = format!("ains-p2-v1-upgrade-{}", now_ms());
+    let legacy = create_legacy_v1_kv_only_database(&db_name).await;
+    legacy.close();
+
+    let backend = open_backend(&db_name).await;
+    for table in [
+        TABLE_KV,
+        TABLE_MEMORIES,
+        TABLE_EMBEDDINGS,
+        agent_core::memory::TABLE_DOCUMENTS,
+        TABLE_HNSW_CACHE,
+    ] {
+        let store = backend.store(table);
+        store
+            .set("migration/probe", &json!(table), None)
+            .await
+            .expect("upgraded store must be writable");
+        assert_eq!(
+            store
+                .get("migration/probe")
+                .await
+                .expect("upgraded store readable"),
+            Some(json!(table)),
+            "store {table} was not created during v1 upgrade"
+        );
+    }
 }
 
 async fn build_engine(backend: &IndexedDbBackend, namespace: MemoryNamespace) -> MemoryEngine {
@@ -195,6 +278,58 @@ async fn vector_search_returns_closest_and_survives_reload() {
         .await
         .unwrap();
     assert_eq!(hits[0].0.content, "coffee brewing");
+}
+
+#[wasm_bindgen_test]
+async fn unreadable_encrypted_embedding_does_not_disable_valid_recall() {
+    let backend = open_backend("ains-memory-encrypted-row-tolerance").await;
+    let raw_embeddings: Arc<dyn KvStore> = Arc::new(backend.store(TABLE_EMBEDDINGS));
+    // WASM executes this test on one browser thread. `KvStore` deliberately
+    // relaxes Send/Sync there, while the production MemoryEngine API still
+    // owns stores through Arc for cross-target parity.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let embeddings: Arc<dyn KvStore> = Arc::new(EncryptedKvStore::with_table_domain(
+        Arc::clone(&raw_embeddings),
+        EncryptionKey::from_bytes([7u8; 32]),
+        TABLE_EMBEDDINGS,
+    ));
+    let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.store(TABLE_HNSW_CACHE));
+    let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
+    manager
+        .create_index(MemoryNamespace::Personal, test_config())
+        .await
+        .unwrap();
+    let mut engine = MemoryEngine::new(
+        Arc::new(backend.store(TABLE_MEMORIES)),
+        Arc::clone(&embeddings),
+        Box::new(manager),
+    );
+    let vector = embed_text("valid encrypted recall fact");
+    engine
+        .remember(
+            MemoryNamespace::Personal,
+            "valid encrypted recall fact",
+            &vector,
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    // Write malformed raw data outside the wrapper. Loading must skip only
+    // this row and preserve the valid encrypted embedding.
+    raw_embeddings
+        .set("personal/tampered", &json!({ "not": "sealed" }), None)
+        .await
+        .unwrap();
+
+    let hits = engine
+        .search(MemoryNamespace::Personal, &vector, 5)
+        .await
+        .unwrap();
+    assert!(
+        hits.iter()
+            .any(|(entry, _)| entry.content == "valid encrypted recall fact")
+    );
 }
 
 #[wasm_bindgen_test]

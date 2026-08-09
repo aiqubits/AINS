@@ -199,10 +199,9 @@ impl HnswVectorIndex {
         self.len() == 0
     }
 
-    /// 物理槽位是否已饱和：槽位全占且**无墓碑可回收**。饱和时新增/更新
-    /// 在物理上都必须插入新节点（hnsw_rs 无真更新，同 id 更新也墓碑旧节点
-    /// 并插入新节点），重建也无法回收任何槽位——管理器应确定性拒绝而非
-    /// 走「写→重建→仍满→写」的 O(N) 每写全量重建循环（review 修复）。
+    /// 物理槽位是否已饱和：槽位全占且**无墓碑可回收**。饱和时新增节点
+    /// 无法从 SoT 重建腾出空间，管理器应确定性拒绝；同 id 更新则会请求
+    /// 从已更新的 SoT 重建，以回收被该更新取代的物理节点。
     pub(crate) fn is_physically_saturated(&self) -> bool {
         self.tombstones.is_empty() && self.ids.len() >= self.max_slots
     }
@@ -294,8 +293,17 @@ impl HnswVectorIndex {
             let Some(node_id) = key.strip_prefix(&prefix) else {
                 continue;
             };
-            let Some(value) = embeddings.get(&key).await? else {
-                continue;
+            let value = match embeddings.get(&key).await {
+                Ok(Some(value)) => value,
+                Ok(None) => continue,
+                // A corrupted or undecryptable individual row must not make
+                // the entire derived index unavailable.  The valid embedding
+                // rows remain the source of a usable recall index.
+                Err(MemoryError::Serialization(e)) | Err(MemoryError::Encryption(e)) => {
+                    tracing::warn!(key, error = %e, "skipping unreadable embedding row during HNSW load");
+                    continue;
+                }
+                Err(e) => return Err(e),
             };
             // 单行损坏（无法解码/维度不符/容量超限）跳过，不拖垮整个索引加载。
             let Ok(vector) = vector_from_value(&value) else {
@@ -330,6 +338,10 @@ impl VectorIndex for HnswVectorIndex {
 
     fn is_physically_saturated(&self) -> bool {
         HnswVectorIndex::is_physically_saturated(self)
+    }
+
+    fn contains_node(&self, node_id: &str) -> bool {
+        self.lookup.contains_key(node_id)
     }
 
     async fn search(&self, query: &[f32], top_k: usize) -> Result<Vec<(String, f32)>, MemoryError> {

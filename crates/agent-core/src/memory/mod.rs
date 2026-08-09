@@ -9,6 +9,8 @@ pub mod kv_crypto;
 pub mod manage;
 pub mod memdir;
 pub mod parser;
+pub mod service;
+pub mod stores;
 pub mod ttl;
 pub mod vector;
 pub mod vector_manager;
@@ -42,6 +44,12 @@ pub use memdir::{
     SCHEMA_VERSION, format_iso_utc, generate_memory_id, parse_iso_utc, slugify,
 };
 pub use parser::{DocumentKind, MAX_CHUNK_CHARS, chunk_document, extract_pdf_text};
+pub use service::{
+    DurableMemoryMetadata, EmbeddingContract, ExtractionReason, ExtractionState, MemoryContext,
+    MemoryHit, MemoryService, MemoryServiceConfig, build_durable_manifest, extract_digest,
+    is_visible, owner_key_for_id,
+};
+pub use stores::{MemoryBackend, MemoryStores, open_memory_stores, prepare_encryption};
 pub use ttl::{DEFAULT_SWEEP_INTERVAL, SweeperHandle, spawn_ttl_sweeper};
 pub use vector::{
     MemoryEntry, MemoryNamespace, Metric, VECTOR_MAX_ENTRIES, VECTOR_MAX_ENTRIES_WEB, VectorIndex,

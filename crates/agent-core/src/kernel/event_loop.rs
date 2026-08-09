@@ -28,6 +28,7 @@ use crate::kernel::fsm;
 use crate::kernel::messages::{
     ContentBlock, ConversationMessage, Role, ToolUse, sanitize_conversation_messages,
 };
+use crate::kernel::provider::AsyncSystemPromptProvider;
 use crate::kernel::state::{AgentEvent, AgentState, CompactTrigger, SystemEventType};
 use crate::kernel::stream_events::StreamEvent;
 use crate::model_client::{
@@ -54,7 +55,7 @@ const STREAM_COMPLETE_TAIL_TIMEOUT: Duration = Duration::from_millis(500);
 /// output without conflating ordinary status updates (such as retries).
 pub const QUERY_INTERRUPTED_STATUS: &str = "Query interrupted by user.";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentKernelConfig {
     pub cwd: PathBuf,
     /// 单次用户输入内的模型轮数上限（对齐基线 QueryEngine 默认 `max_turns=8`）。
@@ -66,6 +67,24 @@ pub struct AgentKernelConfig {
     /// 目标模型；`None` 时由 AI Gateway 按套餐路由。
     pub model: Option<String>,
     pub max_output_tokens: u32,
+    /// 动态 system prompt provider（§12）：Querying 构造 ModelRequest 前
+    /// await 一次，注入 memory recall 段。失败/无内容回落原提示。
+    pub memory_provider: Option<Arc<dyn AsyncSystemPromptProvider>>,
+}
+
+impl std::fmt::Debug for AgentKernelConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // memory_provider 是 trait object（无 Debug）；其余字段可展示。
+        f.debug_struct("AgentKernelConfig")
+            .field("cwd", &self.cwd)
+            .field("max_turns", &self.max_turns)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("system_prompt", &self.system_prompt)
+            .field("model", &self.model)
+            .field("max_output_tokens", &self.max_output_tokens)
+            .field("has_memory_provider", &self.memory_provider.is_some())
+            .finish()
+    }
 }
 
 impl Default for AgentKernelConfig {
@@ -77,6 +96,7 @@ impl Default for AgentKernelConfig {
             system_prompt: None,
             model: None,
             max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
+            memory_provider: None,
         }
     }
 }
@@ -334,7 +354,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                         let request = ModelRequest {
                             model: self.config.model.clone(),
                             messages: self.context.conversation.clone(),
-                            system_prompt: self.effective_system_prompt(),
+                            system_prompt: self.build_system_prompt().await,
                             max_output_tokens: self.config.max_output_tokens,
                             tools: self.api_schemas(),
                         };
@@ -360,6 +380,7 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                                     self.emit(StreamEvent::AssistantTurnComplete {
                                         message,
                                         usage,
+                                        tool_metadata: self.context.tool_metadata.clone(),
                                     });
                                     if tool_uses.is_empty() {
                                         // 无工具请求，回答完成
@@ -447,6 +468,12 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                                 output: outcome.output.clone(),
                                 is_error: outcome.is_error,
                                 metadata: outcome.metadata.clone(),
+                                // `dispatch_many` has returned, so the shared
+                                // metadata contains this batch's mutations.
+                                // The host persists after every completed tool
+                                // result and must not retain the pre-dispatch
+                                // AssistantTurnComplete snapshot.
+                                tool_metadata: self.context.tool_metadata.clone(),
                             });
                             // 拒绝/失败不中止循环：作为 is_error 的 tool_result 回填
                             results.push(ContentBlock::ToolResult {
@@ -697,6 +724,18 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
         .await;
         self.context.conversation = compacted_messages;
 
+        // 压缩完成事件（§11.1）：仅实际发生压缩后 emit 一次，供宿主触发
+        // ordered checkpoint + background durable extraction。
+        if compacted {
+            self.emit(StreamEvent::Compacted {
+                trigger,
+                // 在工具执行后的下一次 Querying 中压缩时，这里已经包含本轮
+                // dispatch 对 metadata 的全部更新；宿主不可复用前一个
+                // AssistantTurnComplete（它发生在 dispatch 之前）的快照。
+                tool_metadata: self.context.tool_metadata.clone(),
+            });
+        }
+
         let mut payload = lifecycle_payload(HookEvent::PostCompact, &self.config.cwd);
         payload.insert(
             "trigger".into(),
@@ -712,17 +751,27 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
         self.tools.api_schemas()
     }
 
-    /// 每轮生效的 system prompt：宿主基础提示（可选）+ 当前权限模式段。
+    /// 每轮生效的 system prompt：宿主基础提示（可选）+ 动态 memory 段
+    /// （§12，provider 提供）+ 当前权限模式段。
     ///
-    /// 模式段必须每轮动态拼接而非固化在 config：会话中模式会经 UI
-    /// 开关或 enter/exit_plan_mode 工具改变，Plan 下模型需要事先收到
-    /// “勿调写工具”的指引，减少“试错→被拒→再退出”的多余轮次
-    /// （权限引擎仍是硬边界，本段仅为提前引导）。
-    fn effective_system_prompt(&self) -> Option<String> {
+    /// 拼装顺序固定：base → dynamic memory → permission mode（权限段必须
+    /// 位于最后，Plan 下模型需要事先收到“勿调写工具”的指引，减少“试错→
+    /// 被拒→再退出”的多余轮次；权限引擎仍是硬边界，本段仅为提前引导）。
+    /// provider 失败/无内容返回 `None` 时回落 base + mode（§12.2）。
+    async fn build_system_prompt(&self) -> Option<String> {
         let mode_section = permission_mode_section(self.tools.permissions().mode());
-        Some(match &self.config.system_prompt {
-            Some(base) => format!("{base}\n\n{mode_section}"),
-            None => mode_section,
+        let base = self.config.system_prompt.clone();
+        let dynamic = match &self.config.memory_provider {
+            Some(provider) => provider.provide(&self.context.conversation).await,
+            None => None,
+        };
+        Some(match (base, dynamic) {
+            (Some(base), Some(dynamic)) => {
+                format!("{base}\n\n{dynamic}\n\n{mode_section}")
+            }
+            (Some(base), None) => format!("{base}\n\n{mode_section}"),
+            (None, Some(dynamic)) => format!("{dynamic}\n\n{mode_section}"),
+            (None, None) => mode_section,
         })
     }
 

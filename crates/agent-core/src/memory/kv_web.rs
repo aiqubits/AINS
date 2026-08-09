@@ -26,6 +26,12 @@ use web_sys::{
 use crate::error::MemoryError;
 use crate::memory::kv::{ALL_TABLES, Envelope, KvStore, now_ms};
 
+/// IndexedDB schema version. Version 1 contained only the legacy `kv` store;
+/// version 2 adds the four Memory/Vector stores introduced with `MemoryStores`.
+/// Keep this explicit so adding a new logical table always requires a storage
+/// migration rather than silently leaving existing browser profiles behind.
+const DB_SCHEMA_VERSION: u32 = 2;
+
 fn storage_err(context: &str, e: impl std::fmt::Debug) -> MemoryError {
     MemoryError::Storage(format!("{context}: {e:?}"))
 }
@@ -122,7 +128,10 @@ impl IndexedDbBackend {
             .map_err(|e| storage_err("indexedDB access", e))?
             .ok_or_else(|| MemoryError::Storage("indexedDB unavailable".into()))?;
         let open_req: IdbOpenDbRequest = factory
-            .open_with_u32(db_name, 1)
+            // Do not keep this at v1: existing AINS browser profiles created
+            // before MemoryStores have only `kv`, and IndexedDB only invokes
+            // `onupgradeneeded` when the requested version increases.
+            .open_with_u32(db_name, DB_SCHEMA_VERSION)
             .map_err(|e| storage_err("open", e))?;
 
         let req_clone = open_req.clone();
@@ -132,6 +141,9 @@ impl IndexedDbBackend {
             if let Ok(result) = req_clone.result() {
                 let db: IdbDatabase = result.unchecked_into();
                 for name in ALL_TABLES {
+                    // Existing stores make `create_object_store` return a
+                    // ConstraintError; intentionally continue so a v1 → v2
+                    // upgrade still creates every missing store.
                     let _ = db.create_object_store(name);
                 }
             }

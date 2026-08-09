@@ -90,29 +90,6 @@ impl DefaultVectorIndexManager {
             .and_then(|slot| slot.try_lock())
             .is_some_and(|guard| matches!(&*guard, IndexSlot::Loaded { .. }))
     }
-
-    /// 将指定 namespace 的派生数据落盘（Native 写 hnsw_cache；Web no-op）。
-    /// 尚未物化（`Pending`）的索引无内存派生数据可持久化，跳过。
-    pub async fn save_index(&self, namespace: MemoryNamespace) -> Result<(), MemoryError> {
-        let slot = self
-            .indexes
-            .get(&namespace)
-            .ok_or(MemoryError::NamespaceNotFound(namespace))?;
-        match &*slot.lock().await {
-            IndexSlot::Loaded { index, .. } => index.save(&*self.hnsw_cache).await,
-            IndexSlot::Pending(_) => Ok(()),
-        }
-    }
-
-    /// 关闭前保存全部**已物化**索引的派生数据（`Pending` 跳过）。
-    pub async fn save_all(&self) -> Result<(), MemoryError> {
-        for slot in self.indexes.values() {
-            if let IndexSlot::Loaded { index, .. } = &*slot.lock().await {
-                index.save(&*self.hnsw_cache).await?;
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
@@ -124,8 +101,13 @@ impl VectorIndexManager for DefaultVectorIndexManager {
         config: VectorIndexConfig,
     ) -> Result<(), MemoryError> {
         // 懒加载：仅登记配置，不做任何 I/O、不重建图（冷启动优化核心）。
+        // insert-if-absent：已登记（Pending/Loaded）保持原状——
+        // `ensure_embedding_contract` 在每次 search/write 都会调用本入口，
+        // 若无条件重置为 Pending，已物化索引会被反复从 SoT 全量重建
+        // （性能回归，§15 懒加载语义）。
         self.indexes
-            .insert(namespace, Mutex::new(IndexSlot::Pending(config)));
+            .entry(namespace)
+            .or_insert_with(|| Mutex::new(IndexSlot::Pending(config)));
         Ok(())
     }
 
@@ -160,13 +142,12 @@ impl VectorIndexManager for DefaultVectorIndexManager {
             Some(slot) => {
                 let (result, rebuild_required, config) = match slot.get_mut() {
                     IndexSlot::Loaded { config, index } => {
-                        // 物理饱和（槽位全占 + 无墓碑可回收）：本次写入即使
-                        // 触发重建也无法回收任何槽位（见 is_physically_saturated
-                        // 注释）——确定性拒绝（与 Web 端容量上限语义一致），
-                        // 避免"写→重建→仍满→写"的 O(N) 每写全量重建。
-                        // SoT 行由调用方（engine）回滚，索引保持与回滚后的
-                        // SoT 一致（未替换）。移除条目腾出槽位后自动恢复。
-                        if index.is_physically_saturated() {
+                        // 物理饱和（槽位全占 + 无墓碑可回收）时，新增节点即使
+                        // 重建也无法腾出空间，故确定性拒绝，避免 "写→重建→
+                        // 仍满→写" 的 O(N) 循环。已有节点刷新不会增加 SoT 的
+                        // 活跃条目数；HNSW 会请求从已更新 SoT 重建，以回收旧
+                        // 物理节点，不能在此提前拒绝。
+                        if index.is_physically_saturated() && !index.contains_node(node_id) {
                             return Err(MemoryError::Storage(
                                 "vector index is physically saturated (all physical slots \
                                  occupied, no tombstones to reclaim); remove entries to make \
@@ -270,6 +251,26 @@ impl VectorIndexManager for DefaultVectorIndexManager {
             // 上一分支已把 Pending 物化为 Loaded，此处不可达。
             IndexSlot::Pending(_) => unreachable!("index materialized above"),
         }
+    }
+
+    async fn save_index(&self, namespace: MemoryNamespace) -> Result<(), MemoryError> {
+        let slot = self
+            .indexes
+            .get(&namespace)
+            .ok_or(MemoryError::NamespaceNotFound(namespace))?;
+        match &*slot.lock().await {
+            IndexSlot::Loaded { index, .. } => index.save(&*self.hnsw_cache).await,
+            IndexSlot::Pending(_) => Ok(()),
+        }
+    }
+
+    async fn save_all(&self) -> Result<(), MemoryError> {
+        for slot in self.indexes.values() {
+            if let IndexSlot::Loaded { index, .. } = &*slot.lock().await {
+                index.save(&*self.hnsw_cache).await?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -421,8 +422,8 @@ mod tests {
         assert_eq!(hits.first().map(|hit| hit.0.as_str()), Some("recovered"));
     }
 
-    /// 模拟物理饱和的 HNSW（槽位全占且无墓碑可回收）：管理器必须在 add
-    /// 入口确定性拒绝，且不得触碰 add / rebuild 信号（更不得触发全量重建）。
+    /// 模拟物理饱和的 HNSW（槽位全占且无墓碑可回收）的新增节点：管理器
+    /// 必须在 add 入口确定性拒绝，且不得触碰 add / rebuild 信号。
     struct SaturatedIndex;
 
     #[async_trait::async_trait]
@@ -482,6 +483,78 @@ mod tests {
         );
     }
 
+    /// 饱和索引中的已存在节点刷新，HNSW 会要求重建派生图；管理器不能把
+    /// 它误判成新增而提前拒绝，否则 SoT-first 的去重更新会被引擎回滚。
+    struct SaturatedExistingIndex;
+
+    #[async_trait::async_trait]
+    impl VectorIndex for SaturatedExistingIndex {
+        async fn add(&mut self, _node_id: &str, _vector: &[f32]) -> Result<(), MemoryError> {
+            Err(MemoryError::Storage("physical slots exhausted".into()))
+        }
+
+        fn take_rebuild_required(&mut self) -> bool {
+            true
+        }
+
+        fn is_physically_saturated(&self) -> bool {
+            true
+        }
+
+        fn contains_node(&self, node_id: &str) -> bool {
+            node_id == "existing"
+        }
+
+        async fn search(
+            &self,
+            _query: &[f32],
+            _top_k: usize,
+        ) -> Result<Vec<(String, f32)>, MemoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn remove(&mut self, _node_id: &str) -> Result<(), MemoryError> {
+            Ok(())
+        }
+
+        async fn save(&self, _kv: &dyn KvStore) -> Result<(), MemoryError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn saturated_existing_node_refresh_rebuilds_from_sot() {
+        let embeddings: Arc<dyn KvStore> = Arc::new(MockKv::new());
+        let cache: Arc<dyn KvStore> = Arc::new(MockKv::new());
+        let namespace = MemoryNamespace::Personal;
+        // SoT-first contract: the updated embedding is already durable before
+        // the HNSW add attempts to allocate its replacement physical node.
+        embeddings
+            .set(
+                &namespace.storage_key("existing"),
+                &vector_to_value(&[0.0, 1.0]),
+                None,
+            )
+            .await
+            .unwrap();
+        let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), cache);
+        manager.indexes.insert(
+            namespace,
+            Mutex::new(IndexSlot::Loaded {
+                config: config(),
+                index: Box::new(SaturatedExistingIndex),
+            }),
+        );
+
+        manager
+            .add(namespace, "existing", &[0.0, 1.0])
+            .await
+            .unwrap();
+
+        let hits = manager.search(namespace, &[0.0, 1.0], 1).await.unwrap();
+        assert_eq!(hits.first().map(|hit| hit.0.as_str()), Some("existing"));
+    }
+
     fn pending_manager() -> (DefaultVectorIndexManager, Arc<MockKv>) {
         let embeddings = Arc::new(MockKv::new());
         let cache: Arc<dyn KvStore> = Arc::new(MockKv::new());
@@ -512,6 +585,47 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0,
             "top_k=0 不得读 SoT"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_index_is_idempotent_and_preserves_materialized_index() {
+        // H1 回归：ensure_embedding_contract 每次 search/write 都会调用
+        // create_index；若无条件重置为 Pending，已物化索引会被反复从 SoT
+        // 全量重建。insert-if-absent 语义必须保持 Loaded 状态与 list 计数。
+        let (mut manager, embeddings) = pending_manager();
+        // 首次 search 触发物化（Pending → Loaded，读 SoT 一次）
+        manager
+            .search(MemoryNamespace::Personal, &[1.0, 0.0], 1)
+            .await
+            .unwrap();
+        assert!(manager.is_loaded(MemoryNamespace::Personal));
+        let after_materialize = embeddings
+            .list_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(after_materialize, 1, "首次 search 物化只读一次 SoT");
+
+        // 模拟 ensure_embedding_contract 的重复 create_index 调用
+        manager
+            .create_index(MemoryNamespace::Personal, config())
+            .await
+            .unwrap();
+        assert!(
+            manager.is_loaded(MemoryNamespace::Personal),
+            "重复 create_index 不得重置已物化索引"
+        );
+
+        // 再次 search：不得重新物化（list_calls 不增加）
+        manager
+            .search(MemoryNamespace::Personal, &[1.0, 0.0], 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            embeddings
+                .list_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            after_materialize,
+            "重复 search 不得触发从 SoT 全量重建"
         );
     }
 

@@ -115,6 +115,10 @@ async fn kernel_auto_compacts_then_answers() {
     }
     let preloaded_tokens = estimate_message_tokens(&history);
     kernel.context_mut().conversation = history;
+    kernel
+        .context_mut()
+        .tool_metadata
+        .record_active_artifact("artifact://created-before-compaction");
 
     // 提交新输入 + 关闭
     event_tx
@@ -153,6 +157,27 @@ async fn kernel_auto_compacts_then_answers() {
     assert!(
         !phases.contains(&"session_memory_end") && !phases.contains(&"compact_start"),
         "compaction must stop at level 2, phases: {phases:?}"
+    );
+
+    // Compacted is a completion trigger, not a replacement conversation
+    // snapshot. The host retains its full mirror for session persistence and
+    // checkpoint/extraction, while Kernel uses the compacted context below for
+    // its next model request.
+    let compacted_metadata = events
+        .iter()
+        .find_map(|event| match event {
+            StreamEvent::Compacted { tool_metadata, .. } => Some(tool_metadata),
+            _ => None,
+        })
+        .expect("expected completed-compaction snapshot event");
+    assert_eq!(
+        compacted_metadata.active_artifacts,
+        ["artifact://created-before-compaction"],
+        "Compacted must expose the current metadata for the host checkpoint"
+    );
+    assert!(
+        estimate_message_tokens(&model.recorded_requests()[0].messages) < preloaded_tokens,
+        "Kernel must still use its reduced context for the next model turn"
     );
 
     // 断言 2：压缩后仍完成回答
