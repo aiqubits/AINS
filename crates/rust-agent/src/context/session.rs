@@ -5,8 +5,8 @@
 //! - 落盘前 `sanitize_conversation_messages`（丢空 assistant、修剪悬空 tool_use）；
 //! - `tool_metadata` 白名单：结构化状态字段全量保留，自由 `extra` 仅保留白名单键；
 //! - 按项目隔离：key 前缀 = `session/{basename}-{sha256(cwd)[:12]}/`；
-//! - latest + 按 id 双写：先写按 id 条目（完整快照），再更新 latest 指针，
-//!   KvStore 单键 set 各自原子（redb 事务 / IndexedDB 事务）。
+//! - 每个项目只保留一个 canonical current snapshot；session_id 仅用于
+//!   清空屏障、checkpoint 与长期记忆的来源追踪，不构成可恢复的历史列表。
 
 use std::path::Path;
 use std::sync::Arc;
@@ -14,18 +14,20 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::error::AgentError;
+use crate::error::{AgentError, MemoryError};
 use crate::kernel::messages::{ConversationMessage, sanitize_conversation_messages};
 use crate::memory::{KvStore, now_ms};
 use crate::model_client::UsageSnapshot;
 use crate::tools::ToolMetadata;
 
-/// 快照 summary 的最大字符数（对齐基线首条 user 消息前 80 字符）。
-pub const SUMMARY_MAX_CHARS: usize = 80;
-/// `list` 默认返回的最大条目数（对齐基线 `limit = 20`）。
-pub const DEFAULT_LIST_LIMIT: usize = 20;
 /// session_id 的十六进制长度（对齐基线 uuid4 hex 前 12 位）。
 pub const SESSION_ID_HEX_LEN: usize = 12;
+
+/// 已清空会话的持久化屏障。所有旧 session 的 snapshot/checkpoint/memory 写入
+/// 都必须检查它，避免另一个标签页或恢复实例在清空后重新落盘。
+pub(crate) fn cleared_session_key(owner_key: &str, project_key: &str, session_id: &str) -> String {
+    format!("memory/cleared_sessions/{owner_key}/{project_key}/{session_id}")
+}
 
 /// `ToolMetadata.extra` 中允许持久化的键白名单（对齐基线
 /// `_PERSISTED_TOOL_METADATA_KEYS` 的非结构化子集；结构化字段
@@ -53,21 +55,16 @@ pub struct SessionSnapshot {
     pub usage: UsageSnapshot,
     #[serde(default)]
     pub tool_metadata: ToolMetadata,
-    pub created_at_ms: i64,
-    #[serde(default)]
-    pub summary: String,
-    #[serde(default)]
-    pub message_count: usize,
 }
 
-/// 会话列表摘要（`list` 返回；仅携带摘要字段，不向调用方暴露完整
-/// 消息；每条目仍需完整反序列化后丢弃消息，条数受 limit 约束）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionSummary {
-    pub session_id: String,
-    pub summary: String,
-    pub created_at_ms: i64,
-    pub message_count: usize,
+/// 清空会话的可观测结果。
+///
+/// `clear_current` 返回 `Ok` 即表示 tombstone 已持久化，会话已在读取侧
+/// 不可见且调用方可安全切换到新 session。`cleanup_failures` 仅表示对旧
+/// 物理记录的尽力回收尚有失败，不能据此继续使用已清空的 session。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionClearOutcome {
+    pub cleanup_failures: Vec<String>,
 }
 
 /// 会话快照的构造输入（`session_id` 为空时自动生成）。
@@ -117,86 +114,183 @@ impl SessionStore {
         }
     }
 
-    /// 持久化快照：sanitize → 白名单过滤 → 双写（按 id + latest）。返回 session_id。
+    /// MemoryService 对 owner 一律使用不可逆摘要。Native 的 session snapshot
+    /// 为兼容旧数据仍保留无 owner 前缀的键，但其 checkpoint/status/tombstone
+    /// 必须使用相同的 memory owner key，否则清空会漏删这些会话工件。
+    fn memory_owner_key(&self) -> String {
+        self.owner_scope
+            .clone()
+            .unwrap_or_else(|| crate::memory::owner_key_for_id("local"))
+    }
+
+    /// 跨标签页的项目级会话操作锁名。产品定义为每个终端/项目只有一个
+    /// 当前历史，保存和清空必须争用同一把锁，不能再按 session_id 分锁。
+    pub fn operation_lock_name(&self, cwd: &str) -> String {
+        format!(
+            "ains-current-session-v1/{}/{}",
+            self.memory_owner_key(),
+            project_slug(cwd)
+        )
+    }
+
+    async fn session_was_cleared(&self, cwd: &str, session_id: &str) -> Result<bool, AgentError> {
+        let owner_key = self.memory_owner_key();
+        Ok(self
+            .kv
+            .get(&cleared_session_key(
+                &owner_key,
+                &project_slug(cwd),
+                session_id,
+            ))
+            .await?
+            .is_some())
+    }
+
+    async fn reject_cleared_session(&self, cwd: &str, session_id: &str) -> Result<(), AgentError> {
+        if self.session_was_cleared(cwd, session_id).await? {
+            return Err(AgentError::Memory(MemoryError::Storage(
+                "refusing snapshot write for a cleared session".into(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// 清空屏障可能在 current snapshot 的写入期间落下。拒绝写入时仅当
+    /// current 仍指向同一 session 时删除它，避免误删另一个终端的当前会话。
+    async fn reject_and_cleanup_cleared_snapshot(
+        &self,
+        cwd: &str,
+        slug: &str,
+        session_id: &str,
+    ) -> Result<(), AgentError> {
+        if !self.session_was_cleared(cwd, session_id).await? {
+            return Ok(());
+        }
+        let current = current_key(slug);
+        if let Ok(Some(snapshot)) = self.load_key(&current).await
+            && snapshot.session_id == session_id
+        {
+            let _ = self.kv.delete(&current).await;
+        }
+        Err(AgentError::Memory(MemoryError::Storage(
+            "refusing snapshot write for a cleared session".into(),
+        )))
+    }
+
+    /// 持久化唯一的当前快照：sanitize → 白名单过滤 → 单键覆盖。返回的
+    /// session_id 只标识清空边界，不能用于恢复历史会话。
     pub async fn save(&self, input: SessionSaveInput) -> Result<String, AgentError> {
         let now = now_ms();
         let session_id = input
             .session_id
             .filter(|id| !id.trim().is_empty())
             .unwrap_or_else(|| generate_session_id(now, &input.cwd));
+        self.reject_cleared_session(&input.cwd, &session_id).await?;
+        let slug = self.scoped_slug(&input.cwd);
+        let current = current_key(&slug);
 
         let messages = sanitize_conversation_messages(input.messages);
-        let summary = extract_summary(&messages);
         let snapshot = SessionSnapshot {
             session_id: session_id.clone(),
             cwd: input.cwd.clone(),
             model: input.model,
             system_prompt: input.system_prompt,
-            message_count: messages.len(),
-            summary,
             messages,
             usage: input.usage,
             tool_metadata: persistable_tool_metadata(&input.tool_metadata),
-            created_at_ms: now,
         };
         let value = serde_json::to_value(&snapshot)
             .map_err(|e| AgentError::Model(format!("session snapshot encode failed: {e}")))?;
 
-        let slug = self.scoped_slug(&input.cwd);
-        // 先写按 id 的完整条目，再更新 latest 指针（崩溃时按 id 条目仍完整）。
-        self.kv
-            .set(&entry_key(&slug, &session_id), &value, None)
+        // 新版本不再读取或写入历史 entry；保存时顺便清除旧版本残留。
+        self.kv.delete_prefix(&legacy_entry_prefix(&slug)).await?;
+        self.kv.set(&current, &value, None).await?;
+        // 单键写之后仍须重查：另一个标签页可能恰好在 set 期间完成清空。
+        self.reject_and_cleanup_cleared_snapshot(&input.cwd, &slug, &session_id)
             .await?;
-        self.kv.set(&latest_key(&slug), &value, None).await?;
         Ok(session_id)
     }
 
-    /// 读取项目最近快照（latest 指针）；回载时再 sanitize 一次。
-    pub async fn load_latest(&self, cwd: &str) -> Result<Option<SessionSnapshot>, AgentError> {
+    /// 读取项目唯一的当前快照；回载时再 sanitize 一次。
+    pub async fn load_current(&self, cwd: &str) -> Result<Option<SessionSnapshot>, AgentError> {
         let slug = self.scoped_slug(cwd);
-        self.load_key(&latest_key(&slug)).await
+        let snapshot = self.load_key(&current_key(&slug)).await?;
+        match snapshot {
+            Some(snapshot) if self.session_was_cleared(cwd, &snapshot.session_id).await? => {
+                Ok(None)
+            }
+            snapshot => Ok(snapshot),
+        }
     }
 
-    /// 按 id 读取快照：先试命名条目，再回退 latest（id 匹配或字面 "latest"）。
-    pub async fn load_by_id(
+    /// 删除当前会话的持久化快照。
+    ///
+    /// `current` 只有仍指向指定会话时才删除，避免陈旧界面误删后来创建的
+    /// 当前会话。旧版本遗留的历史 entry 会在这里一并清除。
+    pub async fn clear_current(
         &self,
         cwd: &str,
         session_id: &str,
-    ) -> Result<Option<SessionSnapshot>, AgentError> {
+    ) -> Result<SessionClearOutcome, AgentError> {
         let slug = self.scoped_slug(cwd);
-        if let Some(snapshot) = self.load_key(&entry_key(&slug, session_id)).await? {
-            return Ok(Some(snapshot));
-        }
-        if let Some(latest) = self.load_key(&latest_key(&slug)).await?
-            && (latest.session_id == session_id || session_id == "latest")
-        {
-            return Ok(Some(latest));
-        }
-        Ok(None)
-    }
+        // 会话快照使用 `scoped_slug`，但 MemoryService 的 checkpoint/status
+        // 使用独立的 owner + project_key 两级键；Web 的 scoped slug 中已包含
+        // owner，不能直接复用，否则会漏删这些会话工件。
+        let project_key = project_slug(cwd);
+        let current = current_key(&slug);
 
-    /// 列出项目会话摘要（按 created_at 降序，截断 limit；latest 指针不重复计入）。
-    ///
-    /// 无法反序列化的损坏条目跳过而非整表失败（对齐基线 `list_sessions`
-    /// 对 JSONDecodeError/OSError 逐条 continue）。
-    pub async fn list(&self, cwd: &str, limit: usize) -> Result<Vec<SessionSummary>, AgentError> {
-        let slug = self.scoped_slug(cwd);
-        let prefix = entry_prefix(&slug);
-        let keys = self.kv.list_prefix(&prefix).await?;
-        let mut summaries = Vec::new();
-        for key in keys {
-            if let Ok(Some(snapshot)) = self.load_key(&key).await {
-                summaries.push(SessionSummary {
-                    session_id: snapshot.session_id,
-                    summary: snapshot.summary,
-                    created_at_ms: snapshot.created_at_ms,
-                    message_count: snapshot.message_count,
-                });
-            }
+        // tombstone 是整个清空操作的提交点。它无法建立时不能删除任何历史，
+        // 否则旧标签页仍可回写；已建立后即使物理回收部分失败，也必须让
+        // 调用方切换到新会话，避免 UI 保留一个已经不可再持久化的旧 session。
+        if !self.session_was_cleared(cwd, session_id).await? {
+            self.kv
+                .set(
+                    &cleared_session_key(&self.memory_owner_key(), &project_key, session_id),
+                    &serde_json::Value::Bool(true),
+                    None,
+                )
+                .await?;
         }
-        summaries.sort_by_key(|s| std::cmp::Reverse(s.created_at_ms));
-        summaries.truncate(limit);
-        Ok(summaries)
+
+        // 各逻辑键没有跨表事务；即使其中一个删除失败，也继续尝试剩余目标，
+        // 尽可能回收物理记录，并把失败交给 UI 以警告用户。
+        let mut failures = Vec::new();
+        let owner_key = self.memory_owner_key();
+        match self.load_key(&current).await {
+            Ok(Some(snapshot)) if snapshot.session_id == session_id => {
+                if let Err(error) = self.kv.delete(&current).await {
+                    failures.push(format!("current: {error}"));
+                }
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(format!("read current: {error}")),
+        }
+        if let Err(error) = self.kv.delete_prefix(&legacy_entry_prefix(&slug)).await {
+            failures.push(format!("legacy entries: {error}"));
+        }
+        // checkpoint/status 与会话快照同在 kv 表，但它们属于当前会话历史，
+        // 即使 MemoryService 因配置或初始化失败不可用也必须一并清除。
+        if let Err(error) = self
+            .kv
+            .delete(&format!(
+                "memory/checkpoints/{owner_key}/{project_key}/{session_id}.md"
+            ))
+            .await
+        {
+            failures.push(format!("checkpoint: {error}"));
+        }
+        if let Err(error) = self
+            .kv
+            .delete_prefix(&format!(
+                "memory/status/{owner_key}/{project_key}/{session_id}/"
+            ))
+            .await
+        {
+            failures.push(format!("status: {error}"));
+        }
+        Ok(SessionClearOutcome {
+            cleanup_failures: failures,
+        })
     }
 
     /// 读取并反序列化单个快照 key（回载时对消息再 sanitize，对齐基线
@@ -208,7 +302,6 @@ impl SessionStore {
         let mut snapshot: SessionSnapshot = serde_json::from_value(value)
             .map_err(|e| AgentError::Model(format!("session snapshot decode failed: {e}")))?;
         snapshot.messages = sanitize_conversation_messages(snapshot.messages);
-        snapshot.message_count = snapshot.messages.len();
         Ok(Some(snapshot))
     }
 }
@@ -232,24 +325,24 @@ pub fn project_slug(cwd: &str) -> String {
     format!("{basename}-{hex}")
 }
 
-fn entry_prefix(slug: &str) -> String {
+/// Pre-single-history key prefix. It is only used to erase data written by
+/// previous releases; no production read/write path treats these as sessions.
+fn legacy_entry_prefix(slug: &str) -> String {
     format!("session/{slug}/entry/")
 }
 
-fn entry_key(slug: &str, session_id: &str) -> String {
-    format!("{}{session_id}", entry_prefix(slug))
-}
-
-fn latest_key(slug: &str) -> String {
+fn current_key(slug: &str) -> String {
+    // Retain the physical key name for a zero-copy migration from the prior
+    // release; its semantics are now strictly one current snapshot.
     format!("session/{slug}/latest")
 }
 
 /// 生成 12 位十六进制 session_id（now_ms + 进程内单调计数 + cwd +
-/// CSPRNG 熵的 sha256 摘要）。计数器消除单进程同毫秒同 cwd 两次 save
+/// CSPRNG 熵的 sha256 摘要）。计数器消除单进程同毫秒同 cwd 两次初始化
 /// 的 id 碰撞；随机熵再隔离不同 Web 标签页/进程中各自从零开始的计数器，
-/// 否则它们在同一毫秒初始化会静默覆盖同一按 id 快照。
+/// 使它们的清空屏障、checkpoint 与长期记忆来源不会相互混淆。
 ///
-/// 公开供 app 装配层在新会话预生成 session_id：与 `SessionStore::save`
+/// 公开供 app 装配层在清空后的新运行边界预生成 session_id：与 `SessionStore::save`
 /// 的自动生成路径同源，保证 MemoryService 的 checkpoint / digest / status
 /// key 与后续快照落盘使用同一 id（避免字面量占位跨会话污染）。
 pub fn generate_session_id(now_ms: i64, cwd: &str) -> String {
@@ -280,21 +373,6 @@ fn session_id_from_components(now_ms: i64, counter: u64, cwd: &str, entropy: [u8
         .collect()
 }
 
-/// 首条含非空文本的 user 消息，text 前 [`SUMMARY_MAX_CHARS`] 字符（对齐基线）。
-fn extract_summary(messages: &[ConversationMessage]) -> String {
-    use crate::kernel::messages::Role;
-    for message in messages {
-        if message.role == Role::User {
-            let text = message.text();
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return trimmed.chars().take(SUMMARY_MAX_CHARS).collect();
-            }
-        }
-    }
-    String::new()
-}
-
 /// 过滤 `tool_metadata`：结构化状态字段全量保留，`extra` 仅保留白名单键
 /// （对齐基线只持久化白名单键，避免临时/敏感键写盘）。
 fn persistable_tool_metadata(metadata: &ToolMetadata) -> ToolMetadata {
@@ -307,9 +385,61 @@ fn persistable_tool_metadata(metadata: &ToolMetadata) -> ToolMetadata {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
     use super::*;
+    use crate::error::MemoryError;
     use crate::kernel::messages::{ContentBlock, ConversationMessage, Role};
     use crate::memory::RedbKvStore;
+
+    /// Injects the clear tombstone immediately after the current key is written,
+    /// reproducing the final single-key-write race in `SessionStore::save`.
+    struct TombstoneAfterCurrentKv {
+        inner: Box<dyn KvStore>,
+        tombstone_key: String,
+        armed: AtomicBool,
+    }
+
+    impl TombstoneAfterCurrentKv {
+        fn new(inner: impl KvStore + 'static, tombstone_key: String) -> Self {
+            Self {
+                inner: Box::new(inner),
+                tombstone_key,
+                armed: AtomicBool::new(true),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KvStore for TombstoneAfterCurrentKv {
+        async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+            self.inner.get(key).await
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: &serde_json::Value,
+            ttl: Option<Duration>,
+        ) -> Result<(), MemoryError> {
+            self.inner.set(key, value, ttl).await?;
+            if key.ends_with("/latest") && self.armed.swap(false, Ordering::SeqCst) {
+                self.inner
+                    .set(&self.tombstone_key, &serde_json::Value::Bool(true), None)
+                    .await?;
+            }
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+            self.inner.delete(key).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+            self.inner.list_prefix(prefix).await
+        }
+    }
 
     fn kv() -> Arc<dyn KvStore> {
         let dir = tempfile::tempdir().unwrap();
@@ -331,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_and_load_latest_roundtrip() {
+    async fn save_and_load_current_roundtrip() {
         let store = SessionStore::new(kv());
         let input = SessionSaveInput {
             cwd: "/proj/alpha".into(),
@@ -342,11 +472,186 @@ mod tests {
         let id = store.save(input).await.unwrap();
         assert_eq!(id.len(), SESSION_ID_HEX_LEN);
 
-        let loaded = store.load_latest("/proj/alpha").await.unwrap().unwrap();
+        let loaded = store.load_current("/proj/alpha").await.unwrap().unwrap();
         assert_eq!(loaded.session_id, id);
         assert_eq!(loaded.model.as_deref(), Some("gpt-test"));
-        assert_eq!(loaded.summary, "first goal");
-        assert_eq!(loaded.message_count, 2);
+        assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn save_cleans_current_when_clear_happens_after_the_intermediate_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session-race.redb");
+        let cwd = "/proj/final-clear-race";
+        let session_id = "clear-race-id";
+        let owner_key = crate::memory::owner_key_for_id("local");
+        let tombstone = cleared_session_key(&owner_key, &project_slug(cwd), session_id);
+        let kv: Arc<dyn KvStore> = Arc::new(TombstoneAfterCurrentKv::new(
+            RedbKvStore::open(&path).unwrap(),
+            tombstone,
+        ));
+        let store = SessionStore::new(Arc::clone(&kv));
+
+        assert!(
+            store
+                .save(SessionSaveInput {
+                    session_id: Some(session_id.into()),
+                    cwd: cwd.into(),
+                    messages: vec![user_msg("must not survive clear")],
+                    ..Default::default()
+                })
+                .await
+                .is_err()
+        );
+
+        let slug = project_slug(cwd);
+        assert!(
+            kv.get(&current_key(&slug)).await.unwrap().is_none(),
+            "the post-clear current snapshot must be cleaned up"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_current_removes_the_snapshot_and_legacy_entries() {
+        let kv = kv();
+        let owner_key = "owner-a-hash";
+        let store = SessionStore::new_scoped(Arc::clone(&kv), owner_key);
+        let cwd = "/proj/clear";
+        let current = store
+            .save(SessionSaveInput {
+                session_id: Some("bbbbbbbbbbbb".into()),
+                cwd: cwd.into(),
+                messages: vec![user_msg("current")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let slug = project_slug(cwd);
+        kv.set(
+            &format!(
+                "{}old-session",
+                legacy_entry_prefix(&format!("owner/{owner_key}/{slug}"))
+            ),
+            &serde_json::json!("obsolete history entry"),
+            None,
+        )
+        .await
+        .unwrap();
+        kv.set(
+            &format!("memory/checkpoints/{owner_key}/{slug}/{current}.md"),
+            &serde_json::json!("recent conversation"),
+            None,
+        )
+        .await
+        .unwrap();
+        kv.set(
+            &format!("memory/status/{owner_key}/{slug}/{current}/last_success_digest"),
+            &serde_json::json!("digest"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        store.clear_current(cwd, &current).await.unwrap();
+
+        assert!(store.load_current(cwd).await.unwrap().is_none());
+        assert!(
+            kv.list_prefix(&legacy_entry_prefix(&format!("owner/{owner_key}/{slug}")))
+                .await
+                .unwrap()
+                .is_empty(),
+            "legacy history entries must be removed during clear"
+        );
+        assert!(
+            kv.get(&format!(
+                "memory/checkpoints/{owner_key}/{slug}/{current}.md"
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            kv.list_prefix(&format!("memory/status/{owner_key}/{slug}/{current}/"))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .save(SessionSaveInput {
+                    session_id: Some(current.clone()),
+                    cwd: cwd.into(),
+                    messages: vec![user_msg("stale tab must not recreate")],
+                    ..Default::default()
+                })
+                .await
+                .is_err(),
+            "tombstone 必须拒绝另一个标签页对已清空 session 的旧快照回写"
+        );
+    }
+
+    #[tokio::test]
+    async fn native_clear_uses_memory_services_hashed_local_owner_key() {
+        let kv = kv();
+        let store = SessionStore::new(Arc::clone(&kv));
+        let cwd = "/proj/native-clear";
+        let session_id = "native-current";
+        let project_key = project_slug(cwd);
+        let memory_owner_key = crate::memory::owner_key_for_id("local");
+        store
+            .save(SessionSaveInput {
+                session_id: Some(session_id.into()),
+                cwd: cwd.into(),
+                messages: vec![user_msg("current")],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        kv.set(
+            &format!("memory/checkpoints/{memory_owner_key}/{project_key}/{session_id}.md"),
+            &serde_json::json!("checkpoint"),
+            None,
+        )
+        .await
+        .unwrap();
+        kv.set(
+            &format!("memory/status/{memory_owner_key}/{project_key}/{session_id}/last_error"),
+            &serde_json::json!("error"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        store.clear_current(cwd, session_id).await.unwrap();
+
+        assert!(
+            kv.get(&format!(
+                "memory/checkpoints/{memory_owner_key}/{project_key}/{session_id}.md"
+            ))
+            .await
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            kv.list_prefix(&format!(
+                "memory/status/{memory_owner_key}/{project_key}/{session_id}/"
+            ))
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            kv.get(&cleared_session_key(
+                &memory_owner_key,
+                &project_key,
+                session_id,
+            ))
+            .await
+            .unwrap()
+            .is_some(),
+            "Native tombstone must use the same owner key as MemoryService"
+        );
     }
 
     #[tokio::test]
@@ -364,15 +669,8 @@ mod tests {
             .unwrap();
 
         assert!(
-            owner_b.load_latest("/ains-web").await.unwrap().is_none(),
-            "a shared Web backend must not restore another owner's latest session"
-        );
-        assert!(
-            owner_b
-                .list("/ains-web", DEFAULT_LIST_LIMIT)
-                .await
-                .unwrap()
-                .is_empty()
+            owner_b.load_current("/ains-web").await.unwrap().is_none(),
+            "a shared Web backend must not restore another owner's current session"
         );
     }
 
@@ -394,7 +692,7 @@ mod tests {
             ..Default::default()
         };
         store.save(input).await.unwrap();
-        let loaded = store.load_latest("/proj/beta").await.unwrap().unwrap();
+        let loaded = store.load_current("/proj/beta").await.unwrap().unwrap();
         // 悬空 assistant 被剔除，仅剩 user 消息
         assert_eq!(loaded.messages.len(), 1);
         assert_eq!(loaded.messages[0].role, Role::User);
@@ -418,7 +716,7 @@ mod tests {
             ..Default::default()
         };
         store.save(input).await.unwrap();
-        let loaded = store.load_latest("/proj/gamma").await.unwrap().unwrap();
+        let loaded = store.load_current("/proj/gamma").await.unwrap().unwrap();
         // 结构化字段保留
         assert_eq!(loaded.tool_metadata.read_files, vec!["/a.rs".to_string()]);
         // 白名单键保留，非白名单键丢弃
@@ -427,113 +725,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn load_by_id_falls_back_to_latest() {
-        let store = SessionStore::new(kv());
-        let id = store
+    async fn save_replaces_the_only_current_snapshot() {
+        let kv = kv();
+        let store = SessionStore::new(Arc::clone(&kv));
+        store
             .save(SessionSaveInput {
+                session_id: Some("aaaaaaaaaaaa".into()),
                 cwd: "/proj/delta".into(),
                 messages: vec![user_msg("goal")],
                 ..Default::default()
             })
             .await
             .unwrap();
-
-        // 命名条目命中
-        assert!(
-            store
-                .load_by_id("/proj/delta", &id)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        // 字面 "latest" 回退命中
-        assert!(
-            store
-                .load_by_id("/proj/delta", "latest")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        // 未知 id 且与 latest 不匹配 → None
-        assert!(
-            store
-                .load_by_id("/proj/delta", "deadbeef0000")
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn list_orders_by_created_at_desc_and_isolates_projects() {
-        let store = SessionStore::new(kv());
-        store
-            .save(SessionSaveInput {
-                session_id: Some("aaaaaaaaaaaa".into()),
-                cwd: "/proj/one".into(),
-                messages: vec![user_msg("older")],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        // 确保 created_at 递增
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        store
-            .save(SessionSaveInput {
-                session_id: Some("bbbbbbbbbbbb".into()),
-                cwd: "/proj/one".into(),
-                messages: vec![user_msg("newer")],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        // 另一项目的会话不应出现在本项目列表
-        store
-            .save(SessionSaveInput {
-                cwd: "/proj/two".into(),
-                messages: vec![user_msg("other project")],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let list = store.list("/proj/one", DEFAULT_LIST_LIMIT).await.unwrap();
-        assert_eq!(list.len(), 2);
-        // 降序：newer 在前
-        assert_eq!(list[0].session_id, "bbbbbbbbbbbb");
-        assert_eq!(list[1].session_id, "aaaaaaaaaaaa");
-    }
-
-    #[tokio::test]
-    async fn list_skips_corrupted_entries_instead_of_failing() {
-        // 回归：损坏条目曾经 `?` 传播导致 list 整表失败；应逐条跳过
-        // （对齐基线 list_sessions 对 JSONDecodeError 的 continue）。
-        let kv = kv();
-        let store = SessionStore::new(Arc::clone(&kv));
-        store
-            .save(SessionSaveInput {
-                cwd: "/proj/epsilon".into(),
-                messages: vec![user_msg("valid session")],
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        // 直接向同前缀写入无法反序列化为快照的值
-        let slug = project_slug("/proj/epsilon");
+        let slug = project_slug("/proj/delta");
         kv.set(
-            &format!("session/{slug}/entry/corrupted0000"),
-            &serde_json::json!("not a snapshot"),
+            &format!("{}legacy-session", legacy_entry_prefix(&slug)),
+            &serde_json::json!("obsolete history entry"),
             None,
         )
         .await
         .unwrap();
 
-        let list = store
-            .list("/proj/epsilon", DEFAULT_LIST_LIMIT)
+        let replacement = store
+            .save(SessionSaveInput {
+                session_id: Some("bbbbbbbbbbbb".into()),
+                cwd: "/proj/delta".into(),
+                messages: vec![user_msg("replacement current history")],
+                ..Default::default()
+            })
             .await
             .unwrap();
-        assert_eq!(list.len(), 1, "corrupted entry must be skipped, not fatal");
-        assert_eq!(list[0].summary, "valid session");
+        let current = store.load_current("/proj/delta").await.unwrap().unwrap();
+        assert_eq!(current.session_id, replacement);
+        assert_eq!(
+            current.messages,
+            vec![user_msg("replacement current history")]
+        );
+        assert!(
+            kv.list_prefix(&legacy_entry_prefix(&slug))
+                .await
+                .unwrap()
+                .is_empty(),
+            "a replacement must not create a historical snapshot"
+        );
     }
 
     #[test]
@@ -549,7 +783,8 @@ mod tests {
 
     #[test]
     fn generate_session_id_unique_within_same_millisecond() {
-        // 回归：同毫秒 + 同 cwd 曾产生相同 id，导致按 id 快照静默互相覆盖
+        // 回归：同毫秒 + 同 cwd 不能生成相同 id，否则清空屏障与 checkpoint
+        // 会把两次运行边界错误地视作同一个会话。
         let a = generate_session_id(42, "/proj/same");
         let b = generate_session_id(42, "/proj/same");
         assert_eq!(a.len(), SESSION_ID_HEX_LEN);
@@ -568,13 +803,5 @@ mod tests {
         let a = session_id_from_components(42, 0, "/proj/same", [1; 12]);
         let b = session_id_from_components(42, 0, "/proj/same", [2; 12]);
         assert_ne!(a, b);
-    }
-
-    #[test]
-    fn extract_summary_takes_first_user_text_capped() {
-        let long = "x".repeat(200);
-        let messages = vec![assistant_msg("ignored"), user_msg(&long)];
-        let summary = extract_summary(&messages);
-        assert_eq!(summary.chars().count(), SUMMARY_MAX_CHARS);
     }
 }

@@ -552,6 +552,13 @@ impl ConversationMirror {
     pub fn snapshot(&self) -> Vec<ConversationMessage> {
         self.messages.clone()
     }
+
+    /// 丢弃当前会话的完整镜像与未完成工具结果槽。
+    pub fn clear(&mut self) {
+        self.messages.clear();
+        self.pending.clear();
+        self.results.clear();
+    }
 }
 
 #[cfg(test)]

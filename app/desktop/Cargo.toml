@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 dioxus = { workspace = true, features = ["router"] }
+dioxus-icons = { workspace = true }
 ui = { workspace = true }
 i18n = { workspace = true }
 # Agent Runtime 嵌入（Phase 6.2，Native）

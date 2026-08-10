@@ -537,6 +537,9 @@ translate! {
     chat_compacting: "Compacting context ({phase})" => "上下文压缩中（{phase}）",
     chat_error_recoverable: "Recoverable error" => "可恢复错误",
     chat_error_fatal: "Session failed" => "会话已失败",
+    chat_copy: "Copy message" => "复制消息",
+    chat_copied: "Copied" => "已复制",
+    chat_copy_failed: "Copy failed" => "复制失败",
 
     // permission_dialog.rs / permission_controls.rs（Phase 6.11）
     perm_dialog_title: "Tool Permission Request" => "工具权限请求",
@@ -586,6 +589,20 @@ translate! {
     agent_exited_plan_mode: "Exited plan mode" => "已退出计划模式",
     agent_exited_full_auto: "Exited full auto mode" => "已退出全自动模式",
     agent_send_failed: "Failed to deliver message: the agent session has stopped" => "消息发送失败：智能体会话已停止",
+    agent_clear_conversation: "Clear conversation" => "清空当前对话",
+    agent_clear_conversation_title: "Clear current conversation" => "清空当前对话",
+    agent_clear_conversation_message: "This removes the current conversation history from this device. Long-term memories are kept by default." => "这会从本设备删除当前会话历史，默认保留长期记忆。",
+    agent_clear_force_memories: "Force-delete long-term memories" => "强制删除长期记忆",
+    agent_clear_force_memories_hint: "Also delete all long-term memories and vectors extracted from this conversation. This cannot be undone." => "同时删除从该会话提取的所有长期记忆及向量。此操作不可逆。",
+    agent_clear_confirm: "Clear conversation" => "清空对话",
+    agent_clear_success: "Current conversation cleared. Long-term memories were kept." => "当前对话已清空，长期记忆已保留。",
+    agent_clear_success_with_memories: "Current conversation and {count} long-term memories were permanently deleted." => "当前对话及 {count} 条长期记忆已永久删除。",
+    agent_clear_failed: "Unable to clear the current conversation" => "无法清空当前对话",
+    agent_clear_unavailable: "Conversation storage is not available yet" => "会话存储暂不可用",
+    agent_clear_memory_unavailable: "Long-term memory is unavailable, so force deletion cannot be completed." => "长期记忆服务不可用，无法执行强制删除。",
+    agent_clear_partial: "Partially deleted {removed} long-term memories; {failed} could not be deleted. Conversation history was kept so you can retry." => "已删除 {removed} 条长期记忆，但 {failed} 条删除失败。为便于重试，当前对话历史已保留。",
+    agent_clear_partial_after_history: "The conversation was cleared. {removed} long-term memories were deleted, but {failed} could not be deleted." => "当前对话已清空，已删除 {removed} 条长期记忆，但 {failed} 条删除失败。",
+    agent_clear_completed_with_cleanup_errors: "Current conversation was cleared, but some stored data could not be removed." => "当前对话已清空，但部分存储数据未能删除。",
 
     // agent_status.rs（Phase 6.5）
     agent_status_idle: "Idle" => "空闲",

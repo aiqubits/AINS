@@ -1497,6 +1497,180 @@ impl rust_agent::memory::VectorIndexManager for MutatingThenFailingVectorManager
     }
 }
 
+/// 第一次 remove 注入失败，第二次成功；用于验证失败时 durable rows 仍保留，
+/// 从而让调用方能够按同一 id 重试清理。
+struct FailOnceRemoveVectorManager {
+    vectors: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<f32>>>>,
+    fail_next_remove: bool,
+    namespace_missing_on_remove: bool,
+}
+
+#[async_trait::async_trait]
+impl rust_agent::memory::VectorIndexManager for FailOnceRemoveVectorManager {
+    async fn create_index(
+        &mut self,
+        _namespace: MemoryNamespace,
+        _config: VectorIndexConfig,
+    ) -> Result<(), MemoryError> {
+        Ok(())
+    }
+
+    async fn remove_index(&mut self, _namespace: MemoryNamespace) -> Result<(), MemoryError> {
+        self.vectors.lock().unwrap().clear();
+        Ok(())
+    }
+
+    async fn add(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+        vector: &[f32],
+    ) -> Result<(), MemoryError> {
+        self.vectors
+            .lock()
+            .unwrap()
+            .insert(namespace.storage_key(node_id), vector.to_vec());
+        Ok(())
+    }
+
+    async fn remove(
+        &mut self,
+        namespace: MemoryNamespace,
+        node_id: &str,
+    ) -> Result<(), MemoryError> {
+        if self.namespace_missing_on_remove {
+            return Err(MemoryError::NamespaceNotFound(namespace));
+        }
+        if self.fail_next_remove {
+            self.fail_next_remove = false;
+            return Err(MemoryError::Storage(
+                "injected vector remove failure".into(),
+            ));
+        }
+        self.vectors
+            .lock()
+            .unwrap()
+            .remove(&namespace.storage_key(node_id));
+        Ok(())
+    }
+
+    async fn search(
+        &self,
+        _namespace: MemoryNamespace,
+        _query: &[f32],
+        _top_k: usize,
+    ) -> Result<Vec<(String, f32)>, MemoryError> {
+        Ok(Vec::new())
+    }
+}
+
+#[tokio::test]
+async fn forget_keeps_durable_rows_when_vector_remove_fails_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let vectors = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut engine = MemoryEngine::new(
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Box::new(FailOnceRemoveVectorManager {
+            vectors: Arc::clone(&vectors),
+            fail_next_remove: true,
+            namespace_missing_on_remove: false,
+        }),
+    );
+
+    let entry = engine
+        .remember(
+            MemoryNamespace::Personal,
+            "retryable forced-delete vector",
+            &[1.0; DIM as usize],
+            json!({}),
+        )
+        .await
+        .unwrap();
+    let key = MemoryNamespace::Personal.storage_key(&entry.id);
+
+    assert!(
+        engine
+            .forget(MemoryNamespace::Personal, &entry.id)
+            .await
+            .is_err()
+    );
+    assert!(
+        engine
+            .get(MemoryNamespace::Personal, &entry.id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        backend
+            .table(TABLE_EMBEDDINGS)
+            .get(&key)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    engine
+        .forget(MemoryNamespace::Personal, &entry.id)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .get(MemoryNamespace::Personal, &entry.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        backend
+            .table(TABLE_EMBEDDINGS)
+            .get(&key)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(vectors.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn forget_deletes_sot_when_vector_namespace_is_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let mut engine = MemoryEngine::new(
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Box::new(FailOnceRemoveVectorManager {
+            vectors: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            fail_next_remove: false,
+            namespace_missing_on_remove: true,
+        }),
+    );
+
+    let entry = engine
+        .remember(
+            MemoryNamespace::Personal,
+            "namespace unavailable forced-delete",
+            &[1.0; DIM as usize],
+            json!({}),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .forget(MemoryNamespace::Personal, &entry.id)
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .get(MemoryNamespace::Personal, &entry.id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 // ── Fix 回归：chunk i 自身部分写入（memories 已落、embeddings 失败）也被回收 ──
 
 #[tokio::test]

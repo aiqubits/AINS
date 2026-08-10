@@ -65,9 +65,16 @@ impl ContextStore {
                     self.tool_metadata.set_user_goal(content.trim());
                 }
             }
-            AgentEvent::SystemEvent { .. } => {}
+            AgentEvent::ClearConversation | AgentEvent::SystemEvent { .. } => {}
         }
         Ok(())
+    }
+
+    /// 清除仅属于当前对话的短期上下文。已加载技能是用户显式启用的运行
+    /// 配置，不随聊天记录一并撤销。
+    pub fn clear_conversation(&mut self) {
+        self.conversation.clear();
+        self.tool_metadata = ToolMetadata::default();
     }
 }
 
@@ -156,6 +163,23 @@ mod tests {
             .await
             .unwrap();
         assert!(store.conversation.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_conversation_removes_history_and_session_metadata() {
+        let mut store = ContextStore::new();
+        store
+            .build(&AgentEvent::UserMessage {
+                content: "temporary goal".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+
+        store.clear_conversation();
+
+        assert!(store.conversation.is_empty());
+        assert!(store.tool_metadata.user_goal.is_none());
     }
 
     #[tokio::test]

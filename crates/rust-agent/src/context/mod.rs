@@ -25,6 +25,5 @@ pub use prompt_pipeline::{
     permission_mode_section, skills_section,
 };
 pub use session::{
-    DEFAULT_LIST_LIMIT, PERSISTED_EXTRA_KEYS, SessionSaveInput, SessionSnapshot, SessionStore,
-    SessionSummary, project_slug,
+    PERSISTED_EXTRA_KEYS, SessionSaveInput, SessionSnapshot, SessionStore, project_slug,
 };

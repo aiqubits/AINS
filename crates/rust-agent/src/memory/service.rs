@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::context::session::cleared_session_key;
 use crate::error::MemoryError;
 use crate::kernel::messages::ConversationMessage;
 #[cfg(not(target_arch = "wasm32"))]
@@ -36,7 +37,7 @@ use crate::memory::extract::{
 use crate::memory::kv::{KvStore, now_ms};
 use crate::memory::manage::effective_recency_ms;
 use crate::memory::memdir::{MemoryScope, MemoryType, NewMemoryEntry};
-use crate::memory::stores::MemoryStores;
+use crate::memory::stores::{ExtractionSessionState, MemoryStores};
 use crate::memory::vector::{MemoryEntry, MemoryNamespace, Metric, VectorIndexConfig};
 use crate::model_client::ModelClient;
 use crate::personalization::contains_secret_material;
@@ -128,6 +129,12 @@ pub struct DurableMemoryMetadata {
     /// provenance，不用于 visibility。
     pub source_session_id: String,
 
+    /// 所有曾写入或刷新过本条记忆的会话。去重刷新不能丢弃既有来源：
+    /// 否则强制清空较新的会话会删除早先会话已经存在的共享记忆。
+    /// 缺失时回退到 `source_session_id`，兼容 v2 及更早的持久化记录。
+    #[serde(default)]
+    pub source_session_ids: Vec<String>,
+
     /// 与 [`MemoryContext::owner_key`] 对应。缺失（旧数据）一律不视为
     /// Private/Project 可见，防止升级后跨账户 fail-open。
     #[serde(default)]
@@ -170,8 +177,18 @@ impl DurableMemoryMetadata {
             project_key,
             team_id,
             source_session_id: source_session_id.to_string(),
+            source_session_ids: vec![source_session_id.to_string()],
             owner_key: owner_key.to_string(),
             dedupe_domain,
+        }
+    }
+
+    /// 兼容旧单一来源字段的完整 provenance 集合。
+    fn source_sessions(&self) -> Vec<String> {
+        if self.source_session_ids.is_empty() {
+            vec![self.source_session_id.clone()]
+        } else {
+            self.source_session_ids.clone()
         }
     }
 }
@@ -368,6 +385,33 @@ pub struct MemoryHit {
     pub expires_at_ms: Option<i64>,
 }
 
+/// 清空会话时长期记忆删除的可观测结果。
+///
+/// 逐条删除跨 memories / embeddings / vector index，底层不提供跨表事务；
+/// 因此调用方必须把非零 `failed_memories` 明确呈现给用户，不能把部分删除
+/// 伪装为完整成功。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionMemoryClearOutcome {
+    pub removed_memories: usize,
+    pub failed_memories: usize,
+    /// `true` 表示会话 tombstone 仍然存在，调用方必须切换到新 session。
+    /// 强制删除部分失败且本次创建了屏障时会回滚为 `false`，以支持保留
+    /// 当前对话后重试。
+    pub tombstone_retained: bool,
+}
+
+/// Background extraction identity captured when the task is queued.
+///
+/// The epoch invalidates work after a clear within one session; `session_id`
+/// additionally prevents a queued task from becoming valid again when the
+/// host switches this `MemoryService` to a freshly generated session whose
+/// epoch happens to start at the same value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionToken {
+    session_id: String,
+    epoch: u64,
+}
+
 /// 抽取 digest（I4 公式）：
 /// `SHA256("ains-memory-extract-v2\0" + session_id + "\0" + format_transcript(last_12))`。
 pub fn extract_digest(session_id: &str, transcript: &str) -> String {
@@ -403,7 +447,7 @@ pub struct MemoryService {
     /// 只串行化本 session 的 extraction；由 MemoryStores 共享，因此同一
     /// 进程中独立恢复相同 snapshot 的 service 也不会并发调用 extraction
     /// LLM。可跨 LLM await 持有，但不阻塞 engine search/remember（§16.2）。
-    extraction_gate: RwLock<Arc<futures::lock::Mutex<()>>>,
+    extraction_session: RwLock<Arc<ExtractionSessionState>>,
     /// Retained only to resolve a new shared gate if a host assigns the stable
     /// session id after construction. The store handles are cheap `Arc` clones.
     extraction_stores: MemoryStores,
@@ -434,7 +478,8 @@ impl MemoryService {
         context: MemoryContext,
         config: MemoryServiceConfig,
     ) -> Result<Self, MemoryError> {
-        let extraction_gate = stores.extraction_gate_for(&Self::extraction_lock_name_for(&context));
+        let extraction_session =
+            stores.extraction_session_for(&Self::extraction_lock_name_for(&context));
         let config = config.sanitized();
         let mut service = Self {
             context: RwLock::new(context),
@@ -445,7 +490,7 @@ impl MemoryService {
             doc_store: None,
             model: Arc::clone(&model),
             config,
-            extraction_gate: RwLock::new(extraction_gate),
+            extraction_session: RwLock::new(extraction_session),
             extraction_stores: stores.clone(),
             revision: Arc::clone(&stores.revision),
             embedding_contract_gate: Arc::clone(&stores.embedding_contract_gate),
@@ -506,6 +551,26 @@ impl MemoryService {
         self.revision.load(Ordering::Acquire)
     }
 
+    /// 当前会话抽取代数。宿主在派发后台 extraction 前捕获它，并交给
+    /// [`Self::extract_durable_if_current`]；会话清空会使之前捕获的值失效。
+    pub fn extraction_epoch(&self) -> u64 {
+        self.extraction_session
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .epoch
+            .load(Ordering::Acquire)
+    }
+
+    /// Capture the current session identity and extraction epoch before
+    /// spawning a background extraction task.
+    pub fn extraction_token(&self) -> ExtractionToken {
+        let session_id = self.ctx().session_id.clone();
+        ExtractionToken {
+            session_id,
+            epoch: self.extraction_epoch(),
+        }
+    }
+
     /// 首轮 `save_snapshot` 生成稳定 session_id 后同步（新会话装配时以占位
     /// id 创建，见 app 装配层；恢复会话直接使用 snapshot 的 id）。
     pub fn set_session_id(&self, session_id: impl Into<String>) {
@@ -514,13 +579,13 @@ impl MemoryService {
             ctx.session_id = session_id.into();
             ctx.clone()
         };
-        let gate = self
+        let extraction_session = self
             .extraction_stores
-            .extraction_gate_for(&Self::extraction_lock_name_for(&context));
+            .extraction_session_for(&Self::extraction_lock_name_for(&context));
         *self
-            .extraction_gate
+            .extraction_session
             .write()
-            .unwrap_or_else(|p| p.into_inner()) = gate;
+            .unwrap_or_else(|p| p.into_inner()) = extraction_session;
     }
 
     /// Origin-wide Web Locks 的稳定名称，以及 native/in-process gate 的
@@ -553,6 +618,9 @@ impl MemoryService {
     /// 查询的持久化状态（§7.2 / §17）。
     async fn record_scoped_memory_error(&self, message: String) {
         self.record_error(&message);
+        if !self.may_persist_session_status().await {
+            return;
+        }
         if let Err(e) = self
             .kv
             .set(
@@ -567,8 +635,25 @@ impl MemoryService {
     }
 
     async fn clear_scoped_memory_error(&self) {
+        if !self.may_persist_session_status().await {
+            return;
+        }
         if let Err(e) = self.kv.delete(&self.status_key("memory_last_error")).await {
             tracing::warn!(error = %e, "clear memory error status failed");
+        }
+    }
+
+    /// 已清空会话的状态键和 checkpoint 一样属于被删除的会话工件。旧实例
+    /// 仍可能在得到 tombstone 拒绝后尝试记录诊断；此时宁可仅写 tracing，
+    /// 也不能重新创建持久化 status。读取 tombstone 失败也按不可写处理。
+    async fn may_persist_session_status(&self) -> bool {
+        match self.session_was_cleared().await {
+            Ok(false) => true,
+            Ok(true) => false,
+            Err(error) => {
+                tracing::warn!(%error, "skip session status persistence: tombstone unavailable");
+                false
+            }
         }
     }
 
@@ -593,6 +678,21 @@ impl MemoryService {
         messages: &[ConversationMessage],
         metadata: Option<&SessionCheckpoint>,
     ) -> Result<(), MemoryError> {
+        // Checkpoints and session clear share this gate.  A tombstone check by
+        // itself is not sufficient: without serialization a stale instance
+        // can observe no tombstone, pause in `kv.set`, and recreate its
+        // checkpoint after another instance has committed the clear.
+        let extraction_session = self
+            .extraction_session
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let _gate = extraction_session.gate.lock().await;
+        // 旧标签页/恢复实例在本会话已清空后不得重建 checkpoint。
+        // 作为派生会话工件，静默跳过即可；调用方无需把它当成主对话失败。
+        if self.session_was_cleared().await? {
+            return Ok(());
+        }
         let checkpoint = metadata.cloned().unwrap_or_default();
         let document = build_session_memory(&checkpoint, messages);
         let result = self
@@ -605,6 +705,15 @@ impl MemoryService {
             .await;
         match result {
             Ok(()) => {
+                // `SessionStore::clear_current` can be called by a host that
+                // does not hold the MemoryService gate.  Fence that path too:
+                // if its tombstone landed while the single-key write was in
+                // flight, remove this just-written physical checkpoint before
+                // reporting success.
+                if self.session_was_cleared().await? {
+                    self.kv.delete(&self.checkpoint_key()).await?;
+                    return Ok(());
+                }
                 if let Err(e) = self
                     .kv
                     .delete(&self.status_key("checkpoint_last_error"))
@@ -616,14 +725,15 @@ impl MemoryService {
             }
             Err(e) => {
                 self.record_error(&format!("checkpoint save failed: {e}"));
-                if let Err(status_error) = self
-                    .kv
-                    .set(
-                        &self.status_key("checkpoint_last_error"),
-                        &Value::String(e.to_string()),
-                        None,
-                    )
-                    .await
+                if self.may_persist_session_status().await
+                    && let Err(status_error) = self
+                        .kv
+                        .set(
+                            &self.status_key("checkpoint_last_error"),
+                            &Value::String(e.to_string()),
+                            None,
+                        )
+                        .await
                 {
                     tracing::warn!(error = %status_error, "persist checkpoint error status failed");
                 }
@@ -634,11 +744,197 @@ impl MemoryService {
 
     /// 读取当前 session 的检查点（不存在返回 None；观测/诊断入口）。
     pub async fn load_checkpoint(&self) -> Result<Option<String>, MemoryError> {
+        // 清空成功后的 tombstone 是读取侧最终屏障。即使一个旧实例在
+        // save_checkpoint 的检查与写入之间留下物理记录，也不得向恢复或
+        // 诊断路径暴露已清空会话的内容。
+        if self.session_was_cleared().await? {
+            return Ok(None);
+        }
         Ok(self
             .kv
             .get(&self.checkpoint_key())
             .await?
             .and_then(|v| v.as_str().map(|s| s.to_string())))
+    }
+
+    async fn session_was_cleared(&self) -> Result<bool, MemoryError> {
+        let ctx = self.ctx().clone();
+        let key = cleared_session_key(&ctx.owner_key, &ctx.project_key, &ctx.session_id);
+        Ok(self.kv.get(&key).await?.is_some())
+    }
+
+    /// 与当前会话的后台抽取同步，并可选择彻底删除由该会话提取的长期记忆。
+    ///
+    /// 先取得本会话 extraction gate，确保已经后台排队或执行中的抽取完成；
+    /// 随后再按来源集合撤销当前会话的归属，避免清空后旧抽取又写回记忆。
+    /// 会话 checkpoint 与 extraction/status 键由 [`SessionStore`] 清除，
+    /// 使 MemoryService 不可用时仍能完成历史数据删除。
+    pub async fn clear_current_session(
+        &self,
+        force_forget_memories: bool,
+    ) -> Result<SessionMemoryClearOutcome, MemoryError> {
+        let ctx = self.ctx().clone();
+        let extraction_session = self
+            .extraction_session
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let _gate = extraction_session.gate.lock().await;
+        let mut outcome = SessionMemoryClearOutcome::default();
+        let tombstone_key = cleared_session_key(&ctx.owner_key, &ctx.project_key, &ctx.session_id);
+        // 旧标签页可能在另一标签页清空后才进入此处。仅本次新建的屏障可在
+        // “保留对话以重试”的部分失败路径撤销，绝不能移除已经提交的清空。
+        let tombstone_existed = self.kv.get(&tombstone_key).await?.is_some();
+        if force_forget_memories {
+            let namespace = MemoryNamespace::Personal;
+            let prefix = namespace.storage_prefix();
+            let mut engine = self.engine.lock().await;
+            // 先在同一 engine 临界区内收集候选，确保扫描失败时尚未执行任何
+            // 不可逆删除；之后逐条尝试以便将部分成功如实报告给 UI。
+            let mut candidates = Vec::new();
+            for key in self.memories.list_prefix(&prefix).await? {
+                let Some(id) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let Some(raw) = self.memories.get(&key).await? else {
+                    continue;
+                };
+                let Ok(entry) = serde_json::from_value::<MemoryEntry>(raw) else {
+                    // 无法确认来源的损坏记录不得依据本次会话删除。
+                    continue;
+                };
+                let Ok(metadata) = serde_json::from_value::<DurableMemoryMetadata>(entry.metadata)
+                else {
+                    continue;
+                };
+                // 会话来源不是权限边界：Private/Project 仍须绑定 owner，
+                // Team 则以同一 team_id 为边界。团队记忆允许不同 owner 的
+                // 相同正文去重刷新，最新 owner 会覆盖 metadata；若仍只看
+                // owner，先前来源将永远无法在自己的清空操作中解除。
+                let same_owner = metadata.owner_key == ctx.owner_key;
+                let same_team = metadata.scope == MemoryScope::Team
+                    && ctx.team_id.is_some()
+                    && metadata.team_id.as_deref() == ctx.team_id.as_deref();
+                if metadata.source_sessions().contains(&ctx.session_id) && (same_owner || same_team)
+                {
+                    candidates.push((id.to_string(), metadata));
+                }
+            }
+            // 候选扫描可能因存储故障失败；在此之前不提交 tombstone，避免
+            // 清空失败却让用户仍打开的旧会话永久失去记忆写入能力。
+            if !tombstone_existed {
+                self.kv
+                    .set(&tombstone_key, &Value::Bool(true), None)
+                    .await?;
+            }
+            extraction_session.epoch.fetch_add(1, Ordering::AcqRel);
+            let mut changed = false;
+            let mut deletions = Vec::new();
+            let mut provenance_updates = Vec::new();
+            for (id, mut metadata) in candidates {
+                let mut remaining_sources = metadata.source_sessions();
+                remaining_sources.retain(|source| source != &ctx.session_id);
+                if remaining_sources.is_empty() {
+                    deletions.push(id);
+                } else {
+                    // Keep a shared memory, but remove the cleared session's
+                    // provenance only after every exclusive deletion succeeds.
+                    // When one deletion fails, the UI retains this conversation
+                    // for retry, so it must retain all of its provenance too.
+                    let original_metadata = metadata.clone();
+                    metadata.source_session_ids = remaining_sources;
+                    metadata.source_session_id = metadata.source_session_ids[0].clone();
+                    provenance_updates.push((id, original_metadata, metadata));
+                }
+            }
+            // Delete entries exclusively owned by this session first. A
+            // failure deliberately prevents provenance updates below: the
+            // caller keeps the conversation open to retry, and another
+            // session must not later delete a memory still attributable to it.
+            for id in deletions {
+                match engine.forget(namespace, &id).await {
+                    Ok(()) => {
+                        outcome.removed_memories += 1;
+                        changed = true;
+                    }
+                    Err(error) => {
+                        outcome.failed_memories += 1;
+                        tracing::warn!(%error, memory_id = %id, "session memory deletion failed");
+                    }
+                }
+            }
+            if outcome.failed_memories == 0 {
+                let mut applied_updates = Vec::new();
+                for (id, original_metadata, metadata) in provenance_updates {
+                    let metadata = serde_json::to_value(&metadata)
+                        .map_err(|e| MemoryError::Serialization(e.to_string()))?;
+                    match engine.update_metadata(namespace, &id, metadata).await {
+                        Ok(()) => {
+                            changed = true;
+                            applied_updates.push((id, original_metadata));
+                        }
+                        Err(error) => {
+                            outcome.failed_memories += 1;
+                            tracing::warn!(%error, memory_id = %id, "session memory provenance cleanup failed");
+                            // This is a retryable clear, so restore every
+                            // earlier provenance update before returning to
+                            // the live conversation. Best-effort restoration
+                            // failures are surfaced as additional failures.
+                            for (applied_id, original_metadata) in applied_updates.into_iter().rev()
+                            {
+                                let original_metadata = serde_json::to_value(&original_metadata)
+                                    .map_err(|e| MemoryError::Serialization(e.to_string()))?;
+                                if let Err(restore_error) = engine
+                                    .update_metadata(namespace, &applied_id, original_metadata)
+                                    .await
+                                {
+                                    outcome.failed_memories += 1;
+                                    tracing::warn!(%restore_error, memory_id = %applied_id, "session memory provenance rollback failed");
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+            // UI 会在部分失败时保留当前对话以便重试；此时不可让 tombstone
+            // 留下并使该会话之后的 snapshot/checkpoint/memory 写入全部失败。
+            // gate 与 engine 锁仍被持有，旧 extraction 已由 epoch 失效，撤销
+            // 屏障后继续当前会话不会让已完成的清空操作反向复活。
+            let mut tombstone_rollback_retained = false;
+            if outcome.failed_memories > 0
+                && !tombstone_existed
+                && let Err(error) = self.kv.delete(&tombstone_key).await
+            {
+                // A failed rollback leaves the session boundary
+                // indeterminate. Never return an error that lets the UI
+                // continue using a session which may still be tombstoned;
+                // check once and otherwise fail closed by retiring it.
+                tracing::warn!(%error, "session clear tombstone rollback failed");
+                tombstone_rollback_retained = match self.kv.get(&tombstone_key).await {
+                    Ok(Some(_)) => true,
+                    Ok(None) => false,
+                    Err(read_error) => {
+                        tracing::warn!(%read_error, "session clear tombstone rollback could not be verified");
+                        true
+                    }
+                };
+            }
+            if changed || outcome.failed_memories > 0 {
+                self.revision.fetch_add(1, Ordering::AcqRel);
+            }
+            outcome.tombstone_retained =
+                tombstone_existed || outcome.failed_memories == 0 || tombstone_rollback_retained;
+        } else {
+            if !tombstone_existed {
+                self.kv
+                    .set(&tombstone_key, &Value::Bool(true), None)
+                    .await?;
+            }
+            extraction_session.epoch.fetch_add(1, Ordering::AcqRel);
+            outcome.tombstone_retained = true;
+        }
+        Ok(outcome)
     }
 
     // ── 写入方 1：Final Turn / Compaction Durable Extraction（§9 / §11）──
@@ -650,11 +946,36 @@ impl MemoryService {
     /// - 同 digest 上次失败 → 仅受 backoff 控制。
     ///
     /// 失败只写 failure digest/time，不覆盖 success digest（§9.3）。
-    pub async fn extract_durable(
+    pub fn extract_durable(
         &self,
         messages: Vec<ConversationMessage>,
         reason: ExtractionReason,
+    ) -> impl std::future::Future<Output = Result<ExtractionOutcome, MemoryError>> + '_ {
+        // Capture at call time rather than first poll.  A host can queue this
+        // future and subsequently switch sessions before the executor starts
+        // it; that queued work must remain bound to its originating session.
+        let token = self.extraction_token();
+        async move {
+            self.extract_durable_if_current(token, messages, reason)
+                .await
+        }
+    }
+
+    /// 仅在排队时的会话抽取代数仍有效时执行 durable extraction。
+    pub async fn extract_durable_if_current(
+        &self,
+        expected: ExtractionToken,
+        messages: Vec<ConversationMessage>,
+        reason: ExtractionReason,
     ) -> Result<ExtractionOutcome, MemoryError> {
+        let skipped_for_cleared_session = || ExtractionOutcome {
+            saved: Vec::new(),
+            skipped: Some("session cleared".to_string()),
+        };
+        if expected.session_id != self.ctx().session_id || expected.epoch != self.extraction_epoch()
+        {
+            return Ok(skipped_for_cleared_session());
+        }
         let _ = reason;
         if !self.config.auto_extract {
             return Ok(ExtractionOutcome {
@@ -669,15 +990,21 @@ impl MemoryService {
             });
         }
         let transcript = format_transcript(&messages);
-        let digest = extract_digest(&self.ctx().session_id, &transcript);
+        let digest = extract_digest(&expected.session_id, &transcript);
 
         // gate 可跨 LLM await 持有（per-session 串行），engine 锁不在此持有。
-        let extraction_gate = self
-            .extraction_gate
+        let extraction_session = self
+            .extraction_session
             .read()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let _gate = extraction_gate.lock().await;
+        let _gate = extraction_session.gate.lock().await;
+        if expected.session_id != self.ctx().session_id
+            || expected.epoch != extraction_session.epoch.load(Ordering::Acquire)
+            || self.session_was_cleared().await?
+        {
+            return Ok(skipped_for_cleared_session());
+        }
         let mut state = self.load_extraction_state().await?;
         if state.last_success_digest.as_deref() == Some(&digest) {
             return Ok(ExtractionOutcome {
@@ -830,6 +1157,11 @@ impl MemoryService {
     }
 
     async fn write_memory_inner(&self, record: NewMemoryEntry) -> Result<String, MemoryError> {
+        if self.session_was_cleared().await? {
+            return Err(MemoryError::Storage(
+                "refusing durable memory write for a cleared session".into(),
+            ));
+        }
         // This gate protects every durable-memory entry point: background LLM
         // extraction and the model-facing memory_write tool both reach this
         // method.  Prompting the extractor not to save secrets is helpful but
@@ -863,10 +1195,15 @@ impl MemoryService {
         );
         let metadata_value = serde_json::to_value(&metadata)
             .map_err(|e| MemoryError::Serialization(e.to_string()))?;
-        let entry = self
-            .engine
-            .lock()
-            .await
+        let mut engine = self.engine.lock().await;
+        // embedding await 期间可能已有其它标签页完成清空；在获得实际写锁
+        // 后再次检查，确保不会绕过清空屏障重建 memory/vector。
+        if self.session_was_cleared().await? {
+            return Err(MemoryError::Storage(
+                "refusing durable memory write for a cleared session".into(),
+            ));
+        }
+        let entry = engine
             .remember_in_domain(
                 MemoryNamespace::Personal,
                 &dedupe_domain,
@@ -1306,7 +1643,7 @@ impl MemoryService {
 
     /// 如果同一 project 的其它 source 仍映射到 `doc_id`，保留共享的
     /// `project_doc/{project}/{doc_id}` membership。内容 hash 去重意味着
-    /// AGENTS.md 与 CLAUDE.md 可以共用一个 doc_id；删除/更新其中一个 source
+    /// AGENTS.md 与 SOUL.md 可以共用一个 doc_id；删除/更新其中一个 source
     /// 时绝不能把另一个 source 的可见文档一并撤销。
     ///
     /// 返回是否实际删除了 membership，供调用方递增 prompt cache revision。
@@ -1336,7 +1673,7 @@ impl MemoryService {
         Ok(false)
     }
 
-    /// P3 预留：索引项目指令文档（AGENTS.md / CLAUDE.md 等轻量文件）。
+    /// P3 预留：索引项目指令文档（AGENTS.md / SOUL.md 等轻量文件）。
     /// 仅 Native 可用（Web 无文件系统）；默认关闭（`index_project_docs`）。
     pub async fn index_project_docs(&self, cwd: &Path) -> Result<usize, MemoryError> {
         if !self.config.index_project_docs {
@@ -1384,7 +1721,7 @@ impl MemoryService {
 
             let mut indexed = 0usize;
             let mut changed = false;
-            for name in ["AGENTS.md"] {
+            for name in ["AGENTS.md", "SOUL.md"] {
                 let path = cwd.join(name);
                 let source_key = format!("project_doc_source/{project_key}/{name}");
                 let mut previous_ids = previous_by_name.remove(name).unwrap_or_default();
@@ -1594,6 +1931,7 @@ mod tests {
             project_key: Some("project".into()),
             team_id: None,
             source_session_id: "session".into(),
+            source_session_ids: vec!["session".into()],
             owner_key: "owner".into(),
             dedupe_domain: "personal:project:owner:project".into(),
         }
@@ -1607,6 +1945,18 @@ mod tests {
             !is_expired_at(&metadata(Some(now + 1)), now),
             "the cleanup re-read must retain an entry whose TTL was refreshed"
         );
+    }
+
+    #[test]
+    fn legacy_single_session_provenance_remains_clearable() {
+        let mut encoded = serde_json::to_value(metadata(None)).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("source_session_ids");
+        let legacy: DurableMemoryMetadata = serde_json::from_value(encoded).unwrap();
+
+        assert_eq!(legacy.source_sessions(), ["session"]);
     }
 
     #[test]

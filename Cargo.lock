@@ -1862,6 +1862,7 @@ dependencies = [
  "chrono",
  "client-api",
  "dioxus",
+ "dioxus-icons",
  "futures",
  "i18n",
  "rust-agent",
@@ -8620,6 +8621,7 @@ dependencies = [
  "dioxus-icons",
  "gloo-timers",
  "i18n",
+ "serde_json",
  "tokio",
 ]
 

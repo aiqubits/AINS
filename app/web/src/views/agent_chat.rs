@@ -10,8 +10,10 @@ use dioxus::prelude::*;
 use futures::{SinkExt, StreamExt};
 
 use client_api::Client;
+use dioxus_icons::lucide::{LoaderCircle, Trash2};
+use rust_agent::context::session::{SessionClearOutcome, SessionStore, generate_session_id};
 use rust_agent::kernel::{AgentEvent, StreamEvent};
-use rust_agent::memory::SessionCheckpoint;
+use rust_agent::memory::{MemoryService, SessionCheckpoint, SessionMemoryClearOutcome};
 use rust_agent::model_client::UsageSnapshot;
 use rust_agent::policy::{PermissionEngine, PermissionMode};
 use rust_agent::tools::ToolMetadata;
@@ -20,7 +22,7 @@ use ui::{
     NoticeItem, NoticeKind, NoticeToast, PERSIST_ERROR, PermissionChoice, PermissionDialog,
     PermissionModeSwitcher, PermissionModeView, PlanModeIndicator, SlashCommandView,
     TOOL_STATE_LOAD_ERROR, TodoItemView, TodoList, ToolStateBanner, ToolStateBannerKind,
-    parse_todo_markdown,
+    parse_todo_markdown, tf,
 };
 
 use crate::agent::permission_bridge::{InteractionMsg, PermissionPromptMsg};
@@ -70,6 +72,46 @@ fn checkpoint_from_tool_metadata(meta: &ToolMetadata) -> SessionCheckpoint {
     checkpoint
 }
 
+/// A memory tombstone is the logical commit point for clearing a session.  If
+/// best-effort snapshot cleanup later fails, the old session must still be
+/// retired: it is no longer writable and keeping it live would let the kernel
+/// continue to use history the user has already cleared.
+fn settle_snapshot_cleanup(
+    memory_outcome: SessionMemoryClearOutcome,
+    snapshot_cleanup: Result<SessionClearOutcome, rust_agent::error::AgentError>,
+) -> Result<SessionClearOutcome, rust_agent::error::AgentError> {
+    match snapshot_cleanup {
+        Ok(outcome) => Ok(outcome),
+        Err(error) if memory_outcome.tombstone_retained => Ok(SessionClearOutcome {
+            cleanup_failures: vec![format!("snapshot cleanup: {error}")],
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+/// Build a user-facing completion warning without exposing backend diagnostics.
+/// `cleanup_failures` remains available to callers for structured logging only.
+fn clear_completion_warning(
+    memory_warning: Option<String>,
+    cleanup_failures: &[String],
+    generic_cleanup_warning: &str,
+) -> Option<String> {
+    match (memory_warning, cleanup_failures.is_empty()) {
+        (Some(memory_warning), true) => Some(memory_warning),
+        (Some(memory_warning), false) => {
+            Some(format!("{memory_warning} {generic_cleanup_warning}"))
+        }
+        (None, false) => Some(generic_cleanup_warning.to_string()),
+        (None, true) => None,
+    }
+}
+
+/// Async UI work that started for an older conversation must not enqueue a
+/// prompt after that conversation has been cleared.
+fn session_epoch_is_current(expected: u64, current: u64) -> bool {
+    expected == current
+}
+
 #[component]
 pub fn AgentChat() -> Element {
     let i18n = use_context::<I18nContext>();
@@ -90,6 +132,14 @@ pub fn AgentChat() -> Element {
     //   存活期间实时反映 /tools 面板或本会话内切换的落盘结果。
     let mut ready = use_signal(|| false);
     let mut event_tx_sig = use_signal(|| None::<futures::channel::mpsc::Sender<AgentEvent>>);
+    let mut session_store_sig = use_signal(|| None::<Arc<SessionStore>>);
+    let mut memory_sig = use_signal(|| None::<Arc<MemoryService>>);
+    let mut session_id_sig = use_signal(|| None::<String>);
+    let mut cwd_sig = use_signal(|| None::<String>);
+    // 持久化快照、checkpoint/extraction 与清空必须线性化：清空完成后，
+    // 旧 stream 事件不得把历史重新写回 storage。
+    let session_operation_gate = use_hook(|| Arc::new(futures::lock::Mutex::new(()))).clone();
+    let mut session_epoch = use_signal(|| 0u64);
     let mut engine_sig = use_signal(|| None::<Arc<PermissionEngine>>);
     // 中断句柄（Phase 7.1）：停止按钮置位，Kernel 消费后自行清位。
     let mut interrupt_sig = use_signal(|| None::<Arc<AtomicBool>>);
@@ -104,11 +154,17 @@ pub fn AgentChat() -> Element {
     // Agent 状态指示（6.5）与待办列表（6.12）
     let mut agent_status = use_signal(AgentStatusView::default);
     let mut todos = use_signal(Vec::<TodoItemView>::new);
+    let mut clear_dialog_open = use_signal(|| false);
+    let mut force_forget_memories = use_signal(|| false);
+    let mut clearing_conversation = use_signal(|| false);
+    let mut clear_error = use_signal(|| None::<String>);
 
     // 装配一次：Kernel + 三条泵协程（本组件卸载时随 scope 取消，
     // event_tx 释放后 Kernel 事件循环优雅退出）。
+    let stream_operation_gate = Arc::clone(&session_operation_gate);
     use_future(move || {
         let client = client.clone();
+        let session_operation_gate = Arc::clone(&stream_operation_gate);
         async move {
             let mut bridge = match service::initialize(client).await {
                 Ok(bridge) => bridge,
@@ -123,6 +179,10 @@ pub fn AgentChat() -> Element {
                 bridge.restored_messages.clone(),
             ));
             event_tx_sig.set(Some(bridge.event_tx.clone()));
+            session_store_sig.set(bridge.session_store.clone());
+            memory_sig.set(bridge.memory.clone());
+            session_id_sig.set(bridge.session_id.clone());
+            cwd_sig.set(Some(bridge.cwd.clone()));
             engine_sig.set(Some(Arc::clone(&bridge.engine)));
             interrupt_sig.set(Some(Arc::clone(&bridge.interrupt)));
             // 上次切换未落盘的失败标记：从存储同步到进程级 PERSIST_ERROR
@@ -190,7 +250,6 @@ pub fn AgentChat() -> Element {
                 let store = bridge.session_store.clone();
                 let engine = Arc::clone(&bridge.engine);
                 let cwd = bridge.cwd.clone();
-                let mut session_id = bridge.session_id.clone();
                 // 生产 MemoryService（§8–§11）：final turn / compacted 时
                 // ordered checkpoint（await）+ background extraction（spawn）。
                 let memory = bridge.memory.clone();
@@ -199,6 +258,7 @@ pub fn AgentChat() -> Element {
                     // P2（§10.2）：事件携带的 ToolMetadata → checkpoint 结构化字段
                     let mut last_tool_metadata: Option<ToolMetadata> = None;
                     while let Some(event) = stream_rx.next().await {
+                        let event_epoch = session_epoch();
                         // 镜像更新（在 event 移入视图前按引用处理）
                         let mut persist = false;
                         let mut final_turn = false;
@@ -259,23 +319,33 @@ pub fn AgentChat() -> Element {
                                 // 会话持久化与 compaction archive 均必须保留 host
                                 // mirror 中未折叠的完整历史；这里不 save_snapshot，
                                 // 也不能以压缩摘要替换 mirror。
+                                let _operation = session_operation_gate.lock().await;
+                                if event_epoch != session_epoch() {
+                                    continue;
+                                }
                                 let snapshot = mirror.read().snapshot();
                                 if let Some(memory) = &memory {
                                     // Compacted 携带的是 tool dispatch 后的当前
                                     // metadata，不能使用 AssistantTurnComplete 时的
                                     // 旧快照。
                                     let checkpoint = checkpoint_from_tool_metadata(tool_metadata);
-                                    if let Err(e) =
-                                        memory.save_checkpoint(&snapshot, Some(&checkpoint)).await
+                                    if let Err(e) = service::save_checkpoint_serialized(
+                                        Arc::clone(memory),
+                                        snapshot.clone(),
+                                        Some(checkpoint),
+                                    )
+                                    .await
                                     {
                                         tracing::warn!(
                                             "memory checkpoint (compaction) failed: {e}"
                                         );
                                     }
                                     let extract = memory.clone();
+                                    let extraction_token = memory.extraction_token();
                                     spawn(async move {
                                         if let Err(e) = service::extract_durable_serialized(
                                             extract,
+                                            extraction_token,
                                             snapshot,
                                             rust_agent::memory::ExtractionReason::Compaction,
                                         )
@@ -320,26 +390,32 @@ pub fn AgentChat() -> Element {
                             flag.store(false, Ordering::SeqCst);
                         }
                         if persist && let Some(store) = &store {
+                            let _operation = session_operation_gate.lock().await;
+                            // 清空先拿到操作锁时会推进 epoch；该旧事件随后即使
+                            // 继续抵达，也不能把旧镜像写入清空后的 current 快照。
+                            if event_epoch != session_epoch() {
+                                continue;
+                            }
                             // 先 clone 快照再 await，不跨 await 持有 Signal 读写守卫
                             let snapshot = mirror.read().snapshot();
                             if let Some(id) = service::save_snapshot(
                                 store,
                                 &cwd,
-                                session_id.clone(),
+                                session_id_sig(),
                                 snapshot.clone(),
                                 last_usage,
                                 last_tool_metadata.clone().unwrap_or_default(),
                             )
                             .await
                             {
-                                // §3：新会话首轮生成稳定 session_id 后同步给
+                                // §3：当前运行边界首轮生成稳定 session_id 后同步给
                                 // MemoryService，保证 checkpoint / digest /
                                 // status key 与 SessionStore 同一 session id
                                 // （恢复会话已在装配时使用 snapshot 的 id）。
                                 if let Some(memory) = &memory {
                                     memory.set_session_id(id.clone());
                                 }
-                                session_id = Some(id);
+                                session_id_sig.set(Some(id));
                             }
                             // final turn：ordered pipeline（§9.2）——checkpoint
                             // 必须有序 await，只有 extraction 可 background。
@@ -349,16 +425,22 @@ pub fn AgentChat() -> Element {
                                 let checkpoint = last_tool_metadata
                                     .as_ref()
                                     .map(checkpoint_from_tool_metadata);
-                                if let Err(e) =
-                                    memory.save_checkpoint(&snapshot, checkpoint.as_ref()).await
+                                if let Err(e) = service::save_checkpoint_serialized(
+                                    Arc::clone(memory),
+                                    snapshot.clone(),
+                                    checkpoint,
+                                )
+                                .await
                                 {
                                     // checkpoint 失败只 warn/观测，不阻断 Agent
                                     tracing::warn!("memory checkpoint failed: {e}");
                                 }
                                 let extract = memory.clone();
+                                let extraction_token = memory.extraction_token();
                                 spawn(async move {
                                     if let Err(e) = service::extract_durable_serialized(
                                         extract,
+                                        extraction_token,
                                         snapshot,
                                         rust_agent::memory::ExtractionReason::FinalTurn,
                                     )
@@ -453,11 +535,25 @@ pub fn AgentChat() -> Element {
                 push_notice(t.chat_slash_skill.to_string(), NoticeKind::Warning);
                 return false;
             }
+            // Loading a skill touches storage before it can enqueue the actual
+            // prompt.  It therefore needs the same session-boundary check as
+            // snapshot/extraction work: a clear while this task is awaiting
+            // must discard the old request rather than send it to the new
+            // conversation.
+            let request_epoch = session_epoch();
             let mut tx = tx;
             spawn(async move {
-                match service::open_skill_store().await {
+                let store = service::open_skill_store().await;
+                if !session_epoch_is_current(request_epoch, session_epoch()) {
+                    return;
+                }
+                match store {
                     Ok(store) => {
-                        match rust_agent::skills::SkillLoader::load(&*store, &name).await {
+                        let content = rust_agent::skills::SkillLoader::load(&*store, &name).await;
+                        if !session_epoch_is_current(request_epoch, session_epoch()) {
+                            return;
+                        }
+                        match content {
                             Ok(content) => {
                                 let prompt = view_model::skill_prompt(&name, &content.body);
                                 view_model::push_user(&mut chat.write(), &format!("/skill {name}"));
@@ -556,6 +652,144 @@ pub fn AgentChat() -> Element {
         agent_status.set(AgentStatusView::Idle);
     };
 
+    let on_clear_conversation = move |_| {
+        if clearing_conversation() || chat.read().busy || chat.read().interrupt_pending {
+            return;
+        }
+        let Some(store) = session_store_sig() else {
+            clear_error.set(Some(t.agent_clear_unavailable.to_string()));
+            return;
+        };
+        let Some(session_id) = session_id_sig() else {
+            clear_error.set(Some(t.agent_clear_unavailable.to_string()));
+            return;
+        };
+        let Some(cwd) = cwd_sig() else {
+            clear_error.set(Some(t.agent_clear_unavailable.to_string()));
+            return;
+        };
+        let Some(mut tx) = event_tx_sig() else {
+            clear_error.set(Some(t.agent_clear_unavailable.to_string()));
+            return;
+        };
+
+        let memory = memory_sig();
+        let force = force_forget_memories();
+        if force && memory.is_none() {
+            // 用户已选择不可逆的长期记忆删除，不能在服务不可用时伪装成
+            // “删除 0 条”的成功；必须 fail closed。
+            clear_error.set(Some(t.agent_clear_memory_unavailable.to_string()));
+            return;
+        }
+        clearing_conversation.set(true);
+        clear_error.set(None);
+        let operation_gate = Arc::clone(&session_operation_gate);
+        spawn(async move {
+            // 与 stream pump 的快照保存共用同一把锁。若旧保存已经开始，
+            // 本次清空等待它完成后再删除；若本次先取得锁，旧事件会因 epoch
+            // 不匹配跳过保存，从而不会复活已删除的历史。
+            let _operation = operation_gate.lock().await;
+            let outcome = match memory.as_ref() {
+                Some(memory) => {
+                    match service::clear_current_session_serialized(Arc::clone(memory), force).await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(err) => {
+                            // Storage errors may contain backend-specific paths or other
+                            // diagnostics. Keep those in the local log and present a stable,
+                            // localized failure to the user.
+                            tracing::warn!(error = %err, "clearing durable session memory failed");
+                            clear_error.set(Some(t.agent_clear_failed.to_string()));
+                            clearing_conversation.set(false);
+                            return;
+                        }
+                    }
+                }
+                None => Default::default(),
+            };
+            if outcome.failed_memories > 0 && !outcome.tombstone_retained {
+                clear_error.set(Some(tf(
+                    t.agent_clear_partial,
+                    &[
+                        ("removed", &outcome.removed_memories.to_string()),
+                        ("failed", &outcome.failed_memories.to_string()),
+                    ],
+                )));
+                clearing_conversation.set(false);
+                return;
+            }
+
+            let session_cleanup = match settle_snapshot_cleanup(
+                outcome,
+                service::clear_session_snapshot_serialized(&store, &cwd, &session_id).await,
+            ) {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    tracing::warn!(error = %err, "clearing session snapshot failed before commit");
+                    clear_error.set(Some(t.agent_clear_failed.to_string()));
+                    clearing_conversation.set(false);
+                    return;
+                }
+            };
+            if !session_cleanup.cleanup_failures.is_empty() {
+                tracing::warn!(
+                    cleanup_failures = ?session_cleanup.cleanup_failures,
+                    "session clear completed with best-effort cleanup failures"
+                );
+            }
+            session_epoch.set(session_epoch().wrapping_add(1));
+
+            // 仅允许在空闲状态打开确认框；因此该事件会在 Kernel 的下一次
+            // Idle 轮询中清空短期上下文，且不会与进行中的模型/工具轮交错。
+            // 发送端失败表示 Kernel 已退出；持久化数据已经删除，后续亦不会有
+            // 旧上下文被使用，因此仍应收敛 UI 到已清空状态。
+            let _kernel_stopped = tx.send(AgentEvent::ClearConversation).await.is_err();
+
+            let new_session_id = generate_session_id(rust_agent::memory::now_ms(), &cwd);
+            if let Some(memory) = &memory {
+                memory.set_session_id(new_session_id.clone());
+            }
+            session_id_sig.set(Some(new_session_id));
+            mirror.write().clear();
+            *chat.write() = ChatViewState::default();
+            todos.set(Vec::new());
+            agent_status.set(AgentStatusView::Idle);
+            force_forget_memories.set(false);
+            clear_dialog_open.set(false);
+            clearing_conversation.set(false);
+
+            let memory_warning = (outcome.failed_memories > 0).then(|| {
+                tf(
+                    t.agent_clear_partial_after_history,
+                    &[
+                        ("removed", &outcome.removed_memories.to_string()),
+                        ("failed", &outcome.failed_memories.to_string()),
+                    ],
+                )
+            });
+            let (text, kind) = if let Some(warning) = clear_completion_warning(
+                memory_warning,
+                &session_cleanup.cleanup_failures,
+                t.agent_clear_completed_with_cleanup_errors,
+            ) {
+                (warning, NoticeKind::Warning)
+            } else if force {
+                (
+                    tf(
+                        t.agent_clear_success_with_memories,
+                        &[("count", &outcome.removed_memories.to_string())],
+                    ),
+                    NoticeKind::Success,
+                )
+            } else {
+                (t.agent_clear_success.to_string(), NoticeKind::Success)
+            };
+            let id = notice_seq() + 1;
+            notice_seq.set(id);
+            notice.set(Some(NoticeItem { id, text, kind }));
+        });
+    };
+
     let on_mode_change = move |new_mode: PermissionModeView| {
         let prev = mode();
         if let Some(engine) = engine_sig.read().as_ref() {
@@ -592,6 +826,23 @@ pub fn AgentChat() -> Element {
             div { style: "display:flex;align-items:center;gap:12px;padding:0 16px 8px;",
                 PermissionModeSwitcher { mode: mode(), on_change: on_mode_change }
                 PlanModeIndicator { mode: mode() }
+                button {
+                    class: "ains-btn ains-btn--secondary",
+                    r#type: "button",
+                    title: t.agent_clear_conversation,
+                    disabled: !ready()
+                        || chat.read().busy
+                        || chat.read().interrupt_pending
+                        || clearing_conversation()
+                        || session_store_sig().is_none(),
+                    onclick: move |_| {
+                        force_forget_memories.set(false);
+                        clear_error.set(None);
+                        clear_dialog_open.set(true);
+                    },
+                    Trash2 { width: 15, height: 15 }
+                    span { {t.agent_clear_conversation} }
+                }
                 div { style: "margin-left:auto;",
                     AgentStatus { status: agent_status() }
                 }
@@ -649,7 +900,7 @@ pub fn AgentChat() -> Element {
             }
             ChatInput {
                 busy: chat.read().busy && ready(),
-                disabled: chat.read().interrupt_pending || !ready(),
+                disabled: chat.read().interrupt_pending || !ready() || clearing_conversation(),
                 on_send,
                 on_interrupt,
                 slash_commands: vec![
@@ -674,6 +925,64 @@ pub fn AgentChat() -> Element {
                         let _ = msg.respond.send(choice);
                     }
                 },
+            }
+        }
+
+        if clear_dialog_open() {
+            Modal {
+                title: t.agent_clear_conversation_title.to_string(),
+                disable_backdrop: true,
+                hide_close: true,
+                on_close: move |_| {
+                    if !clearing_conversation() {
+                        clear_dialog_open.set(false);
+                        force_forget_memories.set(false);
+                        clear_error.set(None);
+                    }
+                },
+                p { style: "margin:0;color:var(--color-text-secondary);font-size:14px;line-height:1.55;",
+                    {t.agent_clear_conversation_message}
+                }
+                label { style: "display:flex;align-items:flex-start;gap:10px;padding:10px 12px;border:1px solid var(--color-error-border);border-radius:var(--radius-lg);background:var(--color-accent-pink-soft-bg);cursor:pointer;",
+                    input {
+                        r#type: "checkbox",
+                        checked: force_forget_memories(),
+                        disabled: clearing_conversation(),
+                        onchange: move |event| force_forget_memories.set(event.checked()),
+                    }
+                    span { style: "display:flex;flex-direction:column;gap:3px;",
+                        strong { style: "font-size:13px;color:var(--color-error-text);", {t.agent_clear_force_memories} }
+                        span { style: "font-size:12px;color:var(--color-text-secondary);line-height:1.45;",
+                            {t.agent_clear_force_memories_hint}
+                        }
+                    }
+                }
+                if let Some(error) = clear_error.read().as_ref() {
+                    p { class: "ains-form-error", style: "margin:0;", "{error}" }
+                }
+                div { style: "display:flex;justify-content:flex-end;gap:10px;margin-top:4px;",
+                    button {
+                        class: "ains-btn ains-btn--secondary",
+                        r#type: "button",
+                        disabled: clearing_conversation(),
+                        onclick: move |_| {
+                            clear_dialog_open.set(false);
+                            force_forget_memories.set(false);
+                            clear_error.set(None);
+                        },
+                        {t.cancel_label}
+                    }
+                    button {
+                        class: "ains-btn ains-btn--danger",
+                        r#type: "button",
+                        disabled: clearing_conversation(),
+                        onclick: on_clear_conversation,
+                        if clearing_conversation() {
+                            LoaderCircle { class: "ains-btn__spinner" }
+                        }
+                        {t.agent_clear_confirm}
+                    }
+                }
             }
         }
 
@@ -721,5 +1030,80 @@ pub fn AgentChat() -> Element {
                 }
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_agent::error::{AgentError, MemoryError};
+
+    #[test]
+    fn session_epoch_guard_rejects_skill_request_after_clear() {
+        let request_epoch = 41;
+
+        assert!(session_epoch_is_current(request_epoch, request_epoch));
+        assert!(
+            !session_epoch_is_current(request_epoch, request_epoch.wrapping_add(1)),
+            "a skill request that began before clear must not enter the replacement session"
+        );
+    }
+
+    #[test]
+    fn tombstone_retained_converts_snapshot_cleanup_error_into_warning() {
+        let outcome = settle_snapshot_cleanup(
+            SessionMemoryClearOutcome {
+                tombstone_retained: true,
+                ..Default::default()
+            },
+            Err(AgentError::Memory(MemoryError::Storage(
+                "injected snapshot cleanup failure".into(),
+            ))),
+        )
+        .expect("a committed tombstone requires switching away from the old session");
+
+        assert_eq!(outcome.cleanup_failures.len(), 1);
+        assert!(outcome.cleanup_failures[0].contains("injected snapshot cleanup failure"));
+    }
+
+    #[test]
+    fn uncommitted_clear_keeps_snapshot_cleanup_error_retryable() {
+        let result = settle_snapshot_cleanup(
+            SessionMemoryClearOutcome::default(),
+            Err(AgentError::Memory(MemoryError::Storage(
+                "injected snapshot cleanup failure".into(),
+            ))),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn tombstone_cleanup_warning_is_generic() {
+        assert!(
+            ui::EN
+                .agent_clear_completed_with_cleanup_errors
+                .contains("some stored data could not be removed")
+        );
+        assert!(
+            !ui::EN
+                .agent_clear_completed_with_cleanup_errors
+                .contains('{')
+        );
+    }
+
+    #[test]
+    fn completion_warning_never_includes_cleanup_diagnostics() {
+        let warning = clear_completion_warning(
+            Some("Long-term memory cleanup was partial.".into()),
+            &["entry: injected IndexedDB failure at /private/storage".into()],
+            ui::EN.agent_clear_completed_with_cleanup_errors,
+        )
+        .expect("either memory or physical cleanup failure needs a warning");
+
+        assert!(warning.contains("Long-term memory cleanup was partial."));
+        assert!(warning.contains("some stored data could not be removed"));
+        assert!(!warning.contains("injected IndexedDB failure"));
+        assert!(!warning.contains("/private/storage"));
     }
 }

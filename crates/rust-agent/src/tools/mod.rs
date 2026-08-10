@@ -17,7 +17,7 @@ pub mod filesystem;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod system;
 
-pub use memory::{MemoryReadTool, MemoryWriteTool};
+pub use memory::{MemoryReadTool, MemoryWriteTool, MemoryWriter};
 pub use runtime::ToolRuntime;
 
 use std::path::Path;

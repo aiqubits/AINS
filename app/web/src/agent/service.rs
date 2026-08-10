@@ -854,10 +854,55 @@ async fn build_memory_service(
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn extract_durable_serialized(
     memory: Arc<MemoryService>,
+    extraction_token: rust_agent::memory::ExtractionToken,
     messages: Vec<ConversationMessage>,
     reason: rust_agent::memory::ExtractionReason,
 ) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
-    memory.extract_durable(messages, reason).await
+    memory
+        .extract_durable_if_current(extraction_token, messages, reason)
+        .await
+}
+
+/// 清空也必须与 durable extraction 使用同一会话锁：否则另一实例/标签页中
+/// 已排队的抽取可能在删除扫描之后才写入，重新创建本应删除的长期记忆。
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn clear_current_session_serialized(
+    memory: Arc<MemoryService>,
+    force_forget_memories: bool,
+) -> Result<rust_agent::memory::SessionMemoryClearOutcome, rust_agent::error::MemoryError> {
+    memory.clear_current_session(force_forget_memories).await
+}
+
+/// checkpoint 与 clear_current_session 使用同一会话锁。否则旧标签页可能在
+/// tombstone 检查后才写入 checkpoint，重新留下已清空的物理 KV 记录。
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn save_checkpoint_serialized(
+    memory: Arc<MemoryService>,
+    messages: Vec<ConversationMessage>,
+    metadata: Option<rust_agent::memory::SessionCheckpoint>,
+) -> Result<(), rust_agent::error::MemoryError> {
+    memory.save_checkpoint(&messages, metadata.as_ref()).await
+}
+
+/// Browser tabs have independent Rust runtimes but share IndexedDB.  Route
+/// direct `memory_write` tool calls through the same Web Lock used by
+/// extraction and clear so a write that began in a stale tab cannot land after
+/// another tab commits the session tombstone.
+#[cfg(target_arch = "wasm32")]
+struct WebLockedMemoryWriter {
+    memory: Arc<MemoryService>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[async_trait::async_trait(?Send)]
+impl rust_agent::tools::MemoryWriter for WebLockedMemoryWriter {
+    async fn write(
+        &self,
+        record: rust_agent::memory::NewMemoryEntry,
+    ) -> Result<String, rust_agent::error::MemoryError> {
+        let lock_name = self.memory.extraction_lock_name();
+        with_web_lock(&lock_name, self.memory.write_memory(record)).await
+    }
 }
 
 /// The Web Locks API is an origin-wide mutex: unlike an in-memory Rust mutex,
@@ -866,10 +911,13 @@ pub async fn extract_durable_serialized(
 /// running without a lock would reintroduce duplicate, non-deterministic
 /// durable-memory writes.
 #[cfg(target_arch = "wasm32")]
-async fn with_web_lock<T>(
+async fn with_web_lock<T, E>(
     lock_name: &str,
-    operation: impl std::future::Future<Output = Result<T, rust_agent::error::MemoryError>>,
-) -> Result<T, rust_agent::error::MemoryError> {
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<rust_agent::error::MemoryError>,
+{
     use futures::channel::oneshot;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use wasm_bindgen_futures::{JsFuture, future_to_promise};
@@ -880,9 +928,7 @@ async fn with_web_lock<T>(
     let locks = js_sys::Reflect::get(&navigator, &JsValue::from_str("locks"))
         .map_err(|_| rust_agent::error::MemoryError::Storage("Web Locks unavailable".into()))?;
     if locks.is_null() || locks.is_undefined() {
-        return Err(rust_agent::error::MemoryError::Storage(
-            "Web Locks unavailable".into(),
-        ));
+        return Err(rust_agent::error::MemoryError::Storage("Web Locks unavailable".into()).into());
     }
     let request = js_sys::Reflect::get(&locks, &JsValue::from_str("request"))
         .map_err(|_| {
@@ -918,9 +964,9 @@ async fn with_web_lock<T>(
     let result = operation.await;
     let _ = release_tx.send(());
     if JsFuture::from(request_promise).await.is_err() && result.is_ok() {
-        return Err(rust_agent::error::MemoryError::Storage(
-            "Web Locks release failed".into(),
-        ));
+        return Err(
+            rust_agent::error::MemoryError::Storage("Web Locks release failed".into()).into(),
+        );
     }
     result
 }
@@ -928,11 +974,42 @@ async fn with_web_lock<T>(
 #[cfg(target_arch = "wasm32")]
 pub async fn extract_durable_serialized(
     memory: Arc<MemoryService>,
+    extraction_token: rust_agent::memory::ExtractionToken,
     messages: Vec<ConversationMessage>,
     reason: rust_agent::memory::ExtractionReason,
 ) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
     let lock_name = memory.extraction_lock_name();
-    with_web_lock(&lock_name, memory.extract_durable(messages, reason)).await
+    with_web_lock(
+        &lock_name,
+        memory.extract_durable_if_current(extraction_token, messages, reason),
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn clear_current_session_serialized(
+    memory: Arc<MemoryService>,
+    force_forget_memories: bool,
+) -> Result<rust_agent::memory::SessionMemoryClearOutcome, rust_agent::error::MemoryError> {
+    let lock_name = memory.extraction_lock_name();
+    with_web_lock(
+        &lock_name,
+        memory.clear_current_session(force_forget_memories),
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn save_checkpoint_serialized(
+    memory: Arc<MemoryService>,
+    messages: Vec<ConversationMessage>,
+    metadata: Option<rust_agent::memory::SessionCheckpoint>,
+) -> Result<(), rust_agent::error::MemoryError> {
+    let lock_name = memory.extraction_lock_name();
+    with_web_lock(&lock_name, async move {
+        memory.save_checkpoint(&messages, metadata.as_ref()).await
+    })
+    .await
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -1457,13 +1534,13 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         .as_deref()
         .map(|owner| session_store_for_owner(Arc::clone(&kv), owner));
 
-    // 会话恢复：latest 快照种子进 Kernel 上下文（快照落盘前已 sanitize）。
+    // 会话恢复：唯一 current 快照种子进 Kernel 上下文（快照落盘前已 sanitize）。
     // 先读取快照（不依赖 kernel），session_id 供 MemoryService 装配。
     let mut restored_messages = Vec::new();
     let mut session_id = None;
     let mut restored_snapshot = None;
     if let Some(session_store) = &session_store {
-        match session_store.load_latest(&cwd).await {
+        match session_store.load_current(&cwd).await {
             Ok(Some(snapshot)) => {
                 restored_messages = snapshot.messages.clone();
                 session_id = Some(snapshot.session_id.clone());
@@ -1477,8 +1554,8 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         }
     }
 
-    // 生产 MemoryService：每 session 实例；装配失败不阻断 Agent。
-    // 新会话预生成 session_id（与 SessionStore::save 自动生成路径同源）：
+    // 生产 MemoryService：每个 current 运行边界一个实例；装配失败不阻断 Agent。
+    // 没有 current 快照时预生成 session_id（与 SessionStore::save 自动生成路径同源）：
     // MemoryService 的 checkpoint / digest / status key 与后续快照落盘使用
     // 同一 id；save_snapshot 失败时也不会退化为跨会话共享的字面量占位。
     if session_id.is_none() {
@@ -1498,6 +1575,11 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     // P3：memory_read / memory_write 工具注入已装配的 MemoryService。
     if let Some(service) = &memory {
         memory_read.attach(Arc::clone(service));
+        #[cfg(target_arch = "wasm32")]
+        memory_write.attach_writer(Arc::new(WebLockedMemoryWriter {
+            memory: Arc::clone(service),
+        }));
+        #[cfg(not(target_arch = "wasm32"))]
         memory_write.attach(Arc::clone(service));
     }
     // Kernel 动态 memory recall（§12）：Querying 前 await provider。
@@ -1541,8 +1623,13 @@ pub async fn save_snapshot(
     usage: UsageSnapshot,
     tool_metadata: ToolMetadata,
 ) -> Option<String> {
+    // session_id 用于 tombstone/checkpoint 边界；保存锁则是项目级，确保
+    // 同一终端只有一个 current snapshot。
+    let session_id = session_id.unwrap_or_else(|| {
+        rust_agent::context::session::generate_session_id(rust_agent::memory::now_ms(), cwd)
+    });
     let input = SessionSaveInput {
-        session_id,
+        session_id: Some(session_id.clone()),
         cwd: cwd.to_string(),
         model: None,
         system_prompt: None,
@@ -1550,13 +1637,55 @@ pub async fn save_snapshot(
         usage,
         tool_metadata,
     };
-    match session_store.save(input).await {
+    match save_snapshot_serialized(session_store, cwd, input).await {
         Ok(id) => Some(id),
         Err(err) => {
             tracing::warn!("session snapshot save failed: {err}");
             None
         }
     }
+}
+
+/// Snapshot 写入与清空操作必须使用同一 host-wide lock。Native 端 redb 由
+/// 单进程服务使用，Web 端则需要 Web Locks API 协调共享 IndexedDB 的标签页。
+#[cfg(not(target_arch = "wasm32"))]
+async fn save_snapshot_serialized(
+    session_store: &SessionStore,
+    _cwd: &str,
+    input: SessionSaveInput,
+) -> Result<String, rust_agent::error::AgentError> {
+    session_store.save(input).await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn save_snapshot_serialized(
+    session_store: &SessionStore,
+    cwd: &str,
+    input: SessionSaveInput,
+) -> Result<String, rust_agent::error::AgentError> {
+    let lock_name = session_store.operation_lock_name(cwd);
+    with_web_lock(&lock_name, session_store.save(input)).await
+}
+
+/// 与 [`save_snapshot`] 使用相同的锁清除当前会话，避免跨标签页的旧 stream
+/// 在清空后把 snapshot 重新写回。
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn clear_session_snapshot_serialized(
+    session_store: &SessionStore,
+    cwd: &str,
+    session_id: &str,
+) -> Result<rust_agent::context::session::SessionClearOutcome, rust_agent::error::AgentError> {
+    session_store.clear_current(cwd, session_id).await
+}
+
+#[cfg(target_arch = "wasm32")]
+pub async fn clear_session_snapshot_serialized(
+    session_store: &SessionStore,
+    cwd: &str,
+    session_id: &str,
+) -> Result<rust_agent::context::session::SessionClearOutcome, rust_agent::error::AgentError> {
+    let lock_name = session_store.operation_lock_name(cwd);
+    with_web_lock(&lock_name, session_store.clear_current(cwd, session_id)).await
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -1699,11 +1828,11 @@ mod tests {
         .expect("snapshot should be persisted");
 
         let restored = store
-            .load_by_id("/workspace/project", &session_id)
+            .load_current("/workspace/project")
             .await
             .unwrap()
             .expect("saved snapshot should be readable");
-        assert_eq!(restored.message_count, messages.len());
+        assert_eq!(restored.session_id, session_id);
         assert_eq!(restored.messages, messages);
         assert_eq!(
             restored.tool_metadata.active_artifacts,

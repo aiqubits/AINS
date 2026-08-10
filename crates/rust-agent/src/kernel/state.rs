@@ -36,6 +36,9 @@ pub enum AgentEvent {
         content: String,
         attachments: Vec<Attachment>,
     },
+    /// 丢弃当前会话的短期上下文。宿主仅应在没有进行中查询时发送，持久化
+    /// 快照与长期记忆由宿主在此事件之外按自己的存储边界处理。
+    ClearConversation,
     SystemEvent {
         event_type: SystemEventType,
     },

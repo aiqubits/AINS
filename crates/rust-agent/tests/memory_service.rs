@@ -7,11 +7,12 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::json;
 
 use futures::StreamExt;
+use rust_agent::context::session::SessionStore;
 use rust_agent::error::{AgentError, MemoryError};
 use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
 use rust_agent::memory::kv::{
@@ -256,9 +257,253 @@ impl KvStore for FailingKv {
     }
 }
 
+/// One-shot delete failure used to verify that a retryable force-clear does
+/// not detach provenance from otherwise shared memories.
+struct FailingDeleteKv {
+    inner: Box<dyn KvStore>,
+    fail_next_delete: Arc<AtomicBool>,
+}
+
+impl FailingDeleteKv {
+    fn new(inner: impl KvStore + 'static, fail_next_delete: Arc<AtomicBool>) -> Self {
+        Self {
+            inner: Box::new(inner),
+            fail_next_delete,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for FailingDeleteKv {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<Duration>,
+    ) -> Result<(), MemoryError> {
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        if self.fail_next_delete.swap(false, Ordering::SeqCst) {
+            return Err(MemoryError::Storage(format!(
+                "injected delete failure for {key}"
+            )));
+        }
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+/// Fails after a caller-selected number of successful writes. This exercises
+/// rollback when one of several shared-memory provenance updates cannot be
+/// persisted.
+struct FailingArmedSetKv {
+    inner: Box<dyn KvStore>,
+    writes_until_failure: Arc<AtomicUsize>,
+}
+
+/// Pauses exactly one checkpoint write after it has passed the tombstone
+/// check. This reproduces the clear/write interleaving that must be
+/// serialized by the shared per-session gate.
+struct PausingCheckpointKv {
+    inner: Box<dyn KvStore>,
+    pause_next_checkpoint_set: AtomicBool,
+    checkpoint_set_started: Arc<tokio::sync::Notify>,
+    resume_checkpoint_set: Arc<tokio::sync::Notify>,
+}
+
+/// Rejects deletion of the session tombstone while preserving the stored row.
+/// This models a storage failure during the retryable force-clear rollback.
+struct FailingTombstoneRollbackKv {
+    inner: Box<dyn KvStore>,
+}
+
+impl FailingTombstoneRollbackKv {
+    fn new(inner: impl KvStore + 'static) -> Self {
+        Self {
+            inner: Box::new(inner),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for FailingTombstoneRollbackKv {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<Duration>,
+    ) -> Result<(), MemoryError> {
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        if key.starts_with("memory/cleared_sessions/") {
+            return Err(MemoryError::Storage(
+                "injected tombstone rollback failure".into(),
+            ));
+        }
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+impl PausingCheckpointKv {
+    fn new(
+        inner: impl KvStore + 'static,
+        checkpoint_set_started: Arc<tokio::sync::Notify>,
+        resume_checkpoint_set: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        Self {
+            inner: Box::new(inner),
+            pause_next_checkpoint_set: AtomicBool::new(true),
+            checkpoint_set_started,
+            resume_checkpoint_set,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for PausingCheckpointKv {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<Duration>,
+    ) -> Result<(), MemoryError> {
+        if key.starts_with("memory/checkpoints/")
+            && self.pause_next_checkpoint_set.swap(false, Ordering::SeqCst)
+        {
+            self.checkpoint_set_started.notify_one();
+            self.resume_checkpoint_set.notified().await;
+        }
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+impl FailingArmedSetKv {
+    fn new(inner: impl KvStore + 'static, writes_until_failure: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: Box::new(inner),
+            writes_until_failure,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for FailingArmedSetKv {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<Duration>,
+    ) -> Result<(), MemoryError> {
+        loop {
+            let remaining = self.writes_until_failure.load(Ordering::SeqCst);
+            if remaining == 0 {
+                break;
+            }
+            if self
+                .writes_until_failure
+                .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+            {
+                if remaining == 1 {
+                    return Err(MemoryError::Storage(format!(
+                        "injected set failure for {key}"
+                    )));
+                }
+                break;
+            }
+        }
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
 fn open_stores(dir: &tempfile::TempDir) -> MemoryStores {
     let backend = RedbBackend::open(dir.path().join("ains.redb")).expect("open redb");
     open_memory_stores(&MemoryBackend::Native(Arc::new(backend)), None)
+}
+
+fn open_stores_with_failing_embedding_delete(
+    dir: &tempfile::TempDir,
+) -> (MemoryStores, Arc<AtomicBool>) {
+    let backend = RedbBackend::open(dir.path().join("ains.redb")).expect("open redb");
+    let fail_next_delete = Arc::new(AtomicBool::new(false));
+    let embeddings: Arc<dyn KvStore> = Arc::new(FailingDeleteKv::new(
+        backend.table(TABLE_EMBEDDINGS),
+        Arc::clone(&fail_next_delete),
+    ));
+    (
+        MemoryStores::from_parts(
+            Arc::new(backend.table(TABLE_KV)),
+            Arc::new(backend.table(TABLE_MEMORIES)),
+            embeddings,
+            Arc::new(backend.table(TABLE_DOCUMENTS)),
+            Arc::new(backend.table(TABLE_HNSW_CACHE)),
+        ),
+        fail_next_delete,
+    )
+}
+
+fn open_stores_with_failing_memory_set(
+    dir: &tempfile::TempDir,
+) -> (MemoryStores, Arc<AtomicUsize>) {
+    let backend = RedbBackend::open(dir.path().join("ains.redb")).expect("open redb");
+    let writes_until_failure = Arc::new(AtomicUsize::new(0));
+    let memories: Arc<dyn KvStore> = Arc::new(FailingArmedSetKv::new(
+        backend.table(TABLE_MEMORIES),
+        Arc::clone(&writes_until_failure),
+    ));
+    (
+        MemoryStores::from_parts(
+            Arc::new(backend.table(TABLE_KV)),
+            memories,
+            Arc::new(backend.table(TABLE_EMBEDDINGS)),
+            Arc::new(backend.table(TABLE_DOCUMENTS)),
+            Arc::new(backend.table(TABLE_HNSW_CACHE)),
+        ),
+        writes_until_failure,
+    )
 }
 
 fn context(project_key: &str, session_id: &str) -> MemoryContext {
@@ -1008,6 +1253,506 @@ async fn checkpoint_keys_are_owner_project_and_session_scoped() {
 }
 
 #[tokio::test]
+async fn clear_current_session_deletes_only_its_memories_and_vectors() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-current"),
+    )
+    .await;
+    // 模拟同一进程中另一处恢复了相同 snapshot 的 service；它必须与当前
+    // 实例共享清空后的抽取失效状态。
+    let restored = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-current"),
+    )
+    .await;
+    let other = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-other"),
+    )
+    .await;
+
+    let current_id = current
+        .write_memory(record(
+            "memory written by current session",
+            MemoryScope::Project,
+        ))
+        .await
+        .unwrap();
+    let other_id = other
+        .write_memory(record(
+            "memory written by other session",
+            MemoryScope::Project,
+        ))
+        .await
+        .unwrap();
+    // 默认路径仅与后台抽取同步，长期记忆仍可在下一次对话中召回；清空前
+    // 已排队但尚未开始的 extraction 必须被代数令牌拒绝，不能随后复活数据。
+    let stale_extraction_token = restored.extraction_token();
+    // Public callers may queue the convenience future without polling it
+    // immediately.  Its identity must be captured at creation time as well.
+    let stale_convenience_future = restored.extract_durable(
+        messages("old turn", "old response"),
+        ExtractionReason::FinalTurn,
+    );
+    let retained = current.clear_current_session(false).await.unwrap();
+    assert_eq!(retained.removed_memories, 0);
+    assert_eq!(retained.failed_memories, 0);
+    current
+        .save_checkpoint(&messages("old turn", "old response"), None)
+        .await
+        .unwrap();
+    assert!(
+        current.load_checkpoint().await.unwrap().is_none(),
+        "已清空 session 的旧实例不得重新写入 checkpoint"
+    );
+    let stale_extraction = restored
+        .extract_durable_if_current(
+            stale_extraction_token.clone(),
+            messages("old turn", "old response"),
+            ExtractionReason::FinalTurn,
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_extraction.skipped.as_deref(), Some("session cleared"));
+    assert!(
+        restored
+            .write_memory(record("must not be recreated", MemoryScope::Project))
+            .await
+            .is_err(),
+        "cleared session 的另一恢复实例不得继续写入长期记忆"
+    );
+    restored.set_session_id("session-after-clear");
+    let stale_convenience = stale_convenience_future.await.unwrap();
+    assert_eq!(
+        stale_convenience.skipped.as_deref(),
+        Some("session cleared"),
+        "an unpolled convenience future must retain its original session identity"
+    );
+    let stale_after_session_switch = restored
+        .extract_durable_if_current(
+            stale_extraction_token,
+            messages("old turn", "old response"),
+            ExtractionReason::FinalTurn,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stale_after_session_switch.skipped.as_deref(),
+        Some("session cleared"),
+        "an extraction queued for the cleared session must not become valid again after a new session starts"
+    );
+    assert!(
+        restored
+            .write_memory(record("new session may write", MemoryScope::Project))
+            .await
+            .is_ok(),
+        "切换到新 session 后不应受旧 session tombstone 影响"
+    );
+    assert!(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&current_id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    // 强制选项按会话来源集合精确删除记忆及其向量，但不触及其他会话。
+    let deleted = current.clear_current_session(true).await.unwrap();
+    assert_eq!(deleted.removed_memories, 1);
+    assert_eq!(deleted.failed_memories, 0);
+    assert!(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&current_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        stores
+            .embeddings
+            .get(&MemoryNamespace::Personal.storage_key(&current_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&other_id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        stores
+            .embeddings
+            .get(&MemoryNamespace::Personal.storage_key(&other_id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn clear_serializes_checkpoint_write_and_removes_the_physical_row() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let cwd = "/workspace/checkpoint-clear-race";
+    let project_key = rust_agent::context::session::project_slug(cwd);
+    let backend = RedbBackend::open(dir.path().join("ains.redb")).expect("open redb");
+    let checkpoint_set_started = Arc::new(tokio::sync::Notify::new());
+    let resume_checkpoint_set = Arc::new(tokio::sync::Notify::new());
+    let kv: Arc<dyn KvStore> = Arc::new(PausingCheckpointKv::new(
+        backend.table(TABLE_KV),
+        Arc::clone(&checkpoint_set_started),
+        Arc::clone(&resume_checkpoint_set),
+    ));
+    let stores = MemoryStores::from_parts(
+        Arc::clone(&kv),
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(backend.table(TABLE_HNSW_CACHE)),
+    );
+    let model = Arc::new(MockModel::empty());
+    let memory = Arc::new(
+        service(
+            stores,
+            Arc::clone(&model) as Arc<dyn ModelClient>,
+            context(&project_key, "checkpoint-clear-race"),
+        )
+        .await,
+    );
+    let checkpoint_key = memory.checkpoint_key();
+
+    let checkpoint_memory = Arc::clone(&memory);
+    let checkpoint_task = tokio::spawn(async move {
+        checkpoint_memory
+            .save_checkpoint(&messages("old question", "old answer"), None)
+            .await
+    });
+    checkpoint_set_started.notified().await;
+
+    let clear_memory = Arc::clone(&memory);
+    let session_store = SessionStore::new(Arc::clone(&kv));
+    let mut clear_task = tokio::spawn(async move {
+        let outcome = clear_memory.clear_current_session(false).await.unwrap();
+        assert!(outcome.tombstone_retained);
+        session_store
+            .clear_current(cwd, "checkpoint-clear-race")
+            .await
+            .unwrap();
+    });
+
+    // The clear must wait for the in-flight checkpoint. Without the shared
+    // gate it would commit the tombstone and delete the absent key here, then
+    // the stale set below would recreate the checkpoint.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut clear_task)
+            .await
+            .is_err()
+    );
+    resume_checkpoint_set.notify_one();
+    checkpoint_task.await.unwrap().unwrap();
+    clear_task.await.unwrap();
+
+    assert!(
+        kv.get(&checkpoint_key).await.unwrap().is_none(),
+        "a cleared session must not leave its checkpoint physically stored"
+    );
+}
+
+#[tokio::test]
+async fn force_clear_preserves_deduplicated_memory_until_its_last_session_source_is_removed() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let first = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-first"),
+    )
+    .await;
+    let second = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-second"),
+    )
+    .await;
+
+    let first_id = first
+        .write_memory(record(
+            "shared memory written in two conversations",
+            MemoryScope::Project,
+        ))
+        .await
+        .unwrap();
+    let second_id = second
+        .write_memory(record(
+            "shared memory written in two conversations",
+            MemoryScope::Project,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        first_id, second_id,
+        "identical scoped memories are deduplicated"
+    );
+
+    let first_clear = first.clear_current_session(true).await.unwrap();
+    assert_eq!(first_clear.removed_memories, 0);
+    let key = MemoryNamespace::Personal.storage_key(&first_id);
+    let after_first: MemoryEntry = serde_json::from_value(
+        stores
+            .memories
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("shared row remains"),
+    )
+    .unwrap();
+    let after_first: DurableMemoryMetadata = serde_json::from_value(after_first.metadata).unwrap();
+    assert_eq!(after_first.source_session_ids, ["session-second"]);
+
+    let second_clear = second.clear_current_session(true).await.unwrap();
+    assert_eq!(second_clear.removed_memories, 1);
+    assert!(stores.memories.get(&key).await.unwrap().is_none());
+    assert!(
+        stores
+            .embeddings
+            .get(&MemoryNamespace::Personal.storage_key(&first_id))
+            .await
+            .unwrap()
+            .is_none(),
+        "the final source deletion also removes the vector SoT"
+    );
+}
+
+#[tokio::test]
+async fn force_clear_removes_a_team_members_source_after_another_owner_refreshes_it() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let mut first_context = MemoryContext::for_owner("proj-a", "team-session-first", "owner-a");
+    first_context.team_id = Some("team-1".into());
+    let mut second_context = MemoryContext::for_owner("proj-a", "team-session-second", "owner-b");
+    second_context.team_id = Some("team-1".into());
+    let first = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        first_context,
+    )
+    .await;
+    let second = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        second_context,
+    )
+    .await;
+
+    let first_id = first
+        .write_memory(record("team-shared provenance", MemoryScope::Team))
+        .await
+        .unwrap();
+    let second_id = second
+        .write_memory(record("team-shared provenance", MemoryScope::Team))
+        .await
+        .unwrap();
+    assert_eq!(first_id, second_id);
+
+    let first_clear = first.clear_current_session(true).await.unwrap();
+    assert_eq!(first_clear.removed_memories, 0);
+    let key = MemoryNamespace::Personal.storage_key(&first_id);
+    let entry: MemoryEntry = serde_json::from_value(
+        stores
+            .memories
+            .get(&key)
+            .await
+            .unwrap()
+            .expect("shared row remains"),
+    )
+    .unwrap();
+    let metadata: DurableMemoryMetadata = serde_json::from_value(entry.metadata).unwrap();
+    assert_eq!(metadata.source_session_ids, ["team-session-second"]);
+
+    let second_clear = second.clear_current_session(true).await.unwrap();
+    assert_eq!(second_clear.removed_memories, 1);
+    assert!(stores.memories.get(&key).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn failed_force_clear_keeps_shared_memory_provenance_for_retry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (stores, fail_next_embedding_delete) = open_stores_with_failing_embedding_delete(&dir);
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-current"),
+    )
+    .await;
+    let other = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-other"),
+    )
+    .await;
+
+    let shared_id = current
+        .write_memory(record("shared retryable provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+    other
+        .write_memory(record("shared retryable provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+    current
+        .write_memory(record("exclusive deletion will fail", MemoryScope::Project))
+        .await
+        .unwrap();
+
+    fail_next_embedding_delete.store(true, Ordering::SeqCst);
+    let outcome = current.clear_current_session(true).await.unwrap();
+    assert_eq!(outcome.failed_memories, 1);
+    assert!(
+        !outcome.tombstone_retained,
+        "a retryable partial clear must leave the current conversation active"
+    );
+
+    let shared: MemoryEntry = serde_json::from_value(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&shared_id))
+            .await
+            .unwrap()
+            .expect("shared memory must remain"),
+    )
+    .unwrap();
+    let shared: DurableMemoryMetadata = serde_json::from_value(shared.metadata).unwrap();
+    assert_eq!(
+        shared.source_session_ids,
+        ["session-current", "session-other"],
+        "failed deletion must not drop the retryable session's provenance"
+    );
+}
+
+#[tokio::test]
+async fn failed_tombstone_rollback_retires_the_partially_cleared_session() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = RedbBackend::open(dir.path().join("ains.redb")).expect("open redb");
+    let fail_next_embedding_delete = Arc::new(AtomicBool::new(false));
+    let stores = MemoryStores::from_parts(
+        Arc::new(FailingTombstoneRollbackKv::new(backend.table(TABLE_KV))),
+        Arc::new(backend.table(TABLE_MEMORIES)),
+        Arc::new(FailingDeleteKv::new(
+            backend.table(TABLE_EMBEDDINGS),
+            Arc::clone(&fail_next_embedding_delete),
+        )),
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(backend.table(TABLE_HNSW_CACHE)),
+    );
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores,
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "rollback-failure"),
+    )
+    .await;
+
+    current
+        .write_memory(record("exclusive memory", MemoryScope::Project))
+        .await
+        .unwrap();
+    fail_next_embedding_delete.store(true, Ordering::SeqCst);
+
+    let outcome = current.clear_current_session(true).await.unwrap();
+    assert_eq!(outcome.failed_memories, 1);
+    assert!(
+        outcome.tombstone_retained,
+        "the UI must retire a session when tombstone rollback failed"
+    );
+    assert!(
+        current
+            .write_memory(record(
+                "must not write after retained tombstone",
+                MemoryScope::Project
+            ))
+            .await
+            .is_err(),
+        "a retained tombstone must reject subsequent old-session writes"
+    );
+}
+
+#[tokio::test]
+async fn failed_shared_provenance_update_rolls_back_prior_updates() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (stores, writes_until_failure) = open_stores_with_failing_memory_set(&dir);
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-current"),
+    )
+    .await;
+    let other = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        context("proj-a", "session-other"),
+    )
+    .await;
+
+    let first_id = current
+        .write_memory(record("first shared provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+    other
+        .write_memory(record("first shared provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+    let second_id = current
+        .write_memory(record("second shared provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+    other
+        .write_memory(record("second shared provenance", MemoryScope::Project))
+        .await
+        .unwrap();
+
+    // Permit the first metadata update, fail the second, then permit the
+    // compensating rollback of the first update.
+    writes_until_failure.store(2, Ordering::SeqCst);
+    let outcome = current.clear_current_session(true).await.unwrap();
+    assert_eq!(outcome.failed_memories, 1);
+    assert!(!outcome.tombstone_retained);
+
+    for id in [first_id, second_id] {
+        let entry: MemoryEntry = serde_json::from_value(
+            stores
+                .memories
+                .get(&MemoryNamespace::Personal.storage_key(&id))
+                .await
+                .unwrap()
+                .expect("shared memory must remain for retry"),
+        )
+        .unwrap();
+        let metadata: DurableMemoryMetadata = serde_json::from_value(entry.metadata).unwrap();
+        assert_eq!(
+            metadata.source_session_ids,
+            ["session-current", "session-other"],
+            "a failed clear must restore every shared-memory provenance update"
+        );
+    }
+}
+
+#[tokio::test]
 async fn set_session_id_updates_checkpoint_and_digest_scoping() {
     let dir = tempfile::TempDir::new().unwrap();
     let stores = open_stores(&dir);
@@ -1065,6 +1810,86 @@ async fn checkpoint_without_metadata_generates_recent_conversation() {
     assert!(doc.contains("hello there"));
     // 不宣称 P1 拥有完整结构化 Task state
     assert!(doc.contains("Current State"));
+}
+
+#[tokio::test]
+async fn cleared_session_checkpoint_is_not_read_even_if_a_stale_row_remains() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let memory_context = context("proj-a", "cleared-checkpoint");
+    let svc = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        memory_context.clone(),
+    )
+    .await;
+    stores
+        .kv
+        .set(&svc.checkpoint_key(), &json!("stale checkpoint"), None)
+        .await
+        .unwrap();
+    stores
+        .kv
+        .set(
+            &format!(
+                "memory/cleared_sessions/{}/{}/{}",
+                memory_context.owner_key, memory_context.project_key, memory_context.session_id,
+            ),
+            &json!(true),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        svc.load_checkpoint().await.unwrap().is_none(),
+        "tombstoned sessions must not expose a stale checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn cleared_session_does_not_recreate_memory_error_status() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let memory_context = context("proj-a", "cleared-status");
+    let svc = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        memory_context.clone(),
+    )
+    .await;
+    stores
+        .kv
+        .set(
+            &format!(
+                "memory/cleared_sessions/{}/{}/{}",
+                memory_context.owner_key, memory_context.project_key, memory_context.session_id,
+            ),
+            &json!(true),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        svc.write_memory(record("old session must not write", MemoryScope::Project))
+            .await
+            .is_err()
+    );
+    assert!(
+        stores
+            .kv
+            .get(&format!(
+                "memory/status/{}/{}/{}/memory_last_error",
+                memory_context.owner_key, memory_context.project_key, memory_context.session_id,
+            ))
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected old write must not recreate cleared session status"
+    );
 }
 
 #[tokio::test]
@@ -2399,8 +3224,8 @@ async fn project_doc_shared_content_keeps_membership_when_one_source_changes_or_
     std::fs::create_dir_all(&cwd).unwrap();
     let shared = "Shared instruction: run cargo test before submitting.";
     std::fs::write(cwd.join("AGENTS.md"), shared).unwrap();
-    let claude = cwd.join("CLAUDE.md");
-    std::fs::write(&claude, shared).unwrap();
+    let soul = cwd.join("SOUL.md");
+    std::fs::write(&soul, shared).unwrap();
 
     let stores = open_stores(&dir);
     let model = Arc::new(MockModel::empty());
@@ -2422,9 +3247,9 @@ async fn project_doc_shared_content_keeps_membership_when_one_source_changes_or_
         "同内容的两个 source 应复用同一个 membership"
     );
 
-    // CLAUDE 改为新内容后，AGENTS 仍引用旧 doc_id；旧 membership 不能被
-    // CLAUDE 的重索引撤销。
-    std::fs::write(&claude, "Claude-only instruction: use cargo fmt.").unwrap();
+    // SOUL 改为新内容后，AGENTS 仍引用旧 doc_id；旧 membership 不能被
+    // SOUL 的重索引撤销。
+    std::fs::write(&soul, "Soul-only instruction: use cargo fmt.").unwrap();
     svc.index_project_docs(&cwd).await.unwrap();
     let after_change = svc
         .search_project_docs("cargo test cargo fmt", 10)
@@ -2437,10 +3262,10 @@ async fn project_doc_shared_content_keeps_membership_when_one_source_changes_or_
             .any(|hit| hit.chunk.content.contains("cargo fmt"))
     );
 
-    // 删除 CLAUDE 后应撤销它的新 membership 并递增 revision，但 AGENTS 的
+    // 删除 SOUL 后应撤销它的新 membership 并递增 revision，但 AGENTS 的
     // 共享内容仍可检索。
     let revision_before_delete = svc.revision();
-    std::fs::remove_file(&claude).unwrap();
+    std::fs::remove_file(&soul).unwrap();
     svc.index_project_docs(&cwd).await.unwrap();
     assert!(svc.revision() > revision_before_delete);
     let after_delete = svc

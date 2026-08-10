@@ -23,6 +23,16 @@ use crate::memory::kv::{
 use crate::memory::kv_crypto::{EncryptedKvStore, EncryptionKey};
 use crate::memory::vector_manager::DefaultVectorIndexManager;
 
+/// 同一持久化会话在一个运行时内共享的 extraction 协调状态。
+///
+/// gate 负责串行化执行；epoch 在会话清空时递增，使已经排队但尚未取得
+/// gate 的旧任务失效。两者必须同属 `MemoryStores`，不能由每个
+/// `MemoryService` 自行持有，否则恢复同一 session 的另一个实例仍会写回。
+pub(crate) struct ExtractionSessionState {
+    pub(crate) gate: futures::lock::Mutex<()>,
+    pub(crate) epoch: AtomicU64,
+}
+
 /// 5 张逻辑表的统一句柄集合（1 张通用 KV 表 + 4 张 Memory/Vector 相关表）。
 #[derive(Clone)]
 pub struct MemoryStores {
@@ -57,7 +67,7 @@ pub struct MemoryStores {
     /// session 边界：同一进程可以同时恢复同一个 snapshot，因此 gate 必须由
     /// 共享 stores 持有。Weak 值会在最后一个 session service 释放后自然回收，
     /// 避免历史 session id 使 map 无界增长。
-    extraction_gates: Arc<RwLock<HashMap<String, Weak<futures::lock::Mutex<()>>>>>,
+    extraction_sessions: Arc<RwLock<HashMap<String, Weak<ExtractionSessionState>>>>,
 }
 
 impl MemoryStores {
@@ -88,7 +98,7 @@ impl MemoryStores {
             revision: Arc::new(AtomicU64::new(0)),
             embedding_contract_gate: Arc::new(futures::lock::Mutex::new(())),
             document_index_gate: Arc::new(futures::lock::Mutex::new(())),
-            extraction_gates: Arc::new(RwLock::new(HashMap::new())),
+            extraction_sessions: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -96,18 +106,21 @@ impl MemoryStores {
     /// session identity. Web hosts add an origin-wide lock around this gate to
     /// cover separate tabs; this map covers independent service instances in
     /// the same runtime (including Native hosts).
-    pub fn extraction_gate_for(&self, session_key: &str) -> Arc<futures::lock::Mutex<()>> {
-        let mut gates = self
-            .extraction_gates
+    pub(crate) fn extraction_session_for(&self, session_key: &str) -> Arc<ExtractionSessionState> {
+        let mut sessions = self
+            .extraction_sessions
             .write()
             .unwrap_or_else(|poison| poison.into_inner());
-        gates.retain(|_, gate| gate.strong_count() > 0);
-        if let Some(gate) = gates.get(session_key).and_then(Weak::upgrade) {
-            return gate;
+        sessions.retain(|_, session| session.strong_count() > 0);
+        if let Some(session) = sessions.get(session_key).and_then(Weak::upgrade) {
+            return session;
         }
-        let gate = Arc::new(futures::lock::Mutex::new(()));
-        gates.insert(session_key.to_string(), Arc::downgrade(&gate));
-        gate
+        let session = Arc::new(ExtractionSessionState {
+            gate: futures::lock::Mutex::new(()),
+            epoch: AtomicU64::new(0),
+        });
+        sessions.insert(session_key.to_string(), Arc::downgrade(&session));
+        session
     }
 }
 

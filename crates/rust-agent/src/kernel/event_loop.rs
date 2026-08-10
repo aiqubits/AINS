@@ -285,6 +285,12 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     .await;
                     AgentState::Idle
                 }
+                AgentState::Observing(AgentEvent::ClearConversation) => {
+                    self.context.clear_conversation();
+                    self.compact_state = AutoCompactState::default();
+                    self.interrupt.store(false, Ordering::SeqCst);
+                    AgentState::Idle
+                }
                 AgentState::Observing(event) => {
                     let payload = agent_event_hook_payload(&event, &self.config.cwd);
                     if self

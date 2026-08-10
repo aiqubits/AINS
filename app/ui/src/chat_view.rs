@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use dioxus_icons::lucide::{ChevronDown, ChevronRight, CircleStop, SendHorizontal};
+use dioxus_icons::lucide::{Check, ChevronDown, ChevronRight, CircleStop, Copy, SendHorizontal};
 
 use crate::{EN, I18nContext, tf};
 
@@ -61,6 +61,48 @@ pub struct ChatViewState {
     /// 在收到确认前不能开始下一条查询，否则旧查询的中断状态可能在新查询
     /// 已显示为 busy 后到达并错误地将其复位为 idle。
     pub interrupt_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum CopyState {
+    #[default]
+    Idle,
+    Copied,
+    Failed,
+}
+
+/// 将消息文本写入宿主 WebView 的剪贴板。优先使用 Clipboard API，不能使用时
+/// 回退到 `execCommand("copy")`，以兼容非安全上下文及部分 Desktop WebView。
+fn clipboard_copy_script(text: &str) -> String {
+    let encoded = serde_json::to_string(&text).expect("serializing a Rust string cannot fail");
+    format!(
+        r#"(async () => {{
+            const text = {encoded};
+            if (typeof navigator !== "undefined" && navigator.clipboard && window.isSecureContext) {{
+                try {{
+                    await navigator.clipboard.writeText(text);
+                    return;
+                }} catch (_) {{
+                    // Permission may be denied even when the API exists.  Try
+                    // the legacy path before reporting a copy failure.
+                }}
+            }}
+            const textarea = document.createElement("textarea");
+            textarea.value = text;
+            textarea.setAttribute("readonly", "");
+            textarea.style.cssText = "position:fixed;left:-9999px;top:0;opacity:0";
+            document.body.appendChild(textarea);
+            textarea.select();
+            const copied = document.execCommand("copy");
+            textarea.remove();
+            if (!copied) throw new Error("clipboard unavailable");
+        }})()"#
+    )
+}
+
+async fn copy_message_text(text: String) -> bool {
+    let script = clipboard_copy_script(&text);
+    document::eval(&script).await.is_ok()
 }
 
 impl ChatViewState {
@@ -134,10 +176,7 @@ pub fn ChatView(state: ReadSignal<ChatViewState>) -> Element {
                 ChatItemRow { key: "{key}", item: item.clone() }
             }
             if !snapshot.streaming_text.is_empty() {
-                div { class: "ains-chat__msg ains-chat__msg--assistant",
-                    span { class: "ains-chat__role", {t.chat_role_assistant} }
-                    pre { class: "ains-chat__text", "{snapshot.streaming_text}" }
-                }
+                TextMessage { role: ChatRole::Assistant, text: snapshot.streaming_text }
             } else if snapshot.busy {
                 div { class: "ains-chat__thinking", {t.chat_thinking} }
             }
@@ -151,24 +190,7 @@ fn ChatItemRow(item: ChatItem) -> Element {
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
 
     match item {
-        ChatItem::Text { role, text } => {
-            let (class, label) = match role {
-                ChatRole::User => ("ains-chat__msg ains-chat__msg--user", t.chat_role_user),
-                ChatRole::Assistant => (
-                    "ains-chat__msg ains-chat__msg--assistant",
-                    t.chat_role_assistant,
-                ),
-                ChatRole::System => ("ains-chat__msg ains-chat__msg--system", ""),
-            };
-            rsx! {
-                div { class,
-                    if !label.is_empty() {
-                        span { class: "ains-chat__role", {label} }
-                    }
-                    pre { class: "ains-chat__text", "{text}" }
-                }
-            }
-        }
+        ChatItem::Text { role, text } => rsx! { TextMessage { role, text } },
         ChatItem::ToolCall {
             name,
             input_preview,
@@ -198,6 +220,88 @@ fn ChatItemRow(item: ChatItem) -> Element {
                     "{text}"
                 }
             }
+        }
+    }
+}
+
+/// 单条文本消息。操作区位于消息框外侧，以便与消息内容清晰分隔。
+#[component]
+fn TextMessage(role: ChatRole, text: String) -> Element {
+    let i18n = try_use_context::<I18nContext>();
+    let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
+    let (message_class, bubble_class, meta_class, label) = match role {
+        ChatRole::User => (
+            "ains-chat__message ains-chat__message--user",
+            "ains-chat__msg ains-chat__msg--user",
+            "ains-chat__message-meta ains-chat__message-meta--user",
+            t.chat_role_user,
+        ),
+        ChatRole::Assistant => (
+            "ains-chat__message ains-chat__message--assistant",
+            "ains-chat__msg ains-chat__msg--assistant",
+            "ains-chat__message-meta ains-chat__message-meta--assistant",
+            t.chat_role_assistant,
+        ),
+        ChatRole::System => (
+            "ains-chat__message ains-chat__message--system",
+            "ains-chat__msg ains-chat__msg--system",
+            "ains-chat__message-meta ains-chat__message-meta--system",
+            "",
+        ),
+    };
+
+    rsx! {
+        div { class: message_class,
+            div { class: bubble_class,
+                if !label.is_empty() {
+                    span { class: "ains-chat__role", {label} }
+                }
+                pre { class: "ains-chat__text", "{text}" }
+            }
+            div { class: meta_class,
+                MessageCopyButton { text }
+            }
+        }
+    }
+}
+
+/// 单条文本消息的复制操作。状态保存在行组件内，避免其他消息的反馈被影响。
+#[component]
+fn MessageCopyButton(text: String) -> Element {
+    let i18n = try_use_context::<I18nContext>();
+    let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
+    let mut copy_state = use_signal(CopyState::default);
+    let (class, label) = match copy_state() {
+        CopyState::Idle => ("ains-chat__copy", t.chat_copy),
+        CopyState::Copied => ("ains-chat__copy ains-chat__copy--copied", t.chat_copied),
+        CopyState::Failed => (
+            "ains-chat__copy ains-chat__copy--failed",
+            t.chat_copy_failed,
+        ),
+    };
+
+    rsx! {
+        button {
+            class,
+            r#type: "button",
+            aria_label: label,
+            title: label,
+            onclick: move |_| {
+                let text = text.clone();
+                spawn(async move {
+                    copy_state.set(if copy_message_text(text).await {
+                        CopyState::Copied
+                    } else {
+                        CopyState::Failed
+                    });
+                });
+            },
+            if copy_state() == CopyState::Copied {
+                Check { class: "ains-chat__copy-icon" }
+            } else {
+                Copy { class: "ains-chat__copy-icon" }
+            }
+            span { class: "ains-chat__sr-only", aria_live: "polite", "{label}" }
         }
     }
 }
@@ -439,5 +543,18 @@ mod tests {
             text: "x".into(),
         }]);
         assert_eq!(state.item_keys, [4]);
+    }
+
+    #[test]
+    fn clipboard_script_escapes_message_text_and_falls_back_after_api_rejection() {
+        let message = "quote: \"; newline:\n; unicode: 智能体".to_string();
+        let script = clipboard_copy_script(&message);
+        assert!(script.contains(r#"quote: \""#));
+        assert!(script.contains(r#"newline:\n"#));
+
+        // Keep the fallback after the Clipboard API call: browsers may expose
+        // `navigator.clipboard` but reject writes because of permissions.
+        assert!(script.contains("catch (_)"));
+        assert!(script.find("catch (_)").unwrap() < script.find("document.execCommand").unwrap());
     }
 }

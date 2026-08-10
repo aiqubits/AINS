@@ -27,6 +27,61 @@ use crate::memory::vector::{
 /// [`MemoryEngine::remember_in_domain`] 写入时以参数为准强制落该字段，
 /// 防止调用方漏写导致 v2 签名行永久残留。
 const DEDUPE_DOMAIN_FIELD: &str = "dedupe_domain";
+/// Durable-memory provenance fields. The engine remains metadata-agnostic for
+/// normal callers, but preserves this optional collection when it refreshes a
+/// deduplicated entry so a later session-scoped deletion cannot erase a
+/// memory that an earlier session also owns.
+const SOURCE_SESSION_ID_FIELD: &str = "source_session_id";
+const SOURCE_SESSION_IDS_FIELD: &str = "source_session_ids";
+
+fn append_unique_session_ids(value: Option<&Value>, ids: &mut Vec<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    let values = match value {
+        Value::String(id) => std::slice::from_ref(id),
+        Value::Array(values) => {
+            for value in values {
+                if let Some(id) = value.as_str()
+                    && !id.is_empty()
+                    && !ids.iter().any(|existing| existing == id)
+                {
+                    ids.push(id.to_string());
+                }
+            }
+            return;
+        }
+        _ => return,
+    };
+    for id in values {
+        if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+}
+
+fn merge_source_session_provenance(
+    existing: &Value,
+    incoming: &mut serde_json::Map<String, Value>,
+) {
+    // Only opt in when the caller supplied the collection. This keeps generic
+    // MemoryEngine users' metadata untouched while preserving provenance for
+    // MemoryService durable records.
+    if !incoming.contains_key(SOURCE_SESSION_IDS_FIELD) {
+        return;
+    }
+    let mut ids = Vec::new();
+    if let Value::Object(existing) = existing {
+        append_unique_session_ids(existing.get(SOURCE_SESSION_IDS_FIELD), &mut ids);
+        append_unique_session_ids(existing.get(SOURCE_SESSION_ID_FIELD), &mut ids);
+    }
+    append_unique_session_ids(incoming.get(SOURCE_SESSION_IDS_FIELD), &mut ids);
+    append_unique_session_ids(incoming.get(SOURCE_SESSION_ID_FIELD), &mut ids);
+    incoming.insert(
+        SOURCE_SESSION_IDS_FIELD.into(),
+        Value::Array(ids.into_iter().map(Value::String).collect()),
+    );
+}
 
 /// 进程内唯一序号：content signature 在不同 dedupe domain 中可以相同，且
 /// `now_ms()` 的精度不足以作为主键唯一性来源。与 CSPRNG 后缀组合后，既
@@ -212,6 +267,7 @@ impl MemoryEngine {
             // 同口径：原样保留（无处挂字段，衰减锚点回落 created_at）。
             entry.metadata = match metadata {
                 Value::Object(mut map) => {
+                    merge_source_session_provenance(&entry.metadata, &mut map);
                     map.insert("importance".into(), merged.into());
                     map.insert("refreshed_at".into(), now_ms().into());
                     // 刷新路径同样强制去重域：forget 依赖该字段选择签名清理路径
@@ -551,6 +607,28 @@ impl MemoryEngine {
         }
     }
 
+    /// Replace a durable entry's metadata without touching its content,
+    /// embedding, signature, or vector index. Used for provenance-only
+    /// session cleanup after a deduplicated memory is found to have other
+    /// surviving sources.
+    pub(crate) async fn update_metadata(
+        &mut self,
+        namespace: MemoryNamespace,
+        id: &str,
+        metadata: Value,
+    ) -> Result<(), MemoryError> {
+        let key = namespace.storage_key(id);
+        let Some(raw) = self.memories.get(&key).await? else {
+            return Err(MemoryError::NotFound(id.to_string()));
+        };
+        let mut entry: MemoryEntry =
+            serde_json::from_value(raw).map_err(|e| MemoryError::Serialization(e.to_string()))?;
+        entry.metadata = metadata;
+        let value =
+            serde_json::to_value(entry).map_err(|e| MemoryError::Serialization(e.to_string()))?;
+        self.memories.set(&key, &value, None).await
+    }
+
     /// 删除一条记忆：签名、内容、向量、索引节点全部清理。
     /// 内容行损坏（无法解码）时跳过签名清理，仍删除裸键，
     /// 保证损坏行不会永久占用容量（`count` 按前缀统计）。
@@ -566,7 +644,7 @@ impl MemoryEngine {
             Err(MemoryError::Serialization(_)) => None,
             Err(e) => return Err(e),
         };
-        if let Some(raw) = raw
+        let signature_key = if let Some(raw) = raw
             && let Ok(entry) = serde_json::from_value::<MemoryEntry>(raw)
         {
             let signature = content_signature(&entry.content, namespace.as_str());
@@ -577,19 +655,28 @@ impl MemoryEngine {
                 Some(domain) => sig_key_v2(namespace, domain, &signature),
                 None => sig_key(namespace, &signature),
             };
-            // 守卫：仅当签名仍指向本条时才删（同签名可能已被新条目接管）。
-            if let Some(Value::String(mapped)) = self.memories.get(&skey).await?
-                && mapped == id
-            {
-                self.memories.delete(&skey).await?;
-            }
-        }
-        self.memories.delete(&namespace.storage_key(id)).await?;
-        self.embeddings.delete(&namespace.storage_key(id)).await?;
+            Some(skey)
+        } else {
+            None
+        };
+        // 先撤销派生索引，再删除两份 Source Of Truth。任一步失败时内容行
+        // 仍保留，调用方可用同一 id 重试；不能先删 memories，否则最后的
+        // vector.remove 失败会让清理任务永久失去定位该向量的 metadata。
         match self.vector.remove(namespace, id).await {
-            Ok(()) | Err(MemoryError::NotFound(_)) => Ok(()),
-            Err(e) => Err(e),
+            // namespace 未创建通常意味着当前 profile 不匹配或索引尚未装配；
+            // 不存在驻留索引可移除时仍必须删除 memories/embeddings，不能让
+            // 强制删除被派生索引状态阻断。
+            Ok(()) | Err(MemoryError::NotFound(_)) | Err(MemoryError::NamespaceNotFound(_)) => {}
+            Err(e) => return Err(e),
+        };
+        self.embeddings.delete(&namespace.storage_key(id)).await?;
+        if let Some(skey) = signature_key
+            && let Some(Value::String(mapped)) = self.memories.get(&skey).await?
+            && mapped == id
+        {
+            self.memories.delete(&skey).await?;
         }
+        self.memories.delete(&namespace.storage_key(id)).await
     }
 
     /// 清空整个 namespace：memories 行、签名映射、embeddings 与索引实例

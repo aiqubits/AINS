@@ -1210,6 +1210,44 @@ async fn startup_event_transitions_to_idle() {
 }
 
 #[tokio::test]
+async fn clear_conversation_discards_prior_context_before_the_next_prompt() {
+    // The UI queues ClearConversation between turns.  The following prompt
+    // must start a fresh model request rather than inherit the old user /
+    // assistant history retained in the live kernel.
+    let model = Arc::new(ScriptedModelClient::new(vec![
+        ScriptedModelClient::text_turn("old reply", usage()),
+        ScriptedModelClient::text_turn("fresh reply", usage()),
+    ]));
+    let (kernel, _events) = run_kernel(
+        Arc::clone(&model),
+        vec![Box::new(EchoTool)],
+        test_config(),
+        vec![
+            user_message("old conversation"),
+            AgentEvent::ClearConversation,
+            user_message("fresh conversation"),
+        ],
+    )
+    .await;
+
+    let requests = model.recorded_requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].messages.len(), 1);
+    assert_eq!(requests[1].messages.len(), 1);
+    assert_eq!(
+        requests[1].messages[0],
+        ConversationMessage::from_user_text("fresh conversation")
+    );
+
+    // Only the new turn remains in the live context after the channel closes.
+    assert_eq!(kernel.context().conversation.len(), 2);
+    assert_eq!(
+        kernel.context().conversation[0],
+        ConversationMessage::from_user_text("fresh conversation")
+    );
+}
+
+#[tokio::test]
 async fn lifecycle_hooks_fire_for_start_prompt_stop_and_end() {
     let mut registry = HookRegistry::new();
     for event in [
@@ -1755,7 +1793,7 @@ async fn snapshot_with_dangling_tool_use_roundtrips_and_next_query_succeeds() {
 
     // 崩溃现场端到端：宿主在 AssistantTurnComplete 时持久化快照，
     // 此时工具尚未完成 → 快照含未配对 tool_use。重启后
-    // load_latest 必须给出已 sanitize 的历史，种子进 Kernel 后
+    // load_current 必须给出已 sanitize 的历史，种子进 Kernel 后
     // 续问仍能正常完成（此前仅有 save/load 与 kernel 各自的分段覆盖）。
     let dir = tempfile::tempdir().unwrap();
     let kv: Arc<dyn KvStore> = Arc::new(
@@ -1790,7 +1828,7 @@ async fn snapshot_with_dangling_tool_use_roundtrips_and_next_query_succeeds() {
         .unwrap();
 
     // 回载：悬空 tool_use 整轮剪除，仅剩 user 消息
-    let snapshot = store.load_latest("/proj/crash").await.unwrap().unwrap();
+    let snapshot = store.load_current("/proj/crash").await.unwrap().unwrap();
     assert_eq!(snapshot.messages.len(), 1);
     assert_eq!(snapshot.messages[0].role, Role::User);
 

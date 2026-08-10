@@ -73,12 +73,11 @@ async fn perception_file_into_context_then_session_roundtrip() {
         .await
         .unwrap();
 
-    // 4. 回载：内容保留，summary 取首条 user 文本
-    let loaded = store.load_latest("/proj/agent").await.unwrap().unwrap();
+    // 4. 回载唯一当前历史：内容保留
+    let loaded = store.load_current("/proj/agent").await.unwrap().unwrap();
     assert_eq!(loaded.session_id, session_id);
     assert_eq!(loaded.messages.len(), 1);
     assert!(loaded.messages[0].text().contains("state machine"));
-    assert!(loaded.summary.contains("review this design"));
 }
 
 /// 5.5 接线：预载超阈值上下文，提交新输入 → Querying 起始自动压缩 →

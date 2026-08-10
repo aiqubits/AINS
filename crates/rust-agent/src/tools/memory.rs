@@ -14,13 +14,31 @@ use std::sync::RwLock;
 
 use serde_json::Value;
 
-use crate::error::ToolError;
+use crate::error::{MemoryError, ToolError};
+use crate::marker::MaybeSendSync;
 use crate::memory::memdir::{MemoryScope, MemoryType, NewMemoryEntry};
 use crate::memory::service::MemoryService;
 use crate::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult};
 
 /// 单次 memory_read 最多返回条数。
 const MEMORY_READ_MAX_RESULTS: usize = 20;
+
+/// Durable-memory write boundary used by [`MemoryWriteTool`].  Hosts that
+/// share storage across runtimes can wrap this operation in their process- or
+/// origin-wide session lock before delegating to [`MemoryService`].
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+pub trait MemoryWriter: MaybeSendSync {
+    async fn write(&self, record: NewMemoryEntry) -> Result<String, MemoryError>;
+}
+
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+impl MemoryWriter for MemoryService {
+    async fn write(&self, record: NewMemoryEntry) -> Result<String, MemoryError> {
+        self.write_memory(record).await
+    }
+}
 
 fn require_string(input: &Value, field: &str) -> Result<String, ToolError> {
     input
@@ -138,7 +156,7 @@ impl Tool for MemoryReadTool {
 /// 写入一条 durable memory（写工具；Team scope 无 team context 时 fail closed）。
 #[derive(Clone)]
 pub struct MemoryWriteTool {
-    service: Arc<RwLock<Option<Arc<MemoryService>>>>,
+    writer: Arc<RwLock<Option<Arc<dyn MemoryWriter>>>>,
 }
 
 impl MemoryWriteTool {
@@ -146,13 +164,19 @@ impl MemoryWriteTool {
     #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
     pub fn new() -> Self {
         Self {
-            service: Arc::new(RwLock::new(None)),
+            writer: Arc::new(RwLock::new(None)),
         }
     }
 
     /// 会话装配完成后注入 MemoryService（幂等；未注入时执行报错）。
     pub fn attach(&self, service: Arc<MemoryService>) {
-        *self.service.write().unwrap_or_else(|p| p.into_inner()) = Some(service);
+        self.attach_writer(service);
+    }
+
+    /// 注入宿主提供的写入边界。Web 宿主使用它将 `memory_write` 与跨标签页
+    /// 的会话清空操作串行化；Native 可继续使用 [`Self::attach`]。
+    pub fn attach_writer(&self, writer: Arc<dyn MemoryWriter>) {
+        *self.writer.write().unwrap_or_else(|p| p.into_inner()) = Some(writer);
     }
 }
 
@@ -199,7 +223,12 @@ impl Tool for MemoryWriteTool {
         input: Value,
         _ctx: &mut ToolContext<'_>,
     ) -> Result<ToolResult, ToolError> {
-        let service = attached_service(&self.service)?;
+        let writer = self
+            .writer
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or_else(|| ToolError::Execution("memory service unavailable".into()))?;
         let content = require_content(&input)?;
         let title = input
             .get("title")
@@ -248,7 +277,7 @@ impl Tool for MemoryWriteTool {
                 })
                 .unwrap_or_default(),
         };
-        match service.write_memory(record).await {
+        match writer.write(record).await {
             Ok(id) => Ok(ToolResult::ok(format!("saved memory {id}"))),
             Err(e) => Ok(ToolResult::err(format!("memory write failed: {e}"))),
         }
@@ -261,7 +290,12 @@ impl Tool for MemoryWriteTool {
 
 #[cfg(test)]
 mod tests {
-    use super::{require_content, require_query};
+    use std::path::Path;
+    use std::sync::{Arc, Mutex};
+
+    use super::{MemoryWriteTool, MemoryWriter, NewMemoryEntry, require_content, require_query};
+    use crate::error::MemoryError;
+    use crate::tools::{Tool, ToolContext, ToolMetadata};
 
     #[test]
     fn memory_write_reads_documented_content_field() {
@@ -275,5 +309,41 @@ mod tests {
         let input = serde_json::json!({"query": " find fact "});
         assert_eq!(require_query(&input).unwrap(), "find fact");
         assert!(require_content(&input).is_err());
+    }
+
+    struct RecordingWriter(Arc<Mutex<Option<NewMemoryEntry>>>);
+
+    #[async_trait::async_trait]
+    impl MemoryWriter for RecordingWriter {
+        async fn write(&self, record: NewMemoryEntry) -> Result<String, MemoryError> {
+            *self.0.lock().unwrap() = Some(record);
+            Ok("serialized-write".into())
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_write_uses_the_attached_writer_boundary() {
+        let captured = Arc::new(Mutex::new(None));
+        let tool = MemoryWriteTool::new();
+        tool.attach_writer(Arc::new(RecordingWriter(Arc::clone(&captured))));
+        let mut metadata = ToolMetadata::default();
+        let mut context = ToolContext {
+            cwd: Path::new("/workspace"),
+            metadata: &mut metadata,
+        };
+
+        let result = tool
+            .execute(
+                serde_json::json!({"content": "remember this", "scope": "private"}),
+                &mut context,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(result.output, "saved memory serialized-write");
+        let record = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(record.body, "remember this");
+        assert_eq!(record.scope, crate::memory::MemoryScope::Private);
     }
 }
