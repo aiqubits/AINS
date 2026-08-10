@@ -8,12 +8,12 @@
 范围：Phase 5.1–5.6（client-api 传输层、ModelClient、提示流水线、会话持久化、
 上下文压缩、集成测试）。
 
-本地验收：`client-api` 与 `agent-core` 双 target build/clippy(-D warnings) 通过；
-Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agent-core lib
+本地验收：`client-api` 与 `rust-agent` 双 target build/clippy(-D warnings) 通过；
+Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；rust-agent lib
 （model_service、context::{prompt_pipeline,session,compact}、perception）+
 集成（`tests/model_service.rs`、`tests/context_pipeline.rs`，Phase 4∥5 汇合）。
-具体用例数随评审回归测试演进，以 `cargo test -p agent-core -p client-api`
-为准。Web 端 `client-api`/`agent-core` 随既有 wasm 套件走 CI wasm-pack
+具体用例数随评审回归测试演进，以 `cargo test -p rust-agent -p client-api`
+为准。Web 端 `client-api`/`rust-agent` 随既有 wasm 套件走 CI wasm-pack
 浏览器测试。
 
 ## 1. client-api 统一传输层（5.1，`app/client-api/src/ai.rs`）
@@ -28,7 +28,7 @@ Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agen
 | 重试 | 既有 `send_and_parse` 网络/5xx/429 指数退避（500ms/1s/2s） | 非流式复用 `send_and_parse`；流式仅在**建连阶段**按 `max_retries` 退避重试，流建立后不在传输层重试（重试语义上收 ModelClient，见 5.2） | 对齐（分层） |
 | 跨端 | reqwest 双 target；wasm 无 tokio | 新增 `stream` feature（双 target）+ `futures`/`bytes`/`base64`；`AiEventStream` cfg 收敛 Box/LocalBox；`sleep_ms` 复用既有跨端定时器 | 对齐 |
 
-## 2. ModelClient 实现（5.2，`agent-core/src/model_service.rs`）
+## 2. ModelClient 实现（5.2，`rust-agent/src/model_service.rs`）
 
 | 能力点 | 基线 `api/client.py` | AINS `GatewayModelClient` | 结论 |
 |---|---|---|---|
@@ -40,7 +40,7 @@ Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agen
 | 工具下发 | 基线走 provider function tools | **偏差（有意）**：服务端 AI 端点拒绝 function tools，故采用**提示词内 `<tool_use>` 标签协议**：工具清单 + 协议说明注入 system prompt，从 assistant 全文解析回 `ToolUse` block（非法块 fail-open 保留为文本）；历史 `ToolUse`/`ToolResult` 回渲染为 `<tool_use>`/`<tool_result>` 文本；`ToolTagFilter` 状态机过滤 UI delta，抑制跨分片协议片段外漏 | 偏差（协议桥接） |
 | 直连能力 | — | `embed`/`stt`/`tts` 复用 client-api；`stt` 按魔数嗅探音频格式（RIFF/fLaC/OggS/ID3/ftyp/EBML→wav/flac/ogg/mp3/mp4/webm，回退 wav） | AINS 扩展 |
 
-## 3. 分段系统提示流水线（5.3，`agent-core/src/context/{prompt_pipeline,environment,project_docs}.rs`）
+## 3. 分段系统提示流水线（5.3，`rust-agent/src/context/{prompt_pipeline,environment,project_docs}.rs`）
 
 | 能力点 | 基线 `prompts/` | AINS | 结论 |
 |---|---|---|---|
@@ -54,7 +54,7 @@ Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agen
 | 记忆段 | `load_memory_prompt` | 由调用方从 `MemdirStore::load_memory_prompt` 取字符串传入（保持流水线为同步纯函数） | 对齐（解耦） |
 | 各段开关 | coordinator/system_prompt/memory 等开关 | `PromptSections` 六 bool + `custom_base`（替换内置 base） | 对齐 |
 
-## 4. 会话持久化（5.4，`agent-core/src/context/session.rs`）
+## 4. 会话持久化（5.4，`rust-agent/src/context/session.rs`）
 
 | 能力点 | 基线 `session_storage.py` | AINS `SessionStore` | 结论 |
 |---|---|---|---|
@@ -66,7 +66,7 @@ Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agen
 | 恢复/列表 | latest / by-id(回退 latest) / list(mtime 降序 limit 20) | `load_latest`/`load_by_id`(命名条目→回退 latest，id 匹配或字面 "latest")/`list`(created_at 降序 `DEFAULT_LIST_LIMIT=20`，损坏条目逐条跳过) | 对齐（损坏条目跳过见 §8 Code Review 修正 CR-3） |
 | summary | 首条 user 文本前 80 字符 | `extract_summary` 同语义（`SUMMARY_MAX_CHARS=80`） | 对齐 |
 
-## 5. 上下文压缩四级降级链（5.5，`agent-core/src/context/compact.rs`）
+## 5. 上下文压缩四级降级链（5.5，`rust-agent/src/context/compact.rs`）
 
 | 能力点 | 基线 `services/compact/` | AINS | 结论 |
 |---|---|---|---|
@@ -82,7 +82,7 @@ Native 测试全过——client-api 单元/集成（`tests/ai_test.rs`）；agen
 | CompactProgress | 九阶段 phase | `ProgressFn`(Native `+Send`) 收集 phase，Kernel 转 `StreamEvent::CompactProgress`；phase 取 context_collapse/session_memory/compact_start/end/retry/failed | 对齐 |
 | 压缩后历史 | boundary+summary+keep+attachments | `build_compact_summary_message`（续接说明 + 格式化摘要 + suppress_follow_up）+ 保留近段，最终 sanitize | 对齐（简化：不含 8 类 attachment 构建，随会话 metadata 后置） |
 
-## 6. Kernel 接线与集成（5.6，`agent-core/src/kernel/event_loop.rs`）
+## 6. Kernel 接线与集成（5.6，`rust-agent/src/kernel/event_loop.rs`）
 
 - Querying 起始 `should_autocompact` 达阈值则内联 `run_compaction(Auto, force=false)`（PreCompact hook→四级链→CompactProgress→PostCompact hook），压缩后同轮续建请求（turn 不变）。
 - `Compacting` 状态桩替换为真实压缩（manual 强制），完成回 `Querying{turn:0}`；FSM `Compacting→Querying` 收敛为主出边。

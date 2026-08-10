@@ -8,7 +8,7 @@ dioxus = { workspace = true, features = ["router"] }
 ui = { workspace = true }
 i18n = { workspace = true }
 # Agent Runtime 嵌入（Phase 6.2，Native）
-agent-core = { workspace = true }
+rust-agent = { workspace = true }
 client-api = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }

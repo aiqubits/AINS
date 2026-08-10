@@ -3,8 +3,8 @@ use dioxus_icons::lucide::NotebookPen;
 
 use crate::{Badge, BadgeVariant, EN, I18nContext, Modal};
 
-/// 权限模式（视图模型，与 agent-core `PermissionMode` 三态一一对应，
-/// 宿主负责双向映射；ui 层不依赖 agent-core）。
+/// 权限模式（视图模型，与 rust-agent `PermissionMode` 三态一一对应，
+/// 宿主负责双向映射；ui 层不依赖 rust-agent）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionModeView {
     #[default]

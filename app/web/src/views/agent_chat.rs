@@ -9,12 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use dioxus::prelude::*;
 use futures::{SinkExt, StreamExt};
 
-use agent_core::kernel::{AgentEvent, StreamEvent};
-use agent_core::memory::SessionCheckpoint;
-use agent_core::model_client::UsageSnapshot;
-use agent_core::policy::{PermissionEngine, PermissionMode};
-use agent_core::tools::ToolMetadata;
 use client_api::Client;
+use rust_agent::kernel::{AgentEvent, StreamEvent};
+use rust_agent::memory::SessionCheckpoint;
+use rust_agent::model_client::UsageSnapshot;
+use rust_agent::policy::{PermissionEngine, PermissionMode};
+use rust_agent::tools::ToolMetadata;
 use ui::{
     AgentStatus, AgentStatusView, ChatInput, ChatView, ChatViewState, I18nContext, Modal,
     NoticeItem, NoticeKind, NoticeToast, PERSIST_ERROR, PermissionChoice, PermissionDialog,
@@ -277,7 +277,7 @@ pub fn AgentChat() -> Element {
                                         if let Err(e) = service::extract_durable_serialized(
                                             extract,
                                             snapshot,
-                                            agent_core::memory::ExtractionReason::Compaction,
+                                            rust_agent::memory::ExtractionReason::Compaction,
                                         )
                                         .await
                                         {
@@ -360,7 +360,7 @@ pub fn AgentChat() -> Element {
                                     if let Err(e) = service::extract_durable_serialized(
                                         extract,
                                         snapshot,
-                                        agent_core::memory::ExtractionReason::FinalTurn,
+                                        rust_agent::memory::ExtractionReason::FinalTurn,
                                     )
                                     .await
                                     {
@@ -457,7 +457,7 @@ pub fn AgentChat() -> Element {
             spawn(async move {
                 match service::open_skill_store().await {
                     Ok(store) => {
-                        match agent_core::skills::SkillLoader::load(&*store, &name).await {
+                        match rust_agent::skills::SkillLoader::load(&*store, &name).await {
                             Ok(content) => {
                                 let prompt = view_model::skill_prompt(&name, &content.body);
                                 view_model::push_user(&mut chat.write(), &format!("/skill {name}"));

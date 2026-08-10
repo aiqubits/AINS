@@ -135,7 +135,7 @@ translate! {
     users_email_empty: "Email cannot be empty" => "邮箱不能为空",
     users_password_empty: "Password cannot be empty" => "密码不能为空",
     users_modal_create_title: "Create New User" => "创建新用户",
-    users_modal_edit_title: "Edit User" => "编辑用户节点",
+    users_modal_edit_title: "Edit User" => "编辑用户",
     users_modal_create_submit: "Create" => "创建实体",
     users_modal_edit_submit: "Save" => "保存实体",
     users_form_name_label: "Username" => "账户名",

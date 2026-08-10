@@ -10,21 +10,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::context::compact::estimate_message_tokens;
-use agent_core::context::prompt_pipeline::{
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::context::compact::estimate_message_tokens;
+use rust_agent::context::prompt_pipeline::{
     PromptPipelineInput, PromptSections, build_system_prompt,
 };
-use agent_core::context::{SessionSaveInput, SessionStore};
-use agent_core::kernel::context::ContextStore;
-use agent_core::kernel::{
+use rust_agent::context::{SessionSaveInput, SessionStore};
+use rust_agent::kernel::context::ContextStore;
+use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, ConversationMessage, Role, ScriptedModelClient,
     StreamEvent, SystemEventType,
 };
-use agent_core::memory::{KvStore, RedbKvStore};
-use agent_core::model_client::UsageSnapshot;
-use agent_core::perception::FileChannel;
-use agent_core::policy::PermissionMode;
+use rust_agent::memory::{KvStore, RedbKvStore};
+use rust_agent::model_client::UsageSnapshot;
+use rust_agent::perception::FileChannel;
+use rust_agent::policy::PermissionMode;
 use tempfile::TempDir;
 
 fn kv() -> (Arc<dyn KvStore>, TempDir) {
@@ -108,7 +108,7 @@ async fn kernel_auto_compacts_then_answers() {
         };
         history.push(ConversationMessage {
             role,
-            content: vec![agent_core::kernel::ContentBlock::Text {
+            content: vec![rust_agent::kernel::ContentBlock::Text {
                 text: format!("turn {i}: {filler}"),
             }],
         });
@@ -225,7 +225,7 @@ async fn kernel_auto_compact_does_not_reset_turn_budget() {
         };
         history.push(ConversationMessage {
             role,
-            content: vec![agent_core::kernel::ContentBlock::Text {
+            content: vec![rust_agent::kernel::ContentBlock::Text {
                 text: format!("turn {i}: {filler}"),
             }],
         });

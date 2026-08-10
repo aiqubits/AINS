@@ -52,19 +52,20 @@ fn check_balance_rbac(
     actor_role: &str,
     actor_tenant_id: &str,
 ) -> Result<(), UserError> {
-    // Protect system accounts — no one can modify a system user's balance
+    // System super-admin can modify any user's balance, including a system
+    // account. Profile and role changes remain protected by `update_user`.
+    if actor_role == "system" {
+        return Ok(());
+    }
+
+    // Non-system actors cannot modify a system user's balance.
     if target.role == "system" {
         tracing::warn!(
             target_user_id = %target.id,
-            "Attempt to modify system account balance — returning NotFound"
+            actor_role = %actor_role,
+            "Non-system actor attempted to modify system account balance — returning NotFound"
         );
         return Err(UserError::NotFound);
-    }
-
-    // System super-admin can modify any non-system user's balance
-    // (including cross-tenant and across all roles).
-    if actor_role == "system" {
-        return Ok(());
     }
 
     // Admin scope: can only modify users within their own tenant

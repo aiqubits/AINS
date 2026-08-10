@@ -12,11 +12,11 @@ use serde_json::json;
 use wiremock::matchers::{body_partial_json, body_string_contains, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
-use agent_core::model_service::GatewayModelClient;
 use client_api::{Client, ClientConfig};
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
+use rust_agent::model_service::GatewayModelClient;
 
 fn gateway_client(mock_uri: &str) -> GatewayModelClient<TokioRuntimeAdapter> {
     let config = ClientConfig::new(mock_uri)
@@ -139,7 +139,7 @@ async fn test_stream_response_parses_tool_use_and_filters_ui_deltas() {
         &client,
         ModelRequest {
             messages: vec![ConversationMessage::from_user_text("1+1=?")],
-            tools: vec![agent_core::tools::ToolDef {
+            tools: vec![rust_agent::tools::ToolDef {
                 name: "calculator".into(),
                 description: "calc".into(),
                 input_schema: json!({"type": "object"}),
@@ -343,7 +343,7 @@ async fn test_request_carries_system_prompt_and_tool_protocol() {
             model: Some("gpt-test".into()),
             system_prompt: Some("base prompt".into()),
             messages: vec![ConversationMessage::from_user_text("hi")],
-            tools: vec![agent_core::tools::ToolDef {
+            tools: vec![rust_agent::tools::ToolDef {
                 name: "calculator".into(),
                 description: "calc".into(),
                 input_schema: json!({"type": "object"}),

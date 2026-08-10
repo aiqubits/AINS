@@ -17,19 +17,19 @@ use std::{
 
 use serde_json::{Value, json};
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::error::ToolError;
-use agent_core::hooks::{
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::error::ToolError;
+use rust_agent::hooks::{
     HookDefinition, HookEvent, HookExecutor, HookRegistry, PromptHookDefinition,
 };
-use agent_core::kernel::{
+use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AgentState, ContentBlock, ConversationMessage,
     QUERY_INTERRUPTED_STATUS, Role, ScriptedModelClient, StreamEvent, SystemEventType,
 };
-use agent_core::model_client::{
+use rust_agent::model_client::{
     EventStream, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
 };
-use agent_core::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult, ToolRuntime};
+use rust_agent::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolResult, ToolRuntime};
 
 struct EchoTool;
 
@@ -70,7 +70,7 @@ impl ModelClient for InterruptAfterToolTurnClient {
     async fn stream_response(
         &self,
         _request: ModelRequest,
-    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+    ) -> Result<EventStream<ModelStreamEvent>, rust_agent::error::AgentError> {
         let interrupt = self
             .interrupt
             .lock()
@@ -87,16 +87,16 @@ impl ModelClient for InterruptAfterToolTurnClient {
         }))
     }
 
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 }
 
@@ -105,20 +105,20 @@ impl ModelClient for PendingModelClient {
     async fn stream_response(
         &self,
         _request: ModelRequest,
-    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+    ) -> Result<EventStream<ModelStreamEvent>, rust_agent::error::AgentError> {
         self.started.store(true, Ordering::SeqCst);
         Ok(Box::pin(futures::stream::pending()))
     }
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 }
 
@@ -134,7 +134,7 @@ impl ModelClient for CompleteThenHungClient {
     async fn stream_response(
         &self,
         _request: ModelRequest,
-    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+    ) -> Result<EventStream<ModelStreamEvent>, rust_agent::error::AgentError> {
         let complete = ModelStreamEvent::Complete {
             message: self.message.clone(),
             usage: usage(),
@@ -146,16 +146,16 @@ impl ModelClient for CompleteThenHungClient {
         ))
     }
 
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 
-    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
-        Err(agent_core::error::AgentError::Model("not scripted".into()))
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, rust_agent::error::AgentError> {
+        Err(rust_agent::error::AgentError::Model("not scripted".into()))
     }
 }
 
@@ -619,7 +619,7 @@ async fn default_constructor_denies_mutating_tools_without_permission_prompt() {
     ]));
     let (_kernel, events) = run_kernel(
         model,
-        vec![Box::new(agent_core::tools::filesystem::FileWriteTool)],
+        vec![Box::new(rust_agent::tools::filesystem::FileWriteTool)],
         AgentKernelConfig {
             cwd: dir.path().to_path_buf(),
             ..test_config()
@@ -1704,8 +1704,8 @@ async fn continuation_resets_turn_counter_after_prepare_continuation() {
 
 #[tokio::test]
 async fn system_prompt_carries_live_permission_mode_section() {
-    use agent_core::policy::{PermissionEngine, PermissionMode, PermissionSettings};
-    use agent_core::tools::interact::EnterPlanModeTool;
+    use rust_agent::policy::{PermissionEngine, PermissionMode, PermissionSettings};
+    use rust_agent::tools::interact::EnterPlanModeTool;
 
     // 引擎 Default 起步；模型第一轮调用 enter_plan_mode（只读、免确认）
     let engine = PermissionEngine::new(PermissionMode::Default, PermissionSettings::default());
@@ -1750,8 +1750,8 @@ async fn system_prompt_carries_live_permission_mode_section() {
 
 #[tokio::test]
 async fn snapshot_with_dangling_tool_use_roundtrips_and_next_query_succeeds() {
-    use agent_core::context::{SessionSaveInput, SessionStore};
-    use agent_core::memory::{KvStore, RedbBackend, TABLE_KV};
+    use rust_agent::context::{SessionSaveInput, SessionStore};
+    use rust_agent::memory::{KvStore, RedbBackend, TABLE_KV};
 
     // 崩溃现场端到端：宿主在 AssistantTurnComplete 时持久化快照，
     // 此时工具尚未完成 → 快照含未配对 tool_use。重启后

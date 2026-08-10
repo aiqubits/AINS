@@ -662,7 +662,7 @@ impl McpClientManager {
                     json!({
                         "protocolVersion": MCP_PROTOCOL_VERSION,
                         "capabilities": {},
-                        "clientInfo": {"name": "ains-agent-core", "version": env!("CARGO_PKG_VERSION")}
+                        "clientInfo": {"name": "ains-rust-agent", "version": env!("CARGO_PKG_VERSION")}
                     }),
                 )
                 .await?;

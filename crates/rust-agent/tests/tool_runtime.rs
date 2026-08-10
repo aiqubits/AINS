@@ -15,24 +15,24 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::error::ToolError;
-use agent_core::hooks::{
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::error::ToolError;
+use rust_agent::hooks::{
     CommandHookDefinition, HookDefinition, HookEvent, HookExecutor, HookRegistry,
 };
-use agent_core::kernel::{
+use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, ScriptedModelClient, StreamEvent,
 };
-use agent_core::model_client::UsageSnapshot;
-use agent_core::policy::{
+use rust_agent::model_client::UsageSnapshot;
+use rust_agent::policy::{
     NoopSandbox, PermissionEngine, PermissionMode, PermissionPrompt, PermissionReply,
     PermissionRequest, PermissionSettings, Sandbox, SandboxCapabilities, SandboxError,
     ShellOutcome, ShellRequest,
 };
-use agent_core::tools::mcp::{McpClientManager, McpServerConfig, register_mcp_tools};
-use agent_core::tools::outputs::FsArtifactSink;
-use agent_core::tools::system::{ClipboardTool, ScreenshotTool, ShellCommandTool};
-use agent_core::tools::{
+use rust_agent::tools::mcp::{McpClientManager, McpServerConfig, register_mcp_tools};
+use rust_agent::tools::outputs::FsArtifactSink;
+use rust_agent::tools::system::{ClipboardTool, ScreenshotTool, ShellCommandTool};
+use rust_agent::tools::{
     Tool, ToolCategory, ToolContext, ToolDef, ToolMetadata, ToolResult, ToolRuntime,
 };
 
@@ -283,7 +283,7 @@ async fn default_mode_confirmation_flow_allow_deny_always_allow() {
         cwd: dir.path(),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_1".into(),
         name: "write_marker".into(),
         input: json!({"path": "denied.txt"}),
@@ -335,7 +335,7 @@ async fn permission_prompt_receives_operation_context() {
     let input = json!({"path": "nested/marker.txt", "content": "visible to UI"});
     let result = runtime
         .dispatch(
-            &agent_core::kernel::ToolUse {
+            &rust_agent::kernel::ToolUse {
                 id: "tu_context".into(),
                 name: "write_marker".into(),
                 input: input.clone(),
@@ -370,12 +370,12 @@ async fn privacy_sensitive_reads_require_confirmation() {
     };
 
     for tool_use in [
-        agent_core::kernel::ToolUse {
+        rust_agent::kernel::ToolUse {
             id: "tu_clipboard".into(),
             name: "clipboard".into(),
             input: json!({"action": "read"}),
         },
-        agent_core::kernel::ToolUse {
+        rust_agent::kernel::ToolUse {
             id: "tu_screenshot".into(),
             name: "screenshot".into(),
             input: json!({}),
@@ -390,7 +390,7 @@ async fn privacy_sensitive_reads_require_confirmation() {
 
 #[tokio::test]
 async fn exit_plan_mode_uses_confirmation_and_restores_default_mode() {
-    use agent_core::tools::interact::ExitPlanModeTool;
+    use rust_agent::tools::interact::ExitPlanModeTool;
 
     let engine = PermissionEngine::new(PermissionMode::Plan, PermissionSettings::default());
     let prompt = Arc::new(CountingPrompt {
@@ -406,7 +406,7 @@ async fn exit_plan_mode_uses_confirmation_and_restores_default_mode() {
     };
     let result = runtime
         .dispatch(
-            &agent_core::kernel::ToolUse {
+            &rust_agent::kernel::ToolUse {
                 id: "tu_exit_plan".into(),
                 name: "exit_plan_mode".into(),
                 input: Value::Null,
@@ -429,7 +429,7 @@ async fn sensitive_path_blacklist_denies_even_in_full_auto() {
         cwd: Path::new("/home/user"),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_1".into(),
         name: "write_marker".into(),
         input: json!({"path": "/home/user/.aws/credentials"}),
@@ -514,7 +514,7 @@ async fn non_matching_hook_does_not_block() {
         cwd: dir.path(),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_1".into(),
         name: "write_marker".into(),
         input: json!({"path": "ok.txt"}),
@@ -551,7 +551,7 @@ async fn blocked_hook_output_still_uses_tool_output_budget() {
     };
     let result = runtime
         .dispatch(
-            &agent_core::kernel::ToolUse {
+            &rust_agent::kernel::ToolUse {
                 id: "tu_budget".into(),
                 name: "write_marker".into(),
                 input: json!({"path": "blocked.txt"}),
@@ -577,7 +577,7 @@ async fn oversized_tool_output_offloads_to_artifact_sink() {
         cwd: dir.path(),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_big".into(),
         name: "big_output".into(),
         input: Value::Null,
@@ -612,7 +612,7 @@ async fn shell_command_via_noop_sandbox_is_refused_end_to_end() {
         cwd: dir.path(),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_sh".into(),
         name: "shell_command".into(),
         input: json!({"command": "touch should-not-exist.txt"}),
@@ -651,7 +651,7 @@ async fn mcp_stdio_server_connects_and_bridges_tool() {
         assert_eq!(statuses.len(), 1);
         assert_eq!(
             statuses[0].state,
-            agent_core::tools::mcp::McpConnectionState::Connected,
+            rust_agent::tools::mcp::McpConnectionState::Connected,
             "detail: {}",
             statuses[0].detail
         );
@@ -670,7 +670,7 @@ async fn mcp_stdio_server_connects_and_bridges_tool() {
         cwd: Path::new("/tmp"),
         metadata: &mut metadata,
     };
-    let tool_use = agent_core::kernel::ToolUse {
+    let tool_use = rust_agent::kernel::ToolUse {
         id: "tu_mcp".into(),
         name: "mcp__fake__ping".into(),
         input: json!({}),
@@ -691,19 +691,19 @@ async fn dispatch_many_serializes_same_file_write_aliases() {
     std::fs::write(dir.path().join("doc.txt"), "alpha beta\n").unwrap();
     let engine = PermissionEngine::new(PermissionMode::FullAuto, PermissionSettings::default());
     let mut runtime = ToolRuntime::new().with_permissions(engine, None);
-    agent_core::tools::filesystem::register_filesystem_tools(&mut runtime);
+    rust_agent::tools::filesystem::register_filesystem_tools(&mut runtime);
 
     let absolute_alias = dir.path().join("sub/../doc.txt");
     let mut metadata = ToolMetadata::new();
     let results = runtime
         .dispatch_many(
             &[
-                agent_core::kernel::ToolUse {
+                rust_agent::kernel::ToolUse {
                     id: "tu_edit_1".into(),
                     name: "edit_file".into(),
                     input: json!({"path": "doc.txt", "old_str": "alpha", "new_str": "ALPHA"}),
                 },
-                agent_core::kernel::ToolUse {
+                rust_agent::kernel::ToolUse {
                     id: "tu_edit_2".into(),
                     name: "edit_file".into(),
                     input: json!({
@@ -739,11 +739,11 @@ async fn dispatch_many_mixed_batch_isolates_failure_and_merges_metadata() {
     std::fs::write(dir.path().join("read2.txt"), "r2\n").unwrap();
     let engine = PermissionEngine::new(PermissionMode::FullAuto, PermissionSettings::default());
     let mut runtime = ToolRuntime::new().with_permissions(engine, None);
-    agent_core::tools::filesystem::register_filesystem_tools(&mut runtime);
-    agent_core::tools::compute::register_compute_tools(&mut runtime);
+    rust_agent::tools::filesystem::register_filesystem_tools(&mut runtime);
+    rust_agent::tools::compute::register_compute_tools(&mut runtime);
 
     let absolute_alias = dir.path().join("sub/../doc.txt");
-    let make = |id: &str, name: &str, input: Value| agent_core::kernel::ToolUse {
+    let make = |id: &str, name: &str, input: Value| rust_agent::kernel::ToolUse {
         id: id.into(),
         name: name.into(),
         input,
@@ -817,19 +817,19 @@ async fn dispatch_many_mixed_batch_isolates_failure_and_merges_metadata() {
 async fn builtin_toolset_registration_smoke() {
     let engine = PermissionEngine::new(PermissionMode::Default, PermissionSettings::default());
     let mut runtime = ToolRuntime::new().with_permissions(engine.clone(), None);
-    agent_core::tools::compute::register_compute_tools(&mut runtime);
-    agent_core::tools::filesystem::register_filesystem_tools(&mut runtime);
-    agent_core::tools::system::register_system_tools(&mut runtime, Arc::new(NoopSandbox), None);
-    runtime.register(Box::new(agent_core::tools::network::WebFetchTool::default()));
-    runtime.register(Box::new(agent_core::tools::interact::TodoWriteTool));
+    rust_agent::tools::compute::register_compute_tools(&mut runtime);
+    rust_agent::tools::filesystem::register_filesystem_tools(&mut runtime);
+    rust_agent::tools::system::register_system_tools(&mut runtime, Arc::new(NoopSandbox), None);
+    runtime.register(Box::new(rust_agent::tools::network::WebFetchTool::default()));
+    runtime.register(Box::new(rust_agent::tools::interact::TodoWriteTool));
     runtime.register(Box::new(
-        agent_core::tools::interact::AskUserQuestionTool::new(None),
+        rust_agent::tools::interact::AskUserQuestionTool::new(None),
     ));
     runtime.register(Box::new(
-        agent_core::tools::interact::EnterPlanModeTool::new(engine.clone()),
+        rust_agent::tools::interact::EnterPlanModeTool::new(engine.clone()),
     ));
     runtime.register(Box::new(
-        agent_core::tools::interact::ExitPlanModeTool::new(engine),
+        rust_agent::tools::interact::ExitPlanModeTool::new(engine),
     ));
 
     let schemas = runtime.api_schemas();

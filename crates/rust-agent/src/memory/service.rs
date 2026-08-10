@@ -1384,7 +1384,7 @@ impl MemoryService {
 
             let mut indexed = 0usize;
             let mut changed = false;
-            for name in ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md"] {
+            for name in ["AGENTS.md"] {
                 let path = cwd.join(name);
                 let source_key = format!("project_doc_source/{project_key}/{name}");
                 let mut previous_ids = previous_by_name.remove(name).unwrap_or_default();

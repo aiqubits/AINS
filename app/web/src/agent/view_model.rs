@@ -3,7 +3,7 @@
 //! desktop 端经 `#[path]` 引用本文件复用同一实现与测试
 //! （两端行为一致由本文件单测保障，见 AINS_PLAN Phase 6 计划 6.3）。
 
-use agent_core::kernel::{
+use rust_agent::kernel::{
     ContentBlock, ConversationMessage, QUERY_INTERRUPTED_STATUS, Role, StreamEvent, ToolUse,
 };
 use serde_json::Value;
@@ -557,7 +557,7 @@ impl ConversationMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::model_client::UsageSnapshot;
+    use rust_agent::model_client::UsageSnapshot;
     use serde_json::json;
 
     fn assistant_msg(text: &str) -> ConversationMessage {
@@ -771,7 +771,7 @@ mod tests {
             &mut state,
             StreamEvent::CompactProgress {
                 phase: "microcompact".into(),
-                trigger: agent_core::kernel::CompactTrigger::Auto,
+                trigger: rust_agent::kernel::CompactTrigger::Auto,
             },
         );
         assert_eq!(state.items.len(), 2);
@@ -1186,7 +1186,7 @@ mod tests {
 
     #[test]
     fn mirror_appends_tool_result_message_so_sanitize_keeps_tool_turn() {
-        use agent_core::kernel::sanitize_conversation_messages;
+        use rust_agent::kernel::sanitize_conversation_messages;
         let mut mirror = ConversationMirror::new(vec![]);
         mirror.push_user_text("run glob");
         mirror.on_turn_complete(tool_use_msg("t1", "glob"));
@@ -1274,7 +1274,7 @@ mod tests {
     fn mirror_user_text_during_open_tool_window_flushes_interrupted_results() {
         // 回归：中断后用户在工具窗口未关闭时插入消息，快照不得丢失
         // 工具轮（tool_result 必须紧跟 tool_use，否则 sanitize 丢弃整轮）
-        use agent_core::kernel::sanitize_conversation_messages;
+        use rust_agent::kernel::sanitize_conversation_messages;
         let mut mirror = ConversationMirror::new(vec![]);
         mirror.push_user_text("run glob");
         mirror.on_turn_complete(tool_use_msg("t1", "glob"));

@@ -15,7 +15,7 @@
 //! **未在真实 Android/iOS 环境验证**：本适配为 FFI-free 语义层（无平台特定
 //! API，结构等价 `NoopSandbox`，编译由构造保证）；但整体移动 agent 集成
 //! （OS 应用沙箱 + Layer 1 策略在真机的实际行为）尚未验证，且 `app/mobile`
-//! 目前未接入 agent-core（本适配为前瞻基础设施，接入后即生效）。
+//! 目前未接入 rust-agent（本适配为前瞻基础设施，接入后即生效）。
 
 use crate::policy::sandbox::{
     Sandbox, SandboxCapabilities, SandboxError, ShellOutcome, ShellRequest,

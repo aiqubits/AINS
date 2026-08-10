@@ -190,7 +190,7 @@ impl ActiveModelBehavior for ActiveModel {}
 
 | Crate | 位置 | 用途 |
 |-------|------|------|
-| `agent-core` | `crates/agent-core/` | 客户端 Agent Runtime 核心（Native + WASM） |
+| `rust-agent` | `crates/rust-agent/` | 客户端 Agent Runtime 核心（Native + WASM） |
 | `ains-runtime` | `crates/ains-runtime/` | Runtime trait + 共享类型 |
 | `ains-axum` | `crates/ains-axum/` | Axum 运行时适配器 |
 | `ains-salvo` | `crates/ains-salvo/` | Salvo 运行时适配器 |

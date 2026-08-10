@@ -11,16 +11,16 @@ Phase 2 `memory/parser.rs`。
 > Phase 1.6 ContextStore。本阶段与 Phase 5.2–5.5 并行推进（见 AINS_PLAN
 > 第十一章推进规则例外）。
 
-本地验收：`agent-core` 双 target build/clippy(-D warnings) 通过；Native
+本地验收：`rust-agent` 双 target build/clippy(-D warnings) 通过；Native
 `perception` 单测全过（mod / vision / voice / file，具体用例数随评审回归
-测试演进，以 `cargo test -p agent-core perception` 为准），并经
+测试演进，以 `cargo test -p rust-agent perception` 为准），并经
 `tests/context_pipeline.rs` 与 Phase 5.4 汇合验证（感知→ContextStore→会话
 快照往返）。
 
 ## 架构分工
 
 平台特定采集（摄像头 / 麦克风 / 截屏 / 拖拽）由各前端（app/web、
-app/desktop）在其平台 API 层完成；`agent-core::perception` 只接收**已采集的
+app/desktop）在其平台 API 层完成；`rust-agent::perception` 只接收**已采集的
 原始字节**，保持核心纯粹、双端可测。感知结果统一为 `PerceptionOutcome`
 （text + image 附件 + 来源说明），经 `into_agent_event` 转 `AgentEvent::
 UserMessage`，由既有 `ContextStore::build` 落入上下文（图像附件→Image block、
@@ -62,7 +62,7 @@ UserMessage`，由既有 `ContextStore::build` 落入上下文（图像附件→
 
 ## 5. 有意偏差与后置项
 
-- 平台采集（摄像头 / 麦克风 / 截屏）不在 `agent-core` 内实现，由前端平台层
+- 平台采集（摄像头 / 麦克风 / 截屏）不在 `rust-agent` 内实现，由前端平台层
   提供原始字节（架构分工；保持核心双端可测）。
 - Web 端 PDF 解析不可用（`extract_pdf_text` 仅 Native），拖拽 PDF 在 Web 报错
   （对齐 Phase 2 memory 层双端分工）。

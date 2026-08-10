@@ -8,11 +8,11 @@ use std::time::Duration;
 use serde_json::json;
 use wasm_bindgen_test::*;
 
-use agent_core::WasmRuntimeAdapter;
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::model_client::ModelRequest;
-use agent_core::platform::Platform;
-use agent_core::runtime_adapter::RuntimeAdapter;
+use rust_agent::WasmRuntimeAdapter;
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::model_client::ModelRequest;
+use rust_agent::platform::Platform;
+use rust_agent::runtime_adapter::RuntimeAdapter;
 
 wasm_bindgen_test_configure!(run_in_browser);
 

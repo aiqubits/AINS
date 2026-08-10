@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use crate::{EN, I18nContext};
 
-/// Agent 运行状态（视图模型，宿主从流事件派生；ui 不依赖 agent-core）。
+/// Agent 运行状态（视图模型，宿主从流事件派生；ui 不依赖 rust-agent）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentStatusView {
     #[default]

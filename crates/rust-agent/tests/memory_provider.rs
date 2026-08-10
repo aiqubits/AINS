@@ -13,16 +13,16 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::context::prompt_pipeline::permission_mode_section;
-use agent_core::kernel::messages::{ContentBlock, Role};
-use agent_core::kernel::mock_model::ScriptedModelClient;
-use agent_core::kernel::{
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::context::prompt_pipeline::permission_mode_section;
+use rust_agent::kernel::messages::{ContentBlock, Role};
+use rust_agent::kernel::mock_model::ScriptedModelClient;
+use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AsyncSystemPromptProvider, ConversationMessage,
     StreamEvent,
 };
-use agent_core::model_client::{ModelStreamEvent, UsageSnapshot};
-use agent_core::policy::PermissionMode;
+use rust_agent::model_client::{ModelStreamEvent, UsageSnapshot};
+use rust_agent::policy::PermissionMode;
 
 fn assistant_turn(text: &str) -> Vec<ModelStreamEvent> {
     let message = ConversationMessage {
@@ -48,7 +48,7 @@ impl AsyncSystemPromptProvider for StaticProvider {
 async fn run_query(
     model: Arc<ScriptedModelClient>,
     provider: Option<Arc<dyn AsyncSystemPromptProvider>>,
-) -> agent_core::model_client::ModelRequest {
+) -> rust_agent::model_client::ModelRequest {
     let config = AgentKernelConfig {
         system_prompt: Some("BASE-SYSTEM-PROMPT".to_string()),
         memory_provider: provider,
@@ -56,7 +56,7 @@ async fn run_query(
         ..AgentKernelConfig::default()
     };
     let (mut kernel, mut event_tx, mut stream_rx) = AgentKernel::<TokioRuntimeAdapter>::new(
-        Arc::clone(&model) as Arc<dyn agent_core::model_client::ModelClient>,
+        Arc::clone(&model) as Arc<dyn rust_agent::model_client::ModelClient>,
         vec![],
         config,
     );

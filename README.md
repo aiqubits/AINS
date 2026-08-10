@@ -34,7 +34,7 @@
 
 AINS 是一个面向企业级场景需求的 AI 原生系统框架，由 **客户端 Agent Runtime**、**服务端 AI 网关与业务后台**、**全端 UI** 三大部分组成：
 
-- **客户端**：`crates/agent-core` 是 **Rust Native + WASM 双执行环境的 Embedded Agent Runtime**——以库的形式嵌入 Dioxus 应用，单进程运行，不依赖任何系统级服务（无 Server Middleware、无 Daemon）。
+- **客户端**：`crates/rust-agent` 是 **Rust Native + WASM 双执行环境的 Embedded Agent Runtime**——以库的形式嵌入 Dioxus 应用，单进程运行，不依赖任何系统级服务（无 Server Middleware、无 Daemon）。
 - **服务端**：`server/` 提供 AI 能力代理（Chat / Vision / Web Search / Embedding / STT / TTS）、身份认证、租户计费与后台管理，**不修改用户会话与记忆**。
 - **全端**：基于 Dioxus 的 Web（WASM）/ Desktop / Mobile 三端应用与共享 UI 组件库、类型化客户端 SDK。
 
@@ -42,7 +42,7 @@ AINS 是一个面向企业级场景需求的 AI 原生系统框架，由 **客�
 
 ## 核心特性
 
-### 🤖 客户端 Agent Runtime（`crates/agent-core`）
+### 🤖 客户端 Agent Runtime（`crates/rust-agent`）
 
 | 能力域 | 特性 |
 |--------|------|
@@ -98,7 +98,7 @@ AINS 是一个面向企业级场景需求的 AI 原生系统框架，由 **客�
 │  ├─ app/ui        共享组件库 (chat / 权限弹窗 / skills / memory) │
 │  └─ app/client-api 类型化 SDK (chat/embed/stt/tts)             │
 ├─────────────────────────────────────────────────────────────────┤
-│  客户端 Agent Runtime — crates/agent-core (Native + WASM)        │
+│  客户端 Agent Runtime — crates/rust-agent (Native + WASM)        │
 │  ├─ Agent Kernel (FSM)      ├─ Memory (KV/Vector/Document)      │
 │  ├─ Tool Runtime (本地+MCP) ├─ Skills System                    │
 │  ├─ Permission Engine 三态  ├─ Platform Sandbox (4 平台)         │
@@ -136,7 +136,7 @@ ains/
 │   ├── services/               #   业务服务 (gateway/metering/quota/dispatch...)
 │   └── utils/                  #   配置 / JWT / 密码 / Snowflake / AutoRouter
 ├── crates/                     # 可复用 crate 生态
-│   ├── agent-core/             #   客户端 Agent Runtime 核心 (Native + WASM)
+│   ├── rust-agent/             #   客户端 Agent Runtime 核心 (Native + WASM)
 │   ├── ains-runtime/           #   Web 框架运行时抽象 (Runtime trait)
 │   ├── ains-axum/  ains-salvo/ #   Axum / Salvo 适配器
 │   ├── distributed-ratelimit/  #   Redis 分布式限流
@@ -181,7 +181,7 @@ ains/
 cargo build --release
 
 # 双目标验证（native + wasm32，含 WASM 前端依赖）
-cargo build --release --target wasm32-unknown-unknown -p agent-core
+cargo build --release --target wasm32-unknown-unknown -p rust-agent
 ```
 
 ### 运行服务端（Docker Compose 全栈）
@@ -211,7 +211,7 @@ cargo test --workspace        # 全仓测试
 ## 测试与质量
 
 - **双目标 CI**（`.github/workflows/ains.yml`）：native + wasm32 双 target 构建，`clippy -D warnings` 零告警，`cargo audit` 安全审计（依赖漏洞阻断），逐 crate 并行流水线。
-- **1000+ 自动化测试**：agent-core 覆盖 Kernel FSM / 记忆 / 工具 / 权限 / 沙箱 / 压缩等数百项单测与集成测试；WASM 端浏览器契约测试（`wasm-pack` + headless Chrome，覆盖 IndexedDB / 记忆 / 工具 / Skills）。
+- **1000+ 自动化测试**：rust-agent 覆盖 Kernel FSM / 记忆 / 工具 / 权限 / 沙箱 / 压缩等数百项单测与集成测试；WASM 端浏览器契约测试（`wasm-pack` + headless Chrome，覆盖 IndexedDB / 记忆 / 工具 / Skills）。
 - **双框架集成测试**：Axum 与 Salvo 两套集成测试并行验证（认证 / 限流 / 读写分离熔断 / 计费 / 网关 / 微信回调）。
 - **多轮安全回归**：Phase 3 工具系统经 14 轮 code review 修复（SSRF 封堵、路径旁路、敏感信息掩码、资源预算上限等），遵循 **fail-closed 默认拒绝** 原则。
 

@@ -5,8 +5,8 @@
 （本地数据静态加密 + 网络传输加密加固）。7.1/7.2（P0）见
 `phase7-sandbox-security.md`。
 
-> **验收状态**：agent-core / client-api 双 target（native + wasm32）
-> `clippy -D warnings` 全绿；agent-core 全量 native 测试通过
+> **验收状态**：rust-agent / client-api 双 target（native + wasm32）
+> `clippy -D warnings` 全绿；rust-agent 全量 native 测试通过
 > （lib 320 + core_traits 28 + memory_native 65 + 其余套件），wasm `--tests`
 > 编译通过；desktop crate 编译通过。
 
@@ -172,10 +172,10 @@ value 载荷写入底层前用 **ChaCha20-Poly1305（AEAD）** 加密，读取�
 
 | crate | 位置 | 用途 |
 |---|---|---|
-| `chacha20poly1305` 0.10（`default-features=false, ["alloc"]`） | agent-core | AEAD 加解密 |
-| `argon2` 0.5（`["alloc"]`） | agent-core | 口令 → 密钥派生 |
-| `zeroize` 1 | agent-core | 密钥内存清零 |
-| `getrandom` 0.2（wasm 侧 `["js"]`） | agent-core | nonce / 随机密钥 CSPRNG |
+| `chacha20poly1305` 0.10（`default-features=false, ["alloc"]`） | rust-agent | AEAD 加解密 |
+| `argon2` 0.5（`["alloc"]`） | rust-agent | 口令 → 密钥派生 |
+| `zeroize` 1 | rust-agent | 密钥内存清零 |
+| `getrandom` 0.2（wasm 侧 `["js"]`） | rust-agent | nonce / 随机密钥 CSPRNG |
 | `tracing`（workspace） | client-api | 明文传输安全告警 |
 
 均为纯 Rust、双 target 编译通过（wasm32 依赖 getrandom js 后端）。

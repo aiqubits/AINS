@@ -273,8 +273,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "client-api"
-    # fmt 由 server / agent-core job 的 `cargo fmt --check`（全 workspace）覆盖
-    # （agent-core 无 services 依赖，作为 server job 容器故障时的兜底）
+    # fmt 由 server / rust-agent job 的 `cargo fmt --check`（全 workspace）覆盖
+    # （rust-agent 无 services 依赖，作为 server job 容器故障时的兜底）
     - name: Lint (Clippy)
       run: cargo clippy --package client-api --all-targets -- -D warnings
     - name: Install wasm32 target
@@ -288,33 +288,33 @@ jobs:
       run: cargo test --package client-api --verbose
 
   # ========================================
-  # Agent Core CI (wasm32 + native dual target)
+  # Rust Agent CI (wasm32 + native dual target)
   # ========================================
-  agent-core:
+  rust-agent:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: Swatinem/rust-cache@v2
       with:
-        shared-key: "agent-core"
+        shared-key: "rust-agent"
     # fmt 兜底：server job 的 `cargo fmt --check`（全 workspace）依赖 Postgres/Redis
     # services 启动成功；本 job 无 services 依赖，容器故障时仍能执行格式检查。
     - name: Format Check
       run: cargo fmt --check
     - name: Lint (Clippy, native)
-      run: cargo clippy --package agent-core --all-targets -- -D warnings
+      run: cargo clippy --package rust-agent --all-targets -- -D warnings
     - name: Build & Test (native)
-      run: cargo test --package agent-core --verbose
+      run: cargo test --package rust-agent --verbose
     - name: Install wasm32 target
       run: rustup target add wasm32-unknown-unknown
     - name: Lint (Clippy, wasm32)
-      run: cargo clippy --package agent-core --target wasm32-unknown-unknown --all-targets -- -D warnings
+      run: cargo clippy --package rust-agent --target wasm32-unknown-unknown --all-targets -- -D warnings
     - name: Install wasm-pack
       uses: taiki-e/install-action@wasm-pack
     # IndexedDB 等浏览器环境测试仅在 CI 执行（AINS_PLAN Phase 0.5）
     - name: Run wasm tests (headless Chrome)
-      run: wasm-pack test --headless --chrome crates/agent-core
+      run: wasm-pack test --headless --chrome crates/rust-agent
 
   # ========================================
   # Desktop App CI (Phase 6.2 native agent embedding)

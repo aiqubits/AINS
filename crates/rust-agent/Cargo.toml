@@ -1,5 +1,5 @@
 [package]
-name = "agent-core"
+name = "rust-agent"
 description = "AINS Agent Runtime Core: WASM/Native dual-target embedded agent runtime"
 version.workspace = true
 edition.workspace = true

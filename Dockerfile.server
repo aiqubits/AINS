@@ -22,7 +22,7 @@ COPY app/ui/Cargo.toml ./app/ui/Cargo.toml
 COPY app/desktop/Cargo.toml ./app/desktop/Cargo.toml
 COPY app/mobile/Cargo.toml ./app/mobile/Cargo.toml
 COPY app/client-api/Cargo.toml ./app/client-api/Cargo.toml
-COPY crates/agent-core/Cargo.toml ./crates/agent-core/Cargo.toml
+COPY crates/rust-agent/Cargo.toml ./crates/rust-agent/Cargo.toml
 COPY crates/emailserver/Cargo.toml ./crates/emailserver/Cargo.toml
 COPY crates/distributed-ratelimit/Cargo.toml ./crates/distributed-ratelimit/Cargo.toml
 COPY crates/i18n/Cargo.toml ./crates/i18n/Cargo.toml
@@ -35,7 +35,7 @@ COPY crates/ains-salvo/Cargo.toml ./crates/ains-salvo/Cargo.toml
 # Required for cargo fetch to resolve all workspace members.
 RUN for dir in \
     server app/web app/ui app/desktop app/mobile app/client-api \
-    crates/agent-core crates/emailserver crates/distributed-ratelimit crates/i18n \
+    crates/rust-agent crates/emailserver crates/distributed-ratelimit crates/i18n \
     crates/wechat-api crates/ains-runtime crates/ains-axum \
     crates/ains-salvo; do \
         mkdir -p "$dir/src"; \
@@ -47,7 +47,7 @@ RUN for dir in \
     echo 'fn main() {}' > app/desktop/src/main.rs && \
     echo 'fn main() {}' > app/mobile/src/main.rs && \
     echo 'pub fn placeholder() {}' > app/client-api/src/lib.rs && \
-    echo 'pub fn placeholder() {}' > crates/agent-core/src/lib.rs && \
+    echo 'pub fn placeholder() {}' > crates/rust-agent/src/lib.rs && \
     echo 'pub fn placeholder() {}' > crates/emailserver/src/lib.rs && \
     echo 'pub fn placeholder() {}' > crates/distributed-ratelimit/src/lib.rs && \
     echo 'pub fn placeholder() {}' > crates/i18n/src/lib.rs && \

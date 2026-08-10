@@ -11,18 +11,18 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde_json::{Value, json};
 
-use agent_core::error::{AgentError, MemoryError, ToolError};
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::memory::kv::KvStore;
-use agent_core::memory::vector::{
+use rust_agent::error::{AgentError, MemoryError, ToolError};
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::memory::kv::KvStore;
+use rust_agent::memory::vector::{
     MemoryNamespace, Metric, VectorIndex, VectorIndexConfig, VectorIndexManager,
 };
-use agent_core::model_client::{
+use rust_agent::model_client::{
     DEFAULT_MAX_OUTPUT_TOKENS, EventStream, ModelClient, ModelRequest, ModelStreamEvent,
     UsageSnapshot,
 };
-use agent_core::platform::Platform;
-use agent_core::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolMetadata, ToolResult};
+use rust_agent::platform::Platform;
+use rust_agent::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolMetadata, ToolResult};
 
 // ── KvStore mock ────────────────────────────────────────────────
 
@@ -600,7 +600,7 @@ fn platform_current_is_not_web_on_native() {
 
 // ── DocumentStore mock ──────────────────────────────────────────
 
-use agent_core::memory::document::{DocumentChunk, DocumentMeta, DocumentStore, SearchResult};
+use rust_agent::memory::document::{DocumentChunk, DocumentMeta, DocumentStore, SearchResult};
 
 #[derive(Default)]
 struct MemDocumentStore {
@@ -696,8 +696,8 @@ async fn document_store_contract_index_dedup_scope_delete() {
 
 // ── SkillLoader / SkillManage mock ──────────────────────────────
 
-use agent_core::error::SkillsError;
-use agent_core::skills::{SkillContent, SkillContext, SkillLoader, SkillManage, SkillSummary};
+use rust_agent::error::SkillsError;
+use rust_agent::skills::{SkillContent, SkillContext, SkillLoader, SkillManage, SkillSummary};
 
 /// 内存 skill 库：`list` 阶段按 `available_tools` 门控过滤（不匹配完全不可见）。
 #[derive(Default)]

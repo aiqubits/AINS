@@ -3,10 +3,10 @@
 对齐基线 OpenHarness `commands/` `plugins/` `swarm/`+`coordinator/` `tasks/`
 `personalization/`。本轮交付 Phase 7+ 全部 P2 项（7+.1–7+.5）。
 
-> **范围说明**：本页的“交付/验收”仅表示 `agent-core` 的组件契约已实现并通过测试；
+> **范围说明**：本页的“交付/验收”仅表示 `rust-agent` 的组件契约已实现并通过测试；
 > 它们尚未全部接入产品运行时的端到端链路，应用层编排属于后续集成工作。
 
-> **验收状态**：agent-core 双 target（native + wasm32）`clippy -D warnings`
+> **验收状态**：rust-agent 双 target（native + wasm32）`clippy -D warnings`
 > 全绿（含 `--tests`）；native 全量测试通过（lib 353：含 commands 10 / plugins 6 /
 > tasks 7 / personalization 6 / swarm 4；memory_native 66：含 mailbox 集成 1）。
 
@@ -100,7 +100,7 @@ frontmatter markdown 命令模板，与 Skill **同构互转**。命令是提示
 
 | crate | 位置 | 用途 |
 |---|---|---|
-| `regex` 1 | agent-core（由 Native-only 移至共享） | filesystem grep（Native）+ personalization 偏好抽取（双 target，wasm 兼容） |
+| `regex` 1 | rust-agent（由 Native-only 移至共享） | filesystem grep（Native）+ personalization 偏好抽取（双 target，wasm 兼容） |
 
 `getrandom`（7.5 引入）复用于 swarm mailbox 消息 nonce。其余全部复用既有依赖。
 

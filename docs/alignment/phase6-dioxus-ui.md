@@ -3,14 +3,14 @@
 对齐基线：`OpenHarness/frontend/terminal/`（React 终端 UI 的交互语义：流式
 消息、工具调用卡片、权限确认、模式切换）与 `OpenHarness/src/openharness/`
 （`engine/stream_events.py`、`permissions/`、`skills/`）。范围：Phase 6 的
-P0 任务——agent-core 嵌入 Web/Desktop（6.1/6.2）、Chat 对话视图（6.3）、
+P0 任务——rust-agent 嵌入 Web/Desktop（6.1/6.2）、Chat 对话视图（6.3）、
 Skills 管理面板（6.4）、权限交互 UI（6.11）。P1/P2 任务（6.5–6.10、6.12）
 不在本批次。
 
-本地验收：`agent-core`/`ui`/`web`/`desktop`/`i18n` 双 target（native +
+本地验收：`rust-agent`/`ui`/`web`/`desktop`/`i18n` 双 target（native +
 wasm32，desktop/mobile 仅 native）build/clippy(-D warnings) 全通过；
-`cargo build -p agent-core -p web --target wasm32-unknown-unknown` 通过；
-mobile native build 通过（NavKey 扩展无回归）。Native 测试全过：agent-core
+`cargo build -p rust-agent -p web --target wasm32-unknown-unknown` 通过；
+mobile native build 通过（NavKey 扩展无回归）。Native 测试全过：rust-agent
 430（lib 281 + 集成 149，含新增 `tests/skills_store.rs` 15）；web 桥接/映射
 单测（`agent::view_model` 18 含 ConversationMirror/mask + `agent::permission_bridge`
 异步契约）；desktop 经 `#[path]` 复用同一套；i18n/ui/client-api 既有套件零
@@ -29,16 +29,16 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 
 | 决策 | 说明 |
 |---|---|
-| `app/ui` 保持纯展示层 | 新组件（chat_view/permission_dialog/permission_controls/skills_panel）仅依赖 dioxus + i18n，全部 props 驱动；视图模型（`ChatItem`/`PermissionRequestView`/`SkillCard` 等）在 ui 内定义，**不引入 agent-core 依赖**。宿主负责 `StreamEvent`/`PermissionRequest` → 视图模型映射 |
+| `app/ui` 保持纯展示层 | 新组件（chat_view/permission_dialog/permission_controls/skills_panel）仅依赖 dioxus + i18n，全部 props 驱动；视图模型（`ChatItem`/`PermissionRequestView`/`SkillCard` 等）在 ui 内定义，**不引入 rust-agent 依赖**。宿主负责 `StreamEvent`/`PermissionRequest` → 视图模型映射 |
 | 宿主 `agent/` 桥接模块 | `app/web/src/agent/{service,view_model,permission_bridge}.rs` 装配 `AgentKernel::with_runtime`（完整 ToolRuntime + PermissionEngine + 确认回调），持 `event_tx`/`stream_rx`，泵入 Dioxus Signal |
 | Desktop 复用 | `app/desktop/src/agent.rs` 与 `views/{agent_chat,skills}.rs` 经 `#[path]` 直接引用 web 端文件，双端同构；平台差异集中在 `service.rs` 的 `cfg` 分支 |
 | 视图解耦 | `agent_chat`/`skills` 视图只依赖 `crate::agent::*` 与 `use_context::<Client>()`（不依赖 web 专有 `AuthState`），故可被 desktop `#[path]` 复用；Client 上下文由各端 App 层提供（web 复用 AuthState client，desktop 从 `AINS_API_URL` 构造） |
 
-## 1. agent-core 嵌入 Web（6.1，`app/web/src/agent/`）
+## 1. rust-agent 嵌入 Web（6.1，`app/web/src/agent/`）
 
 | 能力点 | 设计 | AINS | 结论 |
 |---|---|---|---|
-| 依赖装配 | agent-core 入 web crate | `app/web/Cargo.toml` 新增 `agent-core`/`futures`/`async-trait`/`tracing`/`serde_yaml`；双 target 编译通过 | 对齐 |
+| 依赖装配 | rust-agent 入 web crate | `app/web/Cargo.toml` 新增 `rust-agent`/`futures`/`async-trait`/`tracing`/`serde_yaml`；双 target 编译通过 | 对齐 |
 | ModelClient | 复用 5.1 传输层 | `GatewayModelClient::<WasmRuntimeAdapter>::shared(client)`，client 取自 App 层 `use_context::<Client>()`（AuthState client，token 跨 clone 共享） | 对齐 |
 | 工具集（Web） | compute 全套 + interact + web_fetch | Calculator/Json/Text/Markdown/Date + TodoWrite/AskUserQuestion/Enter・ExitPlanMode + WebFetch | 对齐 |
 | 存储 | IndexedDB 供会话持久化 | `IndexedDbKvStore::open("ains-agent")`；进程内 thread_local 缓存单例（/agent 与 /skills 视图共用一句柄） | 对齐 |
@@ -47,11 +47,11 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 | 会话恢复 | 刷新后从 IndexedDB 续 | 启动 `load_latest(cwd)` 种子进 `kernel.context_mut().conversation` + `seed_history` 首屏渲染；恢复失败仅告警不阻断新会话 | 对齐 |
 | 路由 | `/agent` | main.rs 受保护路由新增 `AgentChat`；Sidebar 新增「AI Agent」组（所有角色可见），`NavKey::AgentChat` | 对齐 |
 
-## 2. agent-core 嵌入 Desktop（6.2，`app/desktop/`）
+## 2. rust-agent 嵌入 Desktop（6.2，`app/desktop/`）
 
 | 能力点 | 设计 | AINS | 结论 |
 |---|---|---|---|
-| 依赖/复用 | Native 桥接 | Cargo.toml 新增 agent-core/client-api/tokio(rt-multi-thread) 等；`agent.rs` + views 经 `#[path]` 复用 web 实现 | 对齐 |
+| 依赖/复用 | Native 桥接 | Cargo.toml 新增 rust-agent/client-api/tokio(rt-multi-thread) 等；`agent.rs` + views 经 `#[path]` 复用 web 实现 | 对齐 |
 | RuntimeAdapter | Tokio | `service::Rt = TokioRuntimeAdapter`（cfg 选择） | 对齐 |
 | 存储 | redb 落数据目录 | `RedbKvStore::open`，路径 `AINS_DATA_DIR` 优先，回退 `$HOME/.ains/agent.redb`；`OnceLock` 进程单例（redb 单进程独占锁） | 对齐 |
 | 工具集（Native 追加） | file/glob/grep/系统/Shell | FileRead/Write/Edit + Glob/Grep + Clipboard/Notification/Screenshot（集成注入暂 None → 自报不可用）+ ShellCommand（经 `NoopSandbox`） | 对齐 |
@@ -75,7 +75,7 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 | 忙碌复位 | 查询结束 | `settle_idle`：无 Running 工具且无 streaming 时复位 busy（final turn = 无 tool_use 的 turn） | 对齐 |
 | i18n | — | 中英文案入 `crates/i18n/src/translate_fields.rs`（chat_/perm_/skills_/ask_user_ 等 57 字段）；计数断言随后续批次/修正演进（最终 546，以 `translations.rs` 断言为准） | 对齐 |
 
-## 4. Skills 管理面板（6.4，`crates/agent-core/src/skills/store.rs` + `app/ui/src/skills_panel.rs`）
+## 4. Skills 管理面板（6.4，`crates/rust-agent/src/skills/store.rs` + `app/ui/src/skills_panel.rs`）
 
 | 能力点 | 基线 `skills/` 6.1 存储节 | AINS | 结论 |
 |---|---|---|---|
@@ -197,10 +197,10 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 
 ## 8. 里程碑验收
 
-- [x] `cargo clippy -p agent-core -p ui -p web -p desktop -p i18n --all-targets -- -D warnings` 通过
-- [x] `cargo clippy -p agent-core -p web --target wasm32-unknown-unknown -- -D warnings` 通过
-- [x] `cargo build -p agent-core -p web --target wasm32-unknown-unknown` 通过；mobile native build 通过
-- [x] `cargo test`：agent-core 430 + client-api 147 + web/desktop/ui/i18n 全过，零回归（含 CodeReview 一轮修正回归）
+- [x] `cargo clippy -p rust-agent -p ui -p web -p desktop -p i18n --all-targets -- -D warnings` 通过
+- [x] `cargo clippy -p rust-agent -p web --target wasm32-unknown-unknown -- -D warnings` 通过
+- [x] `cargo build -p rust-agent -p web --target wasm32-unknown-unknown` 通过；mobile native build 通过
+- [x] `cargo test`：rust-agent 430 + client-api 147 + web/desktop/ui/i18n 全过，零回归（含 CodeReview 一轮修正回归）
 - [ ] wasm-pack CI 浏览器测试（`tests/web_skills.rs` 等）：CI-only，推送后确认
 - [x] Web 浏览器 E2E（真实运行）：release 构建经 Docker（`ains-web` 镜像 + 我的 dist）发布于公网 8099，`browser-use` 实测——登录（WeChat 关闭后仅邮箱+密码）→ `/agent` 渲染 ChatView + 权限模式切换器；发送消息经内嵌 Kernel→`GatewayModelClient`→实时 AI 网关（真实返回 `HTTP 403 no_active_plan`，前端归类为「可恢复错误」）；全自动模式二次确认弹出；`/skills` 渲染面板（"不提供导入入口" + 空态）。截图见 `.devtmp/p6_*.png`（login/agent_view/agent_conversation/fullauto_confirm/skills_view）。
 - [x] Desktop：`cargo build -p desktop` + clippy 通过；视图/桥接经 `#[path]` 与 Web 完全同构（Web 已浏览器实测），desktop 为原生应用不适用浏览器测试。

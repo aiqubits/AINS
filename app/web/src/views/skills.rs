@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use dioxus::prelude::*;
 
-use agent_core::skills::{KvSkillStore, SkillEntry, SkillLoader, SkillManage, SkillTrust};
+use rust_agent::skills::{KvSkillStore, SkillEntry, SkillLoader, SkillManage, SkillTrust};
 use ui::{I18nContext, SkillCard, SkillDetailView, SkillTrustView, SkillsPanel};
 
 use crate::agent::service;

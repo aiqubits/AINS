@@ -10,25 +10,25 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use futures::channel::mpsc;
 
-use agent_core::context::session::{SessionSaveInput, SessionStore, project_slug};
-use agent_core::kernel::{
+use client_api::Client;
+use rust_agent::context::session::{SessionSaveInput, SessionStore, project_slug};
+use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AsyncSystemPromptProvider, ConversationMessage,
     StreamEvent,
 };
-use agent_core::memory::{
+use rust_agent::memory::{
     KvStore, MemdirStore, MemoryContext, MemoryHit, MemoryService, MemoryStores, open_memory_stores,
 };
-use agent_core::model_client::UsageSnapshot;
-use agent_core::model_service::GatewayModelClient;
-use agent_core::policy::{PermissionEngine, PermissionMode, PermissionSettings, SandboxPolicy};
-use agent_core::skills::KvSkillStore;
-use agent_core::tools::compute::{CalculatorTool, DateTool, JsonTool, MarkdownTool, TextTool};
+use rust_agent::model_client::UsageSnapshot;
+use rust_agent::model_service::GatewayModelClient;
+use rust_agent::policy::{PermissionEngine, PermissionMode, PermissionSettings, SandboxPolicy};
+use rust_agent::skills::KvSkillStore;
+use rust_agent::tools::compute::{CalculatorTool, DateTool, JsonTool, MarkdownTool, TextTool};
 #[cfg(any(target_arch = "wasm32", unix))]
-use agent_core::tools::interact::TodoWriteTool;
-use agent_core::tools::interact::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool};
-use agent_core::tools::network::WebFetchTool;
-use agent_core::tools::{ToolCategory, ToolMetadata, ToolRuntime};
-use client_api::Client;
+use rust_agent::tools::interact::TodoWriteTool;
+use rust_agent::tools::interact::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool};
+use rust_agent::tools::network::WebFetchTool;
+use rust_agent::tools::{ToolCategory, ToolMetadata, ToolRuntime};
 use ui::{
     PERSIST_IDLE, PERSIST_PENDING, PERSIST_STATE, TOOL_STATE_LOAD_ERROR, persist_task_in_flight,
     should_sync_persist_error, sync_persist_error,
@@ -291,7 +291,7 @@ static PERSIST_LOCK: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 
 /// 已注册工具名集合的进程级缓存（`tool_schema_snapshot()` 的名字投影）。
 ///
-/// 工具系统为编译期静态注册（agent-core 硬编码实现 + `register_tools`），
+/// 工具系统为编译期静态注册（rust-agent 硬编码实现 + `register_tools`），
 /// 注册表在进程生命周期内不变：每次落盘都重建 ToolRuntime（工具注册 +
 /// UiInteraction channel + workspace 解析）是纯浪费。snapshot 的 workspace
 /// 解析与 [`initialize`] 对齐（cwd 不可用时回退占位路径，见
@@ -486,9 +486,9 @@ fn converge_persist_state() -> bool {
 
 /// 平台 RuntimeAdapter。
 #[cfg(target_arch = "wasm32")]
-pub type Rt = agent_core::WasmRuntimeAdapter;
+pub type Rt = rust_agent::WasmRuntimeAdapter;
 #[cfg(not(target_arch = "wasm32"))]
-pub type Rt = agent_core::TokioRuntimeAdapter;
+pub type Rt = rust_agent::TokioRuntimeAdapter;
 
 /// 装配完成的 Agent 会话：Kernel（待 take 后 spawn）+ 各桥接端点。
 pub struct AgentBridge {
@@ -529,12 +529,12 @@ impl AgentBridge {
 /// 为行为一致同样缓存。
 // 双端统一用 Arc（native 多线程需要；wasm 单线程下非 Send 无害）
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
-async fn open_backend() -> Result<Arc<agent_core::memory::MemoryBackend>, String> {
+async fn open_backend() -> Result<Arc<rust_agent::memory::MemoryBackend>, String> {
     #[cfg(target_arch = "wasm32")]
     {
         use std::rc::Rc;
         thread_local! {
-            static BACKEND_CACHE: Rc<AsyncInitCache<Arc<agent_core::memory::MemoryBackend>>> =
+            static BACKEND_CACHE: Rc<AsyncInitCache<Arc<rust_agent::memory::MemoryBackend>>> =
                 Rc::new(AsyncInitCache::new());
         }
         // A RefCell check-then-await cache is racy even on wasm's single
@@ -544,11 +544,11 @@ async fn open_backend() -> Result<Arc<agent_core::memory::MemoryBackend>, String
         let cache = BACKEND_CACHE.with(Rc::clone);
         cache
             .get_or_try_init(async {
-                use agent_core::memory::IndexedDbBackend;
+                use rust_agent::memory::IndexedDbBackend;
                 let backend = IndexedDbBackend::open("ains-agent")
                     .await
                     .map_err(|e| format!("IndexedDB: {e}"))?;
-                Ok(Arc::new(agent_core::memory::MemoryBackend::Web(Arc::new(
+                Ok(Arc::new(rust_agent::memory::MemoryBackend::Web(Arc::new(
                     backend,
                 ))))
             })
@@ -556,9 +556,9 @@ async fn open_backend() -> Result<Arc<agent_core::memory::MemoryBackend>, String
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use agent_core::memory::RedbBackend;
+        use rust_agent::memory::RedbBackend;
         use std::sync::Mutex;
-        static BACKEND_CACHE: Mutex<Option<Arc<agent_core::memory::MemoryBackend>>> =
+        static BACKEND_CACHE: Mutex<Option<Arc<rust_agent::memory::MemoryBackend>>> =
             Mutex::new(None);
         let mut cache = BACKEND_CACHE
             .lock()
@@ -569,7 +569,7 @@ async fn open_backend() -> Result<Arc<agent_core::memory::MemoryBackend>, String
         let path = native_data_path()?;
         let backend =
             RedbBackend::open(&path).map_err(|e| format!("redb {}: {e}", path.display()))?;
-        let backend = Arc::new(agent_core::memory::MemoryBackend::Native(Arc::new(backend)));
+        let backend = Arc::new(rust_agent::memory::MemoryBackend::Native(Arc::new(backend)));
         *cache = Some(Arc::clone(&backend));
         Ok(backend)
     }
@@ -618,7 +618,7 @@ async fn open_memory_stores_handle() -> Result<MemoryStores, String> {
         if let Some(key) = key.as_ref() {
             // 先检测 plaintext→encrypted 转换，禁止直接套 wrapper。需要清空
             // 旧数据时必须由部署方显式设置 reset 开关；默认返回可操作错误。
-            agent_core::memory::prepare_encryption(
+            rust_agent::memory::prepare_encryption(
                 &backend,
                 key,
                 native_storage_encryption_reset_requested()?,
@@ -751,18 +751,18 @@ impl AsyncSystemPromptProvider for MemoryProvider {
     async fn provide(&self, messages: &[ConversationMessage]) -> Option<String> {
         // §12.1：取最近 human user 文本；跳过只包含 ToolResult 的 user 消息。
         let query = messages.iter().rev().find_map(|message| {
-            if message.role != agent_core::kernel::Role::User {
+            if message.role != rust_agent::kernel::Role::User {
                 return None;
             }
             let text = message.text();
             let has_tool_result = message
                 .content
                 .iter()
-                .any(|block| matches!(block, agent_core::kernel::ContentBlock::ToolResult { .. }));
+                .any(|block| matches!(block, rust_agent::kernel::ContentBlock::ToolResult { .. }));
             (!has_tool_result && !text.trim().is_empty()).then_some(text)
         })?;
         // 短窗口内同 query 复用（含空结果，避免对无记忆 query 反复 embed）。
-        let now = agent_core::memory::now_ms();
+        let now = rust_agent::memory::now_ms();
         let revision = self.service.revision();
         if let Ok(cache) = self.cache.read()
             && let Some((prompt, cache_until, cached_revision)) = cache.get(&query)
@@ -791,12 +791,12 @@ impl AsyncSystemPromptProvider for MemoryProvider {
 /// 不再硬编码 enabled。
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 async fn build_memory_service(
-    model: &Arc<agent_core::model_service::GatewayModelClient<Rt>>,
+    model: &Arc<rust_agent::model_service::GatewayModelClient<Rt>>,
     cwd: &str,
     session_id: Option<&str>,
     owner_id: &str,
 ) -> Option<Arc<MemoryService>> {
-    let config = agent_core::memory::MemoryServiceConfig::from_env();
+    let config = rust_agent::memory::MemoryServiceConfig::from_env();
     if !config.enabled {
         tracing::info!("memory service disabled by config");
         return None;
@@ -815,13 +815,13 @@ async fn build_memory_service(
     let session_id = match session_id {
         Some(id) => id.to_string(),
         None => {
-            agent_core::context::session::generate_session_id(agent_core::memory::now_ms(), cwd)
+            rust_agent::context::session::generate_session_id(rust_agent::memory::now_ms(), cwd)
         }
     };
     let context = MemoryContext::for_owner(project_key, session_id, owner_id);
     match MemoryService::new(
         stores,
-        Arc::clone(model) as Arc<dyn agent_core::model_client::ModelClient>,
+        Arc::clone(model) as Arc<dyn rust_agent::model_client::ModelClient>,
         context,
         config,
     )
@@ -855,8 +855,8 @@ async fn build_memory_service(
 pub async fn extract_durable_serialized(
     memory: Arc<MemoryService>,
     messages: Vec<ConversationMessage>,
-    reason: agent_core::memory::ExtractionReason,
-) -> Result<agent_core::memory::ExtractionOutcome, agent_core::error::MemoryError> {
+    reason: rust_agent::memory::ExtractionReason,
+) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
     memory.extract_durable(messages, reason).await
 }
 
@@ -868,29 +868,29 @@ pub async fn extract_durable_serialized(
 #[cfg(target_arch = "wasm32")]
 async fn with_web_lock<T>(
     lock_name: &str,
-    operation: impl std::future::Future<Output = Result<T, agent_core::error::MemoryError>>,
-) -> Result<T, agent_core::error::MemoryError> {
+    operation: impl std::future::Future<Output = Result<T, rust_agent::error::MemoryError>>,
+) -> Result<T, rust_agent::error::MemoryError> {
     use futures::channel::oneshot;
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use wasm_bindgen_futures::{JsFuture, future_to_promise};
 
     let navigator = web_sys::window()
-        .ok_or_else(|| agent_core::error::MemoryError::Storage("window unavailable".into()))?
+        .ok_or_else(|| rust_agent::error::MemoryError::Storage("window unavailable".into()))?
         .navigator();
     let locks = js_sys::Reflect::get(&navigator, &JsValue::from_str("locks"))
-        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks unavailable".into()))?;
+        .map_err(|_| rust_agent::error::MemoryError::Storage("Web Locks unavailable".into()))?;
     if locks.is_null() || locks.is_undefined() {
-        return Err(agent_core::error::MemoryError::Storage(
+        return Err(rust_agent::error::MemoryError::Storage(
             "Web Locks unavailable".into(),
         ));
     }
     let request = js_sys::Reflect::get(&locks, &JsValue::from_str("request"))
         .map_err(|_| {
-            agent_core::error::MemoryError::Storage("Web Locks request unavailable".into())
+            rust_agent::error::MemoryError::Storage("Web Locks request unavailable".into())
         })?
         .dyn_into::<js_sys::Function>()
         .map_err(|_| {
-            agent_core::error::MemoryError::Storage("Web Locks request unavailable".into())
+            rust_agent::error::MemoryError::Storage("Web Locks request unavailable".into())
         })?;
 
     let (acquired_tx, acquired_rx) = oneshot::channel();
@@ -904,21 +904,21 @@ async fn with_web_lock<T>(
         })
     });
     let callback = callback.dyn_into::<js_sys::Function>().map_err(|_| {
-        agent_core::error::MemoryError::Storage("Web Locks callback unavailable".into())
+        rust_agent::error::MemoryError::Storage("Web Locks callback unavailable".into())
     })?;
     let request_promise = request
         .call2(&locks, &JsValue::from_str(lock_name), &callback)
-        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks request failed".into()))?
+        .map_err(|_| rust_agent::error::MemoryError::Storage("Web Locks request failed".into()))?
         .dyn_into::<js_sys::Promise>()
-        .map_err(|_| agent_core::error::MemoryError::Storage("Web Locks request failed".into()))?;
+        .map_err(|_| rust_agent::error::MemoryError::Storage("Web Locks request failed".into()))?;
 
     acquired_rx.await.map_err(|_| {
-        agent_core::error::MemoryError::Storage("Web Locks acquisition failed".into())
+        rust_agent::error::MemoryError::Storage("Web Locks acquisition failed".into())
     })?;
     let result = operation.await;
     let _ = release_tx.send(());
     if JsFuture::from(request_promise).await.is_err() && result.is_ok() {
-        return Err(agent_core::error::MemoryError::Storage(
+        return Err(rust_agent::error::MemoryError::Storage(
             "Web Locks release failed".into(),
         ));
     }
@@ -929,8 +929,8 @@ async fn with_web_lock<T>(
 pub async fn extract_durable_serialized(
     memory: Arc<MemoryService>,
     messages: Vec<ConversationMessage>,
-    reason: agent_core::memory::ExtractionReason,
-) -> Result<agent_core::memory::ExtractionOutcome, agent_core::error::MemoryError> {
+    reason: rust_agent::memory::ExtractionReason,
+) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
     let lock_name = memory.extraction_lock_name();
     with_web_lock(&lock_name, memory.extract_durable(messages, reason)).await
 }
@@ -944,14 +944,14 @@ mod web_lock_tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     use super::with_web_lock;
-    use agent_core::error::MemoryError;
+    use rust_agent::error::MemoryError;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
     #[wasm_bindgen_test]
     async fn web_locks_serialize_same_name_operations_and_release_after_completion() {
         let trace = Rc::new(RefCell::new(Vec::new()));
-        let lock_name = format!("ains-web-lock-regression-{}", agent_core::memory::now_ms());
+        let lock_name = format!("ains-web-lock-regression-{}", rust_agent::memory::now_ms());
 
         let first_trace = Rc::clone(&trace);
         let first = with_web_lock(&lock_name, async move {
@@ -1006,7 +1006,7 @@ async fn resolve_memory_owner(_client: &Client) -> Result<String, String> {
 fn session_store_for_owner(kv: Arc<dyn KvStore>, owner_id: &str) -> Arc<SessionStore> {
     Arc::new(SessionStore::new_scoped(
         kv,
-        agent_core::memory::owner_key_for_id(owner_id),
+        rust_agent::memory::owner_key_for_id(owner_id),
     ))
 }
 
@@ -1021,7 +1021,7 @@ fn session_store_for_owner(kv: Arc<dyn KvStore>, _owner_id: &str) -> Arc<Session
 fn memdir_store_for_owner(kv: Arc<dyn KvStore>, owner_id: &str) -> Arc<MemdirStore> {
     Arc::new(MemdirStore::new_scoped(
         kv,
-        agent_core::memory::owner_key_for_id(owner_id),
+        rust_agent::memory::owner_key_for_id(owner_id),
     ))
 }
 
@@ -1046,7 +1046,7 @@ const STORAGE_ENCRYPTION_RESET_ENV: &str = "AINS_STORAGE_ENCRYPTION_RESET";
 /// Load a deployment-managed key for native local storage.  Invalid key
 /// material fails startup rather than silently disabling encryption.
 #[cfg(not(target_arch = "wasm32"))]
-fn native_storage_encryption_key() -> Result<Option<agent_core::memory::EncryptionKey>, String> {
+fn native_storage_encryption_key() -> Result<Option<rust_agent::memory::EncryptionKey>, String> {
     let Some(raw) = std::env::var_os(STORAGE_KEY_ENV) else {
         return Ok(None);
     };
@@ -1054,7 +1054,7 @@ fn native_storage_encryption_key() -> Result<Option<agent_core::memory::Encrypti
         .into_string()
         .map_err(|_| format!("{STORAGE_KEY_ENV} must contain ASCII hexadecimal key material"))?;
     let bytes = parse_storage_key_hex(&raw)?;
-    Ok(Some(agent_core::memory::EncryptionKey::from_bytes(bytes)))
+    Ok(Some(rust_agent::memory::EncryptionKey::from_bytes(bytes)))
 }
 
 /// 读取一次性 reset 确认。只接受精确值 `1`，避免 `true` / 拼写错误等宽松
@@ -1115,7 +1115,7 @@ pub async fn open_skill_store() -> Result<Arc<KvSkillStore>, String> {
 /// 无 MemoryService 实例，直接读 `memories` 表并按当前项目可见性过滤。
 /// 返回 `[{type}] {title} ({age}) - {description}` 行（≤80 条）。
 pub async fn open_durable_manifest(client: Client) -> Result<Vec<String>, String> {
-    use agent_core::memory::build_durable_manifest;
+    use rust_agent::memory::build_durable_manifest;
     let stores = open_memory_stores_handle().await?;
     let project_key = project_slug(&bridge_cwd()?);
     let owner = resolve_memory_owner(&client).await?;
@@ -1280,11 +1280,11 @@ fn register_tools(
     policy: &SandboxPolicy,
     workspace: Option<&std::path::Path>,
 ) -> (
-    Arc<agent_core::tools::memory::MemoryReadTool>,
-    Arc<agent_core::tools::memory::MemoryWriteTool>,
+    Arc<rust_agent::tools::memory::MemoryReadTool>,
+    Arc<rust_agent::tools::memory::MemoryWriteTool>,
 ) {
-    let memory_read = Arc::new(agent_core::tools::memory::MemoryReadTool::new());
-    let memory_write = Arc::new(agent_core::tools::memory::MemoryWriteTool::new());
+    let memory_read = Arc::new(rust_agent::tools::memory::MemoryReadTool::new());
+    let memory_write = Arc::new(rust_agent::tools::memory::MemoryWriteTool::new());
     #[cfg(target_arch = "wasm32")]
     let _ = workspace;
     runtime.register(Box::new(CalculatorTool));
@@ -1308,13 +1308,13 @@ fn register_tools(
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use agent_core::platform::Platform;
+        use rust_agent::platform::Platform;
         // `std::fs` cannot provide the required reparse-point-safe,
         // handle-relative semantics on Windows. Keep these tools unregistered
         // there rather than advertising operations that always fail closed.
         #[cfg(unix)]
         {
-            use agent_core::tools::filesystem::{
+            use rust_agent::tools::filesystem::{
                 FileEditTool, FileReadTool, FileWriteTool, GlobTool, GrepTool,
             };
             runtime.register(Box::new(FileReadTool));
@@ -1328,9 +1328,9 @@ fn register_tools(
         //（Linux bwrap）或诚实桩（mac/Win）；隔离不可用时 shell 因
         // capabilities().shell=false 拒绝执行（不降级直跑）。
         if Platform::current() == Platform::Desktop {
-            use agent_core::policy::default_sandbox;
-            use agent_core::tasks::{BackgroundTaskManager, BackgroundTaskTool};
-            use agent_core::tools::system::{
+            use rust_agent::policy::default_sandbox;
+            use rust_agent::tasks::{BackgroundTaskManager, BackgroundTaskTool};
+            use rust_agent::tools::system::{
                 ClipboardTool, NotificationTool, ScreenshotTool, ShellCommandTool,
             };
             let sandbox = default_sandbox(policy.clone());
@@ -1351,7 +1351,7 @@ fn register_tools(
     }
 
     // 契约断言（review S5 + Nit 1 修复）：工具系统为编译期静态注册
-    // （agent-core 硬编码实现 + 本函数），`REGISTERED_TOOL_NAMES` 进程级缓存
+    // （rust-agent 硬编码实现 + 本函数），`REGISTERED_TOOL_NAMES` 进程级缓存
     // （落盘过滤已知工具集用）必须与实际注册集一致。缓存可能已由先前落盘经
     // `registered_tool_names()` 创建——若不一致，说明引入了动态注册（如
     // MCP 热插拔）或注册条件变化，缓存已失效，用户禁用设置会在落盘时被
@@ -1482,8 +1482,8 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     // MemoryService 的 checkpoint / digest / status key 与后续快照落盘使用
     // 同一 id；save_snapshot 失败时也不会退化为跨会话共享的字面量占位。
     if session_id.is_none() {
-        session_id = Some(agent_core::context::session::generate_session_id(
-            agent_core::memory::now_ms(),
+        session_id = Some(rust_agent::context::session::generate_session_id(
+            rust_agent::memory::now_ms(),
             &cwd,
         ));
     }
@@ -1568,10 +1568,10 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
-    use agent_core::error::{AgentError, MemoryError};
-    use agent_core::model_client::{EventStream, ModelStreamEvent};
     use async_trait::async_trait;
     use futures::StreamExt;
+    use rust_agent::error::{AgentError, MemoryError};
+    use rust_agent::model_client::{EventStream, ModelStreamEvent};
     // rsx! 宏展开需要 dioxus_elements 命名空间（tools.rs 同模式），且
     // GlobalSignal（PERSIST_ERROR）读写需 dioxus runtime（VirtualDom 提供）。
     use dioxus::prelude::*;
@@ -2908,10 +2908,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl agent_core::model_client::ModelClient for CountingEmbedModel {
+    impl rust_agent::model_client::ModelClient for CountingEmbedModel {
         async fn stream_response(
             &self,
-            _request: agent_core::model_client::ModelRequest,
+            _request: rust_agent::model_client::ModelRequest,
         ) -> Result<EventStream<ModelStreamEvent>, AgentError> {
             // provider 只走 memory_prompt → embed/search，不触发流式回复
             Ok(futures::stream::empty().boxed())
@@ -2947,9 +2947,9 @@ mod tests {
             let svc = Arc::new(
                 MemoryService::new(
                     stores,
-                    Arc::new(model) as Arc<dyn agent_core::model_client::ModelClient>,
+                    Arc::new(model) as Arc<dyn rust_agent::model_client::ModelClient>,
                     MemoryContext::new("proj", "s1"),
-                    agent_core::memory::MemoryServiceConfig::default(),
+                    rust_agent::memory::MemoryServiceConfig::default(),
                 )
                 .await
                 .unwrap(),
@@ -2975,7 +2975,7 @@ mod tests {
                 "how does auth work?".to_string(),
                 (
                     "stale prompt".to_string(),
-                    agent_core::memory::now_ms().saturating_sub(1),
+                    rust_agent::memory::now_ms().saturating_sub(1),
                     svc.revision(),
                 ),
             );
@@ -2988,12 +2988,12 @@ mod tests {
             assert_ne!(refreshed.as_deref(), Some("stale prompt"));
             // 成功写入会递增 service revision：即使 query 完全相同，也必须
             // 让 Turn N+1 重新检索，不能继续复用 Turn N 的空 prompt。
-            svc.write_memory(agent_core::memory::NewMemoryEntry {
+            svc.write_memory(rust_agent::memory::NewMemoryEntry {
                 title: "auth".to_string(),
                 body: "authentication uses short lived tokens".to_string(),
                 description: "auth fact".to_string(),
-                memory_type: agent_core::memory::MemoryType::Project,
-                scope: agent_core::memory::MemoryScope::Project,
+                memory_type: rust_agent::memory::MemoryType::Project,
+                scope: rust_agent::memory::MemoryScope::Project,
                 importance: 1.0,
                 source: "test".to_string(),
                 ttl_days: 0,
@@ -3022,16 +3022,16 @@ mod tests {
         );
         let service = futures::executor::block_on(MemoryService::new(
             stores,
-            Arc::new(model) as Arc<dyn agent_core::model_client::ModelClient>,
+            Arc::new(model) as Arc<dyn rust_agent::model_client::ModelClient>,
             MemoryContext::new("proj", "s1"),
-            agent_core::memory::MemoryServiceConfig::default(),
+            rust_agent::memory::MemoryServiceConfig::default(),
         ))
         .unwrap();
         let provider = MemoryProvider {
             service: Arc::new(service),
             cache: RwLock::new(HashMap::new()),
         };
-        let now = agent_core::memory::now_ms();
+        let now = rust_agent::memory::now_ms();
         {
             let mut cache = provider.cache.write().unwrap();
             cache.insert("expired".into(), ("old".into(), now - 1, 0));

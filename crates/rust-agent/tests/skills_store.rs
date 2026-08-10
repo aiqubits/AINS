@@ -8,10 +8,10 @@ use std::sync::Arc;
 
 use serde_json::json;
 
-use agent_core::error::SkillsError;
-use agent_core::memory::{KvStore, RedbBackend, TABLE_KV, now_ms};
-use agent_core::platform::Platform;
-use agent_core::skills::{
+use rust_agent::error::SkillsError;
+use rust_agent::memory::{KvStore, RedbBackend, TABLE_KV, now_ms};
+use rust_agent::platform::Platform;
+use rust_agent::skills::{
     AUTO_ROLLBACK_CONSECUTIVE_FAILURES, KvSkillStore, SkillContext, SkillLoader, SkillManage,
     SkillMeta, SkillPruner, SkillTrust, skill_checksum, split_frontmatter,
 };
@@ -283,7 +283,7 @@ async fn create_update_rollback_versioning_and_active_mirror() {
     let vers = store.list_versions("csv").await.unwrap();
     assert_eq!(vers.len(), 1);
     assert_eq!(vers[0].0.label(), "v1.0");
-    assert_eq!(vers[0].1.status, agent_core::skills::SkillStatus::Active);
+    assert_eq!(vers[0].1.status, rust_agent::skills::SkillStatus::Active);
     // 重复创建报错
     assert!(store.create_skill("csv", SKILL_MD).await.is_err());
     // 活跃镜像可被 Loader 读取
@@ -297,8 +297,8 @@ async fn create_update_rollback_versioning_and_active_mirror() {
     assert_eq!(labels, ["v1.0", "v1.1"]);
     let v10 = vers.iter().find(|(v, _)| v.label() == "v1.0").unwrap();
     let v11 = vers.iter().find(|(v, _)| v.label() == "v1.1").unwrap();
-    assert_eq!(v10.1.status, agent_core::skills::SkillStatus::Deprecated);
-    assert_eq!(v11.1.status, agent_core::skills::SkillStatus::Active);
+    assert_eq!(v10.1.status, rust_agent::skills::SkillStatus::Deprecated);
+    assert_eq!(v11.1.status, rust_agent::skills::SkillStatus::Active);
     // 活跃镜像已切到 v1.1 内容
     assert_eq!(
         store
@@ -317,7 +317,7 @@ async fn create_update_rollback_versioning_and_active_mirror() {
     let labels: Vec<_> = vers.iter().map(|(v, _)| v.label()).collect();
     assert_eq!(labels, ["v1.0", "v1.1", "v2.0"]);
     let v20 = vers.iter().find(|(v, _)| v.label() == "v2.0").unwrap();
-    assert_eq!(v20.1.status, agent_core::skills::SkillStatus::Active);
+    assert_eq!(v20.1.status, rust_agent::skills::SkillStatus::Active);
     assert_eq!(
         store
             .load("csv")
@@ -359,7 +359,7 @@ async fn record_outcome_auto_rollback_after_consecutive_failures() {
     let vers = store.list_versions("wf").await.unwrap();
     assert!(
         vers.iter().any(
-            |(v, r)| v.label() == "v2.0" && r.status == agent_core::skills::SkillStatus::Active
+            |(v, r)| v.label() == "v2.0" && r.status == rust_agent::skills::SkillStatus::Active
         )
     );
 

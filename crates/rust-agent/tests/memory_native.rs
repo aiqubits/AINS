@@ -12,10 +12,10 @@ use std::time::Duration;
 use futures::StreamExt;
 use serde_json::json;
 
-use agent_core::TokioRuntimeAdapter;
-use agent_core::error::{AgentError, MemoryError};
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::memory::{
+use rust_agent::TokioRuntimeAdapter;
+use rust_agent::error::{AgentError, MemoryError};
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::memory::{
     DefaultVectorIndexManager, DocumentStore, KvStore, LocalDocumentStore, MemdirStore,
     MemoryEngine, MemoryExtractor, MemoryNamespace, MemoryType, Metric, NewMemoryEntry,
     RedbBackend, SessionCheckpoint, TABLE_DOCUMENTS, TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_KV,
@@ -24,7 +24,7 @@ use agent_core::memory::{
     memdir::{MAX_ENTRYPOINT_LINES, truncate_entrypoint},
     now_ms, parse_memory_records, save_session_checkpoint, spawn_ttl_sweeper,
 };
-use agent_core::model_client::{
+use rust_agent::model_client::{
     EventStream, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
 };
 
@@ -99,7 +99,7 @@ async fn build_engine(backend: &RedbBackend, namespace: MemoryNamespace) -> Memo
     let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager;
+    use rust_agent::memory::VectorIndexManager;
     manager
         .create_index(namespace, test_config())
         .await
@@ -404,7 +404,7 @@ async fn memdir_add_scan_remove_and_prompt() {
     let filename = store
         .add_entry(NewMemoryEntry {
             title: "Build Setup".into(),
-            body: "Use `cargo build -p agent-core` for the runtime crate.".into(),
+            body: "Use `cargo build -p rust-agent` for the runtime crate.".into(),
             description: "How to build the runtime".into(),
             memory_type: MemoryType::Project,
             ..Default::default()
@@ -421,7 +421,7 @@ async fn memdir_add_scan_remove_and_prompt() {
     let dup = store
         .add_entry(NewMemoryEntry {
             title: "Build Setup Again".into(),
-            body: "use CARGO BUILD -p agent-core for the runtime crate".into(),
+            body: "use CARGO BUILD -p rust-agent for the runtime crate".into(),
             ..Default::default()
         })
         .await
@@ -717,7 +717,7 @@ async fn remember_refresh_updates_recency() {
 
 #[test]
 fn retention_score_uses_refreshed_at() {
-    use agent_core::memory::manage::{effective_recency_ms, retention_score};
+    use rust_agent::memory::manage::{effective_recency_ms, retention_score};
 
     let now: i64 = 1_753_600_000_000;
     let sixty_days_ago = now - 60 * 24 * 3600 * 1000;
@@ -755,7 +755,7 @@ async fn search_ranked_reranks_by_time_decay() {
     // old 向量与 query 完全对齐（原始余弦 1.0）但 60 天前刷新（两个半衰期
     // → 衰减 0.25）；new 向量偏离（余弦 ≈ 0.707）但刚刷新（衰减 ≈ 1.0）。
     // 原始名次 old > new，衰减后应翻转为 new > old。
-    let now = agent_core::memory::now_ms();
+    let now = rust_agent::memory::now_ms();
     let sixty_days = 60 * 24 * 3600 * 1000;
     let query = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let inv = 1.0f32 / 2.0f32.sqrt();
@@ -1441,7 +1441,7 @@ struct MutatingThenFailingVectorManager {
 }
 
 #[async_trait::async_trait]
-impl agent_core::memory::VectorIndexManager for MutatingThenFailingVectorManager {
+impl rust_agent::memory::VectorIndexManager for MutatingThenFailingVectorManager {
     async fn create_index(
         &mut self,
         _namespace: MemoryNamespace,
@@ -1508,7 +1508,7 @@ async fn document_index_partial_chunk_write_is_cleaned_up() {
     let embeddings: Arc<dyn KvStore> = Arc::new(FailingKv::new(backend.table(TABLE_EMBEDDINGS), 2));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager as _;
+    use rust_agent::memory::VectorIndexManager as _;
     manager
         .create_index(MemoryNamespace::Document, test_config())
         .await
@@ -1837,7 +1837,7 @@ async fn failed_new_remember_removes_resident_index_node() {
 
 #[tokio::test]
 async fn create_index_is_lazy_and_first_search_rebuilds_from_sot() {
-    use agent_core::memory::{VectorIndexManager, vector_to_value};
+    use rust_agent::memory::{VectorIndexManager, vector_to_value};
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -1877,7 +1877,7 @@ async fn create_index_is_lazy_and_first_search_rebuilds_from_sot() {
 
 #[tokio::test]
 async fn pending_index_absorbs_writes_without_rebuild() {
-    use agent_core::memory::{VectorIndexManager, vector_to_value};
+    use rust_agent::memory::{VectorIndexManager, vector_to_value};
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -1918,7 +1918,7 @@ async fn pending_index_absorbs_writes_without_rebuild() {
 
 #[tokio::test]
 async fn encrypted_kv_store_roundtrip_and_ciphertext_at_rest() {
-    use agent_core::memory::{EncryptedKvStore, EncryptionKey};
+    use rust_agent::memory::{EncryptedKvStore, EncryptionKey};
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -1955,7 +1955,7 @@ async fn encrypted_kv_store_roundtrip_and_ciphertext_at_rest() {
 
 #[tokio::test]
 async fn encrypted_kv_store_forwards_ttl() {
-    use agent_core::memory::{EncryptedKvStore, EncryptionKey};
+    use rust_agent::memory::{EncryptedKvStore, EncryptionKey};
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -1982,7 +1982,7 @@ async fn encrypted_kv_store_forwards_ttl() {
 
 #[tokio::test]
 async fn kv_mailbox_post_inbox_unread_mark_read() {
-    use agent_core::swarm::KvMailbox;
+    use rust_agent::swarm::KvMailbox;
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -2034,7 +2034,7 @@ async fn remember_rolls_back_on_embeddings_set_failure() {
     let embeddings: Arc<dyn KvStore> = Arc::new(FailingKv::new(backend.table(TABLE_EMBEDDINGS), 1));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager as _;
+    use rust_agent::memory::VectorIndexManager as _;
     manager
         .create_index(MemoryNamespace::Personal, test_config())
         .await
@@ -2088,7 +2088,7 @@ async fn remember_rolls_back_on_signature_set_failure() {
     let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager as _;
+    use rust_agent::memory::VectorIndexManager as _;
     manager
         .create_index(MemoryNamespace::Personal, test_config())
         .await
@@ -2455,7 +2455,7 @@ async fn document_dedupe_and_list_survive_corrupt_meta() {
 
 #[tokio::test]
 async fn hnsw_update_at_capacity_succeeds() {
-    use agent_core::memory::{HnswVectorIndex, VectorIndex};
+    use rust_agent::memory::{HnswVectorIndex, VectorIndex};
 
     let mut index =
         HnswVectorIndex::new(MemoryNamespace::Personal, test_config()).with_max_entries(2);
@@ -2589,7 +2589,7 @@ async fn document_delete_survives_corrupt_meta() {
 
 #[tokio::test]
 async fn euclidean_scores_match_shared_similarity_fn() {
-    use agent_core::memory::{VectorIndexManager as _, similarity_score};
+    use rust_agent::memory::{VectorIndexManager as _, similarity_score};
 
     let dir = tempfile::tempdir().unwrap();
     let backend = open_backend(&dir);
@@ -2786,7 +2786,7 @@ async fn eviction_is_restored_when_new_entry_write_fails() {
     let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager as _;
+    use rust_agent::memory::VectorIndexManager as _;
     manager
         .create_index(MemoryNamespace::Personal, test_config())
         .await
@@ -2956,7 +2956,7 @@ async fn restore_failure_keeps_engine_usable() {
     let embeddings: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_EMBEDDINGS));
     let hnsw_cache: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_HNSW_CACHE));
     let mut manager = DefaultVectorIndexManager::new(Arc::clone(&embeddings), hnsw_cache);
-    use agent_core::memory::VectorIndexManager as _;
+    use rust_agent::memory::VectorIndexManager as _;
     manager
         .create_index(MemoryNamespace::Personal, test_config())
         .await
@@ -3139,7 +3139,7 @@ async fn search_ranked_overfetches_beyond_raw_topk_window() {
     // old 与 query 完全对齐（余弦 1.0）但 60 天前刷新（衰减 0.25）；
     // fresh 偏离（余弦 ≈ 0.707）但刚刷新。top_k = 1 时原始窗口只含
     // old，无过采样则 fresh 永远无法反超（衰减只降不升）。
-    let now = agent_core::memory::now_ms();
+    let now = rust_agent::memory::now_ms();
     let sixty_days = 60 * 24 * 3600 * 1000;
     let query = vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
     let inv = 1.0f32 / 2.0f32.sqrt();

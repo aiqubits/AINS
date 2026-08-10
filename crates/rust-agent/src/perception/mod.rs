@@ -3,7 +3,7 @@
 //!
 //! 架构分工：平台特定采集（摄像头 / 麦克风 / 截屏 / 拖拽）由各前端
 //! （app/web、app/desktop）在其平台 API 层完成；本模块只接收已采集的原始
-//! 字节，保持 agent-core 纯粹、双端可测。感知结果统一为 [`PerceptionOutcome`]，
+//! 字节，保持 rust-agent 纯粹、双端可测。感知结果统一为 [`PerceptionOutcome`]，
 //! 经 [`PerceptionOutcome::into_agent_event`] 转为 `AgentEvent::UserMessage`
 //! 后由既有 `ContextStore::build` 落入上下文（图像附件 → Image block）。
 

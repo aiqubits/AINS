@@ -3,7 +3,7 @@ use dioxus_icons::lucide::Trash2;
 
 use crate::{Badge, BadgeVariant, EN, I18nContext, Modal, tf};
 
-/// 技能信任级别（视图模型，宿主从 agent-core `SkillTrust` 映射）。
+/// 技能信任级别（视图模型，宿主从 rust-agent `SkillTrust` 映射）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillTrustView {
     System,

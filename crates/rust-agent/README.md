@@ -1,4 +1,4 @@
-# agent-core
+# rust-agent
 
 AINS Agent Runtime Core：单一 crate、WASM/Native 双编译目标的 Embedded Agent Runtime。
 
@@ -13,12 +13,12 @@ AINS Agent Runtime Core：单一 crate、WASM/Native 双编译目标的 Embedded
 
 ```bash
 # Native
-cargo build -p agent-core
-cargo test -p agent-core
+cargo build -p rust-agent
+cargo test -p rust-agent
 
 # Web (WASM)
-cargo build -p agent-core --target wasm32-unknown-unknown
+cargo build -p rust-agent --target wasm32-unknown-unknown
 
 # 浏览器环境测试（IndexedDB 等，仅 CI 执行）
-wasm-pack test --headless --chrome crates/agent-core
+wasm-pack test --headless --chrome crates/rust-agent
 ```

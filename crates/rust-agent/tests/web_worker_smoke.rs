@@ -8,9 +8,9 @@ use std::time::Duration;
 
 use wasm_bindgen_test::*;
 
-use agent_core::WasmRuntimeAdapter;
-use agent_core::platform::Platform;
-use agent_core::runtime_adapter::RuntimeAdapter;
+use rust_agent::WasmRuntimeAdapter;
+use rust_agent::platform::Platform;
+use rust_agent::runtime_adapter::RuntimeAdapter;
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 

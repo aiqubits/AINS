@@ -16,8 +16,8 @@ use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::*;
 use web_sys::{IdbDatabase, IdbOpenDbRequest, IdbRequest};
 
-use agent_core::WasmRuntimeAdapter;
-use agent_core::memory::{
+use rust_agent::WasmRuntimeAdapter;
+use rust_agent::memory::{
     DefaultVectorIndexManager, EncryptedKvStore, EncryptionKey, IndexedDbBackend, KvStore,
     MemdirStore, MemoryEngine, MemoryNamespace, Metric, NewMemoryEntry, TABLE_EMBEDDINGS,
     TABLE_HNSW_CACHE, TABLE_KV, TABLE_MEMORIES, VectorIndexConfig, VectorIndexManager,
@@ -115,7 +115,7 @@ async fn existing_v1_database_is_upgraded_with_all_memory_stores() {
         TABLE_KV,
         TABLE_MEMORIES,
         TABLE_EMBEDDINGS,
-        agent_core::memory::TABLE_DOCUMENTS,
+        rust_agent::memory::TABLE_DOCUMENTS,
         TABLE_HNSW_CACHE,
     ] {
         let store = backend.store(table);

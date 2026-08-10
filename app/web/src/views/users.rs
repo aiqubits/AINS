@@ -1109,14 +1109,20 @@ fn render_form_modal(
 
     let role_now = signals.form_role.cloned();
 
-    // Balance adjustment: visible in Edit mode when the actor has permission
+    // A system actor may adjust any account, including a system account. Admins
+    // remain limited to user-role accounts in their own tenant.
     let can_adjust = editing
         .as_ref()
-        .map(|u| {
-            (current_role == "system" && u.role != "system")
-                || (current_role == "admin" && u.role == "user")
-        })
+        .map(|u| actor_is_system || (current_role == "admin" && u.role == "user"))
         .unwrap_or(false);
+    // System accounts are intentionally editable only through the balance
+    // adjustment endpoint. Do not render profile, role, or tenant controls for
+    // them, and do not expose the normal update submit button.
+    let is_system_target = kind == ModalKind::Edit
+        && editing
+            .as_ref()
+            .map(|u| u.role == "system")
+            .unwrap_or(false);
 
     let on_increase = make_adjust_handler(AdjustHandlerParams {
         signals,
@@ -1161,36 +1167,38 @@ fn render_form_modal(
                 if let Some(err) = form_error.as_ref() {
                     p { class: "ains-form-error", "{err}" }
                 }
-                TextInput {
-                    label: form_name_label.clone(),
-                    placeholder: Some(form_name_placeholder.clone()),
-                    value: signals.form_name,
-                    required: true,
-                    disabled: submitting,
-                    name: Some("name".to_string()),
-                }
-                TextInput {
-                    label: form_email_label.clone(),
-                    placeholder: Some(form_email_placeholder.clone()),
-                    value: signals.form_email,
-                    input_type: InputType::Email,
-                    required: true,
-                    disabled: submitting,
-                    name: Some("email".to_string()),
-                }
-                if kind == ModalKind::Create {
+                if !is_system_target {
                     TextInput {
-                        label: form_password_label.clone(),
-                        placeholder: Some(password_placeholder_str.to_string()),
-                        value: signals.form_password,
-                        input_type: InputType::Password,
-                        required: password_required,
+                        label: form_name_label.clone(),
+                        placeholder: Some(form_name_placeholder.clone()),
+                        value: signals.form_name,
+                        required: true,
                         disabled: submitting,
-                        name: Some("password".to_string()),
-                        hint: Some(form_password_hint.clone()),
+                        name: Some("name".to_string()),
+                    }
+                    TextInput {
+                        label: form_email_label.clone(),
+                        placeholder: Some(form_email_placeholder.clone()),
+                        value: signals.form_email,
+                        input_type: InputType::Email,
+                        required: true,
+                        disabled: submitting,
+                        name: Some("email".to_string()),
+                    }
+                    if kind == ModalKind::Create {
+                        TextInput {
+                            label: form_password_label.clone(),
+                            placeholder: Some(password_placeholder_str.to_string()),
+                            value: signals.form_password,
+                            input_type: InputType::Password,
+                            required: password_required,
+                            disabled: submitting,
+                            name: Some("password".to_string()),
+                            hint: Some(form_password_hint.clone()),
+                        }
                     }
                 }
-                if kind == ModalKind::Edit && current_role == "system" {
+                if kind == ModalKind::Edit && current_role == "system" && !is_system_target {
                     div { class: "ains-form-field",
                         label { class: "ains-form-label", "{role_label}" }
                         div { class: "ains-form-pill-group",
@@ -1231,7 +1239,7 @@ fn render_form_modal(
                 }
                 // 仅 system 角色可选择/变更所属租户（创建与编辑均可）——共享自绘下拉，
                 // 触发器与弹层均与 Modal 内其它字段对齐；选项仅展示租户 ID 前 8 位。
-                if actor_is_system {
+                if actor_is_system && !is_system_target {
                     {
                         render_tenant_select(TenantSelectView {
                             label: tenant_id_label.clone(),
@@ -1252,13 +1260,15 @@ fn render_form_modal(
                         })
                     }
                 }
-                Button {
-                    button_type: ButtonType::Submit,
-                    full_width: true,
-                    disabled: submitting,
-                    loading: submitting,
-                    onclick: on_submit,
-                    "{submit_label}"
+                if !is_system_target {
+                    Button {
+                        button_type: ButtonType::Submit,
+                        full_width: true,
+                        disabled: submitting,
+                        loading: submitting,
+                        onclick: on_submit,
+                        "{submit_label}"
+                    }
                 }
                 // 余额调整：编辑模式且当前用户有权限时显示
                 if kind == ModalKind::Edit && can_adjust {

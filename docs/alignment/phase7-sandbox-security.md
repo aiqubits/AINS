@@ -85,7 +85,7 @@ per-UID + SELinux 域 + zygote seccomp；iOS：容器沙箱 + 代码签名，且
 | 编译验证 | async_trait + cfg-const 模式经 probe `cargo check --target aarch64-linux-android` + `aarch64-apple-ios` 通过 | ✅ |
 
 **未验证/前瞻**：整体移动 agent 集成（OS 沙箱 + Layer 1 在真机的实际行为）尚未
-真机验证，且 `app/mobile` 目前未接入 agent-core（本适配为前瞻基础设施，接入后即生效）。
+真机验证，且 `app/mobile` 目前未接入 rust-agent（本适配为前瞻基础设施，接入后即生效）。
 Android isolated-process 桥接为可能的后续增强（需 Java/Binder 层，非 Rust 直接可到）。
 
 ## 5. 7.2 敏感操作二次确认（`permission_engine.rs`）
@@ -121,10 +121,10 @@ mid-model-stream 与 mid-tool 的即时抢占需并发化改造，留待后续�
 
 ## 8. 里程碑验收
 
-- [x] `cargo clippy -p agent-core -p ui -p web -p desktop -p mobile -p i18n --all-targets -- -D warnings`
-- [x] `cargo clippy -p agent-core -p web --target wasm32-unknown-unknown -- -D warnings`
-- [x] `cargo check -p web -p agent-core --target wasm32-unknown-unknown`（WASM 兼容）
-- [x] `cargo test`：agent-core lib 302 + kernel_loop 28（含中断回归）+ skills_store 25 +
+- [x] `cargo clippy -p rust-agent -p ui -p web -p desktop -p mobile -p i18n --all-targets -- -D warnings`
+- [x] `cargo clippy -p rust-agent -p web --target wasm32-unknown-unknown -- -D warnings`
+- [x] `cargo check -p web -p rust-agent --target wasm32-unknown-unknown`（WASM 兼容）
+- [x] `cargo test`：rust-agent lib 302 + kernel_loop 28（含中断回归）+ skills_store 25 +
       新增 sandbox_policy（含 3 项 SBPL profile 单测）/sandbox_linux/permission_engine 单测，零回归
       （全量 725 通过 / 0 失败）
 - [x] Linux bwrap 集成测试：安装 bwrap 时运行真实隔离，未安装则 `eprintln!` 跳过
@@ -134,7 +134,7 @@ mid-model-stream 与 mid-tool 的即时抢占需并发化改造，留待后续�
       async_trait + cfg-const 模式经 probe `cargo check --target aarch64-linux-android` +
       `aarch64-apple-ios` 均通过
 - [ ] macOS/Windows/Android/iOS 真实环境运行验证（需对应主机；mac/Win 需
-      `AINS_ENABLE_UNVERIFIED_SANDBOX=1`；mobile 需先将 agent-core 接入 app/mobile）：未验证
+      `AINS_ENABLE_UNVERIFIED_SANDBOX=1`；mobile 需先将 rust-agent 接入 app/mobile）：未验证
 - [ ] wasm-pack CI 浏览器测试（web_tools 等 NetworkPolicy 签名更新）：CI-only，推送后确认
 - 备注：桌面 shell 隔离按平台不同，**非全平台/全发行版通用**：
   - **Linux**：需安装外部二进制 `bubblewrap`（Debian/Ubuntu：`apt-get install bubblewrap`；
@@ -217,7 +217,7 @@ Code Review（Phase 7 全量 diff）发现的缺陷修复：
    仅存元数据、表示层变更不要求 bump。
 
 验收：`cargo check`/`clippy --all-targets -D warnings`（native + wasm32）零告警；
-`cargo test -p agent-core` 全量通过（lib 379 + 集成 169）。
+`cargo test -p rust-agent` 全量通过（lib 379 + 集成 169）。
 
 ## 13. Review 修复记录（2026-08-01 五轮，复审核）
 
@@ -239,7 +239,7 @@ Code Review（Phase 7 全量 diff）发现的缺陷修复：
    cancelled / 共享预算）经 `x86_64-pc-windows-msvc` probe 编译通过；
    `sandbox_macos.rs` 同套改动经 `x86_64-apple-darwin` probe 编译通过。
 
-验收：`cargo test -p agent-core` 全量通过（lib 381 + 集成 169 = 550）；
+验收：`cargo test -p rust-agent` 全量通过（lib 381 + 集成 169 = 550）；
 native/wasm32 clippy 零告警；Windows/macOS 沙箱代码经隔离 probe 跨目标
 编译验证。
 
@@ -276,7 +276,7 @@ native/wasm32 clippy 零告警；Windows/macOS 沙箱代码经隔离 probe 跨�
 方法（现有调用方均正确使用 `capabilities().shell` 单项检查，无实际收益）；
 后台任务 per-task timeout（7 天兜底 + stop 取消已覆盖设计意图）。
 
-验收：`cargo test -p agent-core` 全量通过（lib 386 + 集成 169 = 555）；
+验收：`cargo test -p rust-agent` 全量通过（lib 386 + 集成 169 = 555）；
 native/wasm32 `clippy --all-targets -D warnings` 零告警（含 `--tests`）；
 `web`（wasm32）/`desktop`/`client-api` 编译与测试全绿。
 
@@ -298,7 +298,7 @@ native/wasm32 `clippy --all-targets -D warnings` 零告警（含 `--tests`）；
 `HookExecutor` 无宿主注入 `with_sandbox`（command hook 恒 NoopSandbox
 拒绝——安全默认，随宿主接线面推进）。
 
-验收：`cargo test -p agent-core` 全量通过（lib 387 + 集成 169 = 556）；
+验收：`cargo test -p rust-agent` 全量通过（lib 387 + 集成 169 = 556）；
 native/wasm32 `clippy --all-targets -D warnings` 零告警（含 `--tests`）。
 
 ## 16. Review 修复记录（2026-08-01 八轮，上轮问题逐项验收）
@@ -324,7 +324,7 @@ current_dir 失败回退，B2 修复已 fail-closed 兜底，自动绝对化引�
 复杂度无收益）；`HookExecutor` with_sandbox 宿主注入（安全默认，待接线面）；
 `bridge_cwd` 相对回退信号化（B2 已兜底安全）。
 
-验收：`cargo test -p agent-core` 全量通过（lib 389 + 集成 169 = 558）；
+验收：`cargo test -p rust-agent` 全量通过（lib 389 + 集成 169 = 558）；
 native/wasm32 `clippy --all-targets -D warnings` 零告警（含 `--tests`）；
 `web`（wasm32）/`desktop`/`client-api` 编译与测试全绿。
 
@@ -390,7 +390,7 @@ Windows Job 分配竞态需对应平台验证；后台任务历史记录仍需�
    连续多轮（含单线程、高负载 4 实例并行 + CPU 压力）无法复现，疑似负载
    下时序敏感测试偶发失败。CI 中若复现需定位具体测试。
 
-验收：`cargo test -p agent-core` 全量通过（lib 448 + kernel_loop 33 含
+验收：`cargo test -p rust-agent` 全量通过（lib 448 + kernel_loop 33 含
 尾窗中断回归 + 其余套件）；native/wasm32 `clippy --all-targets -D warnings`
 零告警。
 
@@ -475,6 +475,6 @@ expand 输出上限（runtime 输出预算兜底）；`$1` 词字符边界（已
 InProcessExecutor 无超时（接线时设计，已随 §B3 文档标注强制点）；首次索引
 物化 O(N) 次 get（性能优化，留 Phase 8 实测）。
 
-验收：`cargo test -p agent-core` 全量通过（lib 453 + 集成 177 = 630）；
+验收：`cargo test -p rust-agent` 全量通过（lib 453 + 集成 177 = 630）；
 native/wasm32 `clippy --all-targets -D warnings` 零告警（含 --tests）；
 `web`（wasm32）/`desktop` 编译通过。

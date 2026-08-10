@@ -212,7 +212,7 @@ async fn test_set_balance_rejects_negative() {
 }
 
 #[tokio::test]
-async fn test_set_balance_on_system_user_returns_404() {
+async fn test_system_can_adjust_own_system_balance() {
     let app = axum_helpers::create_app().await;
     let sys_email = common::unique_email("set_bal_sys_on_sys");
     let sys_token = axum_helpers::create_system_and_login(&app, &sys_email).await;
@@ -230,21 +230,39 @@ async fn test_set_balance_on_system_user_returns_404() {
     assert_eq!(status, StatusCode::OK);
     let sys_id: i64 = body["user_id"].as_str().unwrap().parse().unwrap();
 
-    let (status, body) = put(
+    let (status, body) = post(
         &app,
-        &format!("/api/users/{}/balance", sys_id),
+        &format!("/api/users/{}/balance/adjust", sys_id),
         Some(&sys_token),
         Some(&json!({
-            "balance": 50000,
+            "amount": 50000,
         })),
     )
     .await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "should not allow modifying system account: {:?}",
+        StatusCode::OK,
+        "system should be able to increase its own balance: {:?}",
         body
     );
+    assert_eq!(body["balance"], 50000);
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/users/{}/balance/adjust", sys_id),
+        Some(&sys_token),
+        Some(&json!({
+            "amount": -20000,
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "system should be able to decrease its own balance: {:?}",
+        body
+    );
+    assert_eq!(body["balance"], 30000);
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 //! 权限确认 / ask_user_question 的 UI 桥接（Phase 6.11）。
 //!
-//! 设计：agent-core 的回调 trait 在 Kernel 任务内被调用（native 下要求
+//! 设计：rust-agent 的回调 trait 在 Kernel 任务内被调用（native 下要求
 //! `Send + Sync`），不能直接持有 Dioxus `Signal`。桥接层以 channel 解耦：
 //! 回调侧把请求（含 oneshot 回执发送端）推入 unbounded channel，UI 协程
 //! 接收后弹窗，用户点击后经 oneshot 回填。channel/回执任一侧关闭 →
@@ -17,8 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::channel::{mpsc, oneshot};
 use futures::lock::Mutex;
 
-use agent_core::policy::{PermissionPrompt, PermissionReply, PermissionRequest};
-use agent_core::tools::interact::UserInteraction;
+use rust_agent::policy::{PermissionPrompt, PermissionReply, PermissionRequest};
+use rust_agent::tools::interact::UserInteraction;
 use ui::{PermissionChoice, PermissionRequestView};
 
 /// 推给 UI 协程的权限确认请求。

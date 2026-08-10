@@ -9,11 +9,11 @@ ui = { workspace = true }
 dioxus-icons = { workspace = true }
 client-api = { workspace = true }
 # Agent Runtime 嵌入（Phase 6.1）
-agent-core = { workspace = true }
+rust-agent = { workspace = true }
 futures = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-# Skills 详情 frontmatter 展示（与 agent-core 公开 API 同版本）
+# Skills 详情 frontmatter 展示（与 rust-agent 公开 API 同版本）
 serde_yaml = "0.9"
 chrono = { workspace = true }
 base64 = "0.22"

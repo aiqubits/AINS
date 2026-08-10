@@ -10,10 +10,10 @@ use std::sync::Arc;
 use serde_json::json;
 use wasm_bindgen_test::*;
 
-use agent_core::error::SkillsError;
-use agent_core::memory::{IndexedDbBackend, KvStore, TABLE_KV, now_ms};
-use agent_core::platform::Platform;
-use agent_core::skills::{
+use rust_agent::error::SkillsError;
+use rust_agent::memory::{IndexedDbBackend, KvStore, TABLE_KV, now_ms};
+use rust_agent::platform::Platform;
+use rust_agent::skills::{
     KvSkillStore, SkillContext, SkillLoader, SkillManage, SkillMeta, SkillTrust, skill_checksum,
 };
 

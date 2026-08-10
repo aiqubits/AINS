@@ -3,7 +3,7 @@
 
 use dioxus::prelude::*;
 
-use agent_core::memory::{MemdirEntry, MemdirStore, MemoryHit, format_iso_utc, parse_iso_utc};
+use rust_agent::memory::{MemdirEntry, MemdirStore, MemoryHit, format_iso_utc, parse_iso_utc};
 use ui::{I18nContext, MemoryCard, MemoryViewer};
 
 use crate::agent::service;

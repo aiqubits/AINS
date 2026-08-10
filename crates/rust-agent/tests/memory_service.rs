@@ -11,23 +11,23 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use serde_json::json;
 
-use agent_core::error::{AgentError, MemoryError};
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::memory::kv::{
+use futures::StreamExt;
+use rust_agent::error::{AgentError, MemoryError};
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::memory::kv::{
     TABLE_DOCUMENTS, TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_KV, TABLE_MEMORIES,
 };
-use agent_core::memory::kv_crypto::EncryptionKey;
-use agent_core::memory::{
+use rust_agent::memory::kv_crypto::EncryptionKey;
+use rust_agent::memory::{
     DefaultVectorIndexManager, DurableMemoryMetadata, ExtractionReason, KvStore, MemoryBackend,
     MemoryContext, MemoryEngine, MemoryEntry, MemoryNamespace, MemoryScope, MemoryService,
     MemoryServiceConfig, MemoryStores, MemoryType, Metric, NewMemoryEntry, RedbBackend,
     VectorIndexConfig, VectorIndexManager, build_durable_manifest, extract_digest, is_visible,
     now_ms, open_memory_stores, owner_key_for_id, prepare_encryption, vector_to_value,
 };
-use futures::StreamExt;
 use std::time::Duration;
 
-use agent_core::model_client::{
+use rust_agent::model_client::{
     EventStream, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
 };
 
@@ -1383,8 +1383,8 @@ async fn dimension_mismatch_fails_closed() {
 
 #[tokio::test]
 async fn ciphertext_cannot_cross_table_domains() {
-    use agent_core::error::MemoryError;
-    use agent_core::memory::{EncryptionKey, TABLE_EMBEDDINGS, TABLE_MEMORIES};
+    use rust_agent::error::MemoryError;
+    use rust_agent::memory::{EncryptionKey, TABLE_EMBEDDINGS, TABLE_MEMORIES};
 
     let dir = tempfile::TempDir::new().unwrap();
     let backend = RedbBackend::open(dir.path().join("ains.redb")).unwrap();
@@ -1571,8 +1571,8 @@ async fn encryption_rejects_unreadable_sealed_rows_and_reset_removes_them() {
 
 #[tokio::test]
 async fn kv_legacy_and_table_domain_modes_coexist() {
-    use agent_core::error::MemoryError;
-    use agent_core::memory::{EncryptionKey, TABLE_EMBEDDINGS, TABLE_MEMORIES};
+    use rust_agent::error::MemoryError;
+    use rust_agent::memory::{EncryptionKey, TABLE_EMBEDDINGS, TABLE_MEMORIES};
 
     let dir = tempfile::TempDir::new().unwrap();
     let backend = RedbBackend::open(dir.path().join("ains.redb")).unwrap();
@@ -1660,8 +1660,8 @@ async fn turn_n_written_memory_recalled_on_turn_n_plus_1() {
 
 #[tokio::test]
 async fn legacy_memory_without_dedupe_domain_forgets_via_v1_signature() {
-    use agent_core::memory::manage::content_signature;
-    use agent_core::memory::{TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_MEMORIES};
+    use rust_agent::memory::manage::content_signature;
+    use rust_agent::memory::{TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_MEMORIES};
     let dir = tempfile::TempDir::new().unwrap();
     let backend = RedbBackend::open(dir.path().join("ains.redb")).unwrap();
     let memories: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_MEMORIES));

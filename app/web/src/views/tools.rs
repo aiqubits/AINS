@@ -11,7 +11,7 @@ use dioxus::core::spawn_forever;
 use dioxus::prelude::*;
 use futures::FutureExt;
 
-use agent_core::tools::ToolCategory;
+use rust_agent::tools::ToolCategory;
 use ui::{
     I18nContext, PERSIST_ERROR, PERSIST_IDLE, PERSIST_PENDING, PERSIST_STATE,
     TOOL_STATE_LOAD_ERROR, ToolCardView, ToolCategoryView, ToolPanel, ToolStateBanner,
@@ -31,7 +31,7 @@ use crate::agent::service;
 // PERSIST_IDLE/RUNNING/PENDING）与挂载同步决策（should_sync_persist_error
 // / persist_task_in_flight）同样在 ui crate，供 /tools 与会话视图共用。
 
-/// agent-core 工具分类 → 面板徽标视图（MCP 桥接工具按名称前缀识别，
+/// rust-agent 工具分类 → 面板徽标视图（MCP 桥接工具按名称前缀识别，
 /// 其余按 `Tool::category()` 自报分类）。
 fn to_category_view(name: &str, category: ToolCategory) -> ToolCategoryView {
     if name.starts_with("mcp__") {

@@ -353,7 +353,7 @@ ains/
 │   └── client-api/                  # 类型化客户端 API SDK (chat/embed/stt/tts)
 │
 ├── crates/
-│   ├── agent-core/                  # 客户端 Agent Runtime 核心（Native + WASM）
+│   ├── rust-agent/                  # 客户端 Agent Runtime 核心（Native + WASM）
 │   ├── ains-runtime/                # Runtime trait + 统一请求/响应/错误
 │   ├── ains-axum/                   # Axum 适配器
 │   ├── ains-salvo/                  # Salvo 适配器
@@ -375,9 +375,9 @@ ains/
 
 ---
 
-## 客户端 Agent Runtime（agent-core）
+## 客户端 Agent Runtime（rust-agent）
 
-`crates/agent-core` 是 AINS 的客户端 Agent Runtime 核心，**同一 crate 双目标编译**（Native 与 WASM），业务逻辑只依赖 trait 抽象，平台实现（tokio / wasm-bindgen / redb / IndexedDB）收敛在 cfg 门控文件中按 target 互斥编译。
+`crates/rust-agent` 是 AINS 的客户端 Agent Runtime 核心，**同一 crate 双目标编译**（Native 与 WASM），业务逻辑只依赖 trait 抽象，平台实现（tokio / wasm-bindgen / redb / IndexedDB）收敛在 cfg 门控文件中按 target 互斥编译。
 
 | 模块 | 职责 |
 |------|------|

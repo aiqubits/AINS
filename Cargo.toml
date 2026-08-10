@@ -1,5 +1,5 @@
 [workspace]
-members = ["server", "app/ui", "app/web", "app/desktop", "app/mobile", "app/client-api", "crates/agent-core", "crates/emailserver", "crates/distributed-ratelimit", "crates/ains-runtime", "crates/ains-axum", "crates/ains-salvo", "crates/i18n", "crates/wechat-api"]
+members = ["server", "app/ui", "app/web", "app/desktop", "app/mobile", "app/client-api", "crates/rust-agent", "crates/emailserver", "crates/distributed-ratelimit", "crates/ains-runtime", "crates/ains-axum", "crates/ains-salvo", "crates/i18n", "crates/wechat-api"]
 # resolver = "3" is required for Rust edition 2024
 # Minimum Rust version: 1.92+
 resolver = "3"
@@ -41,7 +41,7 @@ ui = { path = "app/ui" }
 client-api = { path = "app/client-api" }
 
 # Shared crates
-agent-core = { path = "crates/agent-core" }
+rust-agent = { path = "crates/rust-agent" }
 emailserver = { path = "crates/emailserver" }
 distributed-ratelimit = { path = "crates/distributed-ratelimit" }
 
@@ -73,7 +73,7 @@ jsonwebtoken = "9"
 tokio-stream = "0.1"
 futures = "0.3"
 
-# Phase 7.1: 平台沙箱依赖（agent-core native-only）。bwrap 可执行探测（含
+# Phase 7.1: 平台沙箱依赖（rust-agent native-only）。bwrap 可执行探测（含
 # 可执行位与 Windows PATHEXT 处理，优于手动扫 PATH）。
 which = "8"
 

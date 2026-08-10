@@ -3,7 +3,7 @@ use dioxus_icons::lucide::{ChevronDown, ChevronRight, CircleStop, SendHorizontal
 
 use crate::{EN, I18nContext, tf};
 
-/// 消息角色（视图模型，宿主负责从 agent-core 映射，见 AINS_PLAN 6.3）。
+/// 消息角色（视图模型，宿主负责从 rust-agent 映射，见 AINS_PLAN 6.3）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
     User,

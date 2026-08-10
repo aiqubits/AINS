@@ -113,7 +113,7 @@ format/minify/get 通过有界 writer 序列化，避免在共享输出预算介
 
 ## 10. 测试与验收（3.10）
 
-- Native：`cargo test -p agent-core --all-targets` 303 项全过 —— lib 184 +
+- Native：`cargo test -p rust-agent --all-targets` 303 项全过 —— lib 184 +
   core_traits 19 + kernel_loop 24 + memory_native 61 +
   `tests/tool_runtime.rs` 集成 15（plan 拦截端到端、
   确认回调 Allow/Deny/AlwaysAllow、敏感路径 full_auto 兜底、pre_tool_use

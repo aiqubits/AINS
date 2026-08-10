@@ -104,7 +104,7 @@ pub fn sync_persist_error(pending: Option<String>, message: &str) {
     }
 }
 
-/// 工具分类（视图模型，宿主从 agent-core `ToolCategory` 映射；
+/// 工具分类（视图模型，宿主从 rust-agent `ToolCategory` 映射；
 /// `Meta` 对应 AgentInternal——权限/交互类元工具，`Mcp` 为远程桥接）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolCategoryView {

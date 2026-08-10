@@ -79,14 +79,14 @@
 
 ## 8. 验收记录（Phase 1 收尾）
 
-- `cargo test -p agent-core`（Native）：lib 单测 23 项（sanitize 9 / fsm 4 /
+- `cargo test -p rust-agent`（Native）：lib 单测 23 项（sanitize 9 / fsm 4 /
   metadata 3 / context 3 及其他）+ `core_traits.rs` 19 项 + `kernel_loop.rs`
   集成 11 项，全部通过。
 - `kernel_loop.rs` 覆盖：纯文本回复、完整工具循环（会话 4 条 + 第二次请求 3 条
   消息 + work_log 写入）、失败工具合成 is_error 回填、未知工具、max_turns=2 超限
   Failed、Retry→Status 文案、空 assistant 忽略、传输错误存活、新输入触发悬空
   tool_use 修剪、continue_pending 续跑、Shutdown 事件零查询完成。
-- `cargo clippy -p agent-core --all-targets -- -D warnings`：通过（修正
+- `cargo clippy -p rust-agent --all-targets -- -D warnings`：通过（修正
   futures-channel `try_next` 弃用 → `try_recv`）。
-- `cargo build/clippy -p agent-core --target wasm32-unknown-unknown -- -D warnings`：
+- `cargo build/clippy -p rust-agent --target wasm32-unknown-unknown -- -D warnings`：
   通过（内核仅依赖 futures/std，双 target 编译干净）。

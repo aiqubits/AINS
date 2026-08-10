@@ -8,21 +8,21 @@
 
 use wasm_bindgen_test::*;
 
-use agent_core::context::compact::{
+use rust_agent::context::compact::{
     estimate_message_tokens, estimate_tokens, get_autocompact_threshold,
 };
-use agent_core::context::prompt_pipeline::{
+use rust_agent::context::prompt_pipeline::{
     PromptPipelineInput, PromptSections, build_system_prompt, permission_mode_section,
     skills_section,
 };
-use agent_core::kernel::messages::{ContentBlock, ConversationMessage, Role};
-use agent_core::model_client::ModelRequest;
-use agent_core::model_service::{
+use rust_agent::kernel::messages::{ContentBlock, ConversationMessage, Role};
+use rust_agent::model_client::ModelRequest;
+use rust_agent::model_service::{
     ToolTagFilter, build_ai_request, detect_audio_format, parse_assistant_content,
 };
-use agent_core::perception::{FileChannel, PerceptionOutcome};
-use agent_core::policy::PermissionMode;
-use agent_core::skills::SkillSummary;
+use rust_agent::perception::{FileChannel, PerceptionOutcome};
+use rust_agent::policy::PermissionMode;
+use rust_agent::skills::SkillSummary;
 
 wasm_bindgen_test_configure!(run_in_browser);
 
@@ -94,7 +94,7 @@ fn perception_file_text_ingest_and_event_on_web() {
         .into_agent_event(Some("q"))
         .expect("event");
     match event {
-        agent_core::kernel::AgentEvent::UserMessage { content, .. } => {
+        rust_agent::kernel::AgentEvent::UserMessage { content, .. } => {
             assert!(content.contains("q"));
             assert!(content.contains("hi"));
         }
@@ -129,7 +129,7 @@ fn model_service_protocol_helpers_on_web() {
     // 工具协议注入 system prompt
     let request = ModelRequest {
         system_prompt: Some("base".into()),
-        tools: vec![agent_core::tools::ToolDef {
+        tools: vec![rust_agent::tools::ToolDef {
             name: "calc".into(),
             description: "calc".into(),
             input_schema: serde_json::json!({"type": "object"}),

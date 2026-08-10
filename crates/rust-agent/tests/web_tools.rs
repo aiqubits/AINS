@@ -16,17 +16,17 @@ use futures::StreamExt;
 use serde_json::{Map, Value, json};
 use wasm_bindgen_test::*;
 
-use agent_core::hooks::{
+use rust_agent::hooks::{
     CommandHookDefinition, HookDefinition, HookEvent, HookExecutor, HookRegistry,
     PromptHookDefinition,
 };
-use agent_core::kernel::ToolUse;
-use agent_core::model_client::{EventStream, ModelClient, ModelRequest, ModelStreamEvent};
-use agent_core::policy::{PermissionEngine, PermissionMode, PermissionSettings};
-use agent_core::tools::compute::{CalculatorTool, register_compute_tools};
-use agent_core::tools::interact::TodoWriteTool;
-use agent_core::tools::outputs::DEFAULT_TOOL_OUTPUT_INLINE_CHARS;
-use agent_core::tools::{Tool, ToolContext, ToolMetadata, ToolRuntime};
+use rust_agent::kernel::ToolUse;
+use rust_agent::model_client::{EventStream, ModelClient, ModelRequest, ModelStreamEvent};
+use rust_agent::policy::{PermissionEngine, PermissionMode, PermissionSettings};
+use rust_agent::tools::compute::{CalculatorTool, register_compute_tools};
+use rust_agent::tools::interact::TodoWriteTool;
+use rust_agent::tools::outputs::DEFAULT_TOOL_OUTPUT_INLINE_CHARS;
+use rust_agent::tools::{Tool, ToolContext, ToolMetadata, ToolRuntime};
 
 wasm_bindgen_test_configure!(run_in_browser);
 
@@ -198,8 +198,8 @@ async fn oversized_output_keeps_preview_only_without_sink() {
 
     #[async_trait::async_trait(?Send)]
     impl Tool for Big {
-        fn definition(&self) -> agent_core::tools::ToolDef {
-            agent_core::tools::ToolDef {
+        fn definition(&self) -> rust_agent::tools::ToolDef {
+            rust_agent::tools::ToolDef {
                 name: "big".into(),
                 description: "big".into(),
                 input_schema: json!({"type": "object"}),
@@ -214,14 +214,14 @@ async fn oversized_output_keeps_preview_only_without_sink() {
             &self,
             _input: Value,
             _ctx: &mut ToolContext<'_>,
-        ) -> Result<agent_core::tools::ToolResult, agent_core::error::ToolError> {
-            Ok(agent_core::tools::ToolResult::ok(
+        ) -> Result<rust_agent::tools::ToolResult, rust_agent::error::ToolError> {
+            Ok(rust_agent::tools::ToolResult::ok(
                 "W".repeat(DEFAULT_TOOL_OUTPUT_INLINE_CHARS + 7),
             ))
         }
 
-        fn category(&self) -> agent_core::tools::ToolCategory {
-            agent_core::tools::ToolCategory::Compute
+        fn category(&self) -> rust_agent::tools::ToolCategory {
+            rust_agent::tools::ToolCategory::Compute
         }
     }
 
@@ -296,8 +296,8 @@ async fn command_hooks_degrade_gracefully_on_web() {
 
 #[wasm_bindgen_test]
 async fn network_guard_syntax_checks_run_on_web() {
-    use agent_core::policy::NetworkPolicy;
-    use agent_core::tools::network::{
+    use rust_agent::policy::NetworkPolicy;
+    use rust_agent::tools::network::{
         ensure_public_http_url, fetch_public_http_response, validate_http_url,
     };
     assert!(validate_http_url("https://example.com/x").is_ok());
@@ -320,19 +320,19 @@ impl ModelClient for StalledModel {
     async fn stream_response(
         &self,
         _request: ModelRequest,
-    ) -> Result<EventStream<ModelStreamEvent>, agent_core::error::AgentError> {
+    ) -> Result<EventStream<ModelStreamEvent>, rust_agent::error::AgentError> {
         Ok(futures::stream::pending().boxed_local())
     }
 
-    async fn embed(&self, _text: &str) -> Result<Vec<f32>, agent_core::error::AgentError> {
+    async fn embed(&self, _text: &str) -> Result<Vec<f32>, rust_agent::error::AgentError> {
         Ok(Vec::new())
     }
 
-    async fn stt(&self, _audio_data: &[u8]) -> Result<String, agent_core::error::AgentError> {
+    async fn stt(&self, _audio_data: &[u8]) -> Result<String, rust_agent::error::AgentError> {
         Ok(String::new())
     }
 
-    async fn tts(&self, _text: &str) -> Result<Vec<u8>, agent_core::error::AgentError> {
+    async fn tts(&self, _text: &str) -> Result<Vec<u8>, rust_agent::error::AgentError> {
         Ok(Vec::new())
     }
 }

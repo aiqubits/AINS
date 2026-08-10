@@ -359,7 +359,7 @@ pub enum AiStreamEvent {
     },
 }
 
-/// SSE 事件流：Native 端要求 `Send`，WASM 端为本地流（与 agent-core
+/// SSE 事件流：Native 端要求 `Send`，WASM 端为本地流（与 rust-agent
 /// `EventStream` 同一 cfg 收敛策略）。
 #[cfg(not(target_arch = "wasm32"))]
 pub type AiEventStream = futures::stream::BoxStream<'static, Result<AiStreamEvent, ClientError>>;
