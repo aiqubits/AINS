@@ -313,7 +313,9 @@ mod tests {
 
     struct RecordingWriter(Arc<Mutex<Option<NewMemoryEntry>>>);
 
-    #[async_trait::async_trait]
+    // 与 trait 声明保持同一平台条件：wasm 下 `?Send`，native 下 `Send`。
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     impl MemoryWriter for RecordingWriter {
         async fn write(&self, record: NewMemoryEntry) -> Result<String, MemoryError> {
             *self.0.lock().unwrap() = Some(record);
@@ -321,7 +323,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     async fn memory_write_uses_the_attached_writer_boundary() {
         let captured = Arc::new(Mutex::new(None));
         let tool = MemoryWriteTool::new();
