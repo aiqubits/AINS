@@ -1,5 +1,4 @@
 /* ConfirmDialog —— 通用确认弹窗组件 */
-@import url("/assets/styling/button.css");
 
 /* ── 确认弹窗专用：弹窗卡片使用纯白不透明背景，覆盖 ui modal 的毛玻璃效果 ── */
 .ains-confirm-dialog .ains-modal__card {
