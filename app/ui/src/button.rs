@@ -13,11 +13,7 @@ pub fn Button(
     #[props(default = false)] full_width: bool,
     #[props(default = false)] loading: bool,
 ) -> Element {
-    let class = if full_width {
-        "ains-btn ains-btn--primary ains-btn--block"
-    } else {
-        "ains-btn ains-btn--primary"
-    };
+    let class = button_class(full_width, button_type);
 
     let type_attr = match button_type {
         ButtonType::Button => "button",
@@ -44,12 +40,47 @@ pub fn Button(
     }
 }
 
+fn button_class(full_width: bool, button_type: ButtonType) -> &'static str {
+    match (full_width, button_type) {
+        (true, ButtonType::Danger) => "ains-btn ains-btn--danger ains-btn--block",
+        (false, ButtonType::Danger) => "ains-btn ains-btn--danger",
+        (true, _) => "ains-btn ains-btn--primary ains-btn--block",
+        (false, _) => "ains-btn ains-btn--primary",
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ButtonType {
     #[default]
     Button,
     Submit,
     /// Danger-style button for destructive actions (e.g., "log out all devices").
-    /// Renders as a regular HTML button; visual styling is applied via CSS.
+    /// Renders as a regular HTML button; the red gradient is provided via
+    /// `button.css` (`.ains-btn--danger`, shared across all platforms).
     Danger,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ButtonType, button_class};
+
+    #[test]
+    fn button_variants_include_the_base_class_and_expected_variant() {
+        assert_eq!(
+            button_class(false, ButtonType::Button),
+            "ains-btn ains-btn--primary"
+        );
+        assert_eq!(
+            button_class(true, ButtonType::Submit),
+            "ains-btn ains-btn--primary ains-btn--block"
+        );
+        assert_eq!(
+            button_class(false, ButtonType::Danger),
+            "ains-btn ains-btn--danger"
+        );
+        assert_eq!(
+            button_class(true, ButtonType::Danger),
+            "ains-btn ains-btn--danger ains-btn--block"
+        );
+    }
 }

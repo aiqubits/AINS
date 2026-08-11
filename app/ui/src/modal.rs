@@ -25,35 +25,33 @@ pub fn Modal(
     let i18n = try_use_context::<I18nContext>();
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
 
-    if !open {
-        return rsx! {};
-    }
-
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/modal.css") }
-        div {
-            class: "ains-modal__backdrop",
-            onclick: move |e| {
-                if !disable_backdrop {
-                    on_close.call(e);
-                }
-            },
-        }
-        div { class: "ains-modal__wrap", role: "dialog", aria_modal: "true",
-            div { class: "ains-modal__card",
-                header { class: "ains-modal__header",
-                    h3 { class: "ains-modal__title", "{title}" }
-                    if !hide_close {
-                        button {
-                            class: "ains-modal__close",
-                            r#type: "button",
-                            aria_label: t.modal_close,
-                            onclick: move |e| on_close.call(e),
-                            X {}
+        if open {
+            div {
+                class: "ains-modal__backdrop",
+                onclick: move |e| {
+                    if !disable_backdrop {
+                        on_close.call(e);
+                    }
+                },
+            }
+            div { class: "ains-modal__wrap", role: "dialog", aria_modal: "true",
+                div { class: "ains-modal__card",
+                    header { class: "ains-modal__header",
+                        h3 { class: "ains-modal__title", "{title}" }
+                        if !hide_close {
+                            button {
+                                class: "ains-modal__close",
+                                r#type: "button",
+                                aria_label: t.modal_close,
+                                onclick: move |e| on_close.call(e),
+                                X {}
+                            }
                         }
                     }
+                    div { class: "ains-modal__body", {children} }
                 }
-                div { class: "ains-modal__body", {children} }
             }
         }
     }

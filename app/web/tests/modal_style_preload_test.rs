@@ -12,10 +12,20 @@ use dioxus::prelude::*;
 use dioxus_core::ScopeId;
 
 const GLOBAL_STYLES: &str = include_str!("../../ui/src/global_styles.rs");
+const CONFIRM_DIALOG_RS: &str = include_str!("../src/components/confirm_dialog.rs");
 const CONFIRM_DIALOG_CSS: &str = include_str!("../assets/components/confirm_dialog.css");
+const BUTTON_CSS: &str = include_str!("../../ui/assets/styling/button.css");
 const WEB_APP: &str = include_str!("../src/main.rs");
 const DESKTOP_APP: &str = include_str!("../../desktop/src/main.rs");
 const MOBILE_APP: &str = include_str!("../../mobile/src/main.rs");
+
+/// 匹配独立 CSS 规则行，而非注释或任意子串。这样删除实际选择器时，
+/// 测试不会被文档中的类名误满足。
+fn has_css_selector(stylesheet: &str, selector: &str) -> bool {
+    stylesheet
+        .lines()
+        .any(|line| line.trim() == format!("{selector} {{"))
+}
 
 /// 测试用 Document：捕获 Dioxus 在首轮渲染中真正注册到 document head 的 link。
 #[derive(Default)]
@@ -41,6 +51,25 @@ impl Document for CapturingDocument {
 fn GlobalStylesTestApp() -> Element {
     rsx! {
         ui::GlobalStyles {}
+    }
+}
+
+#[component]
+fn ClosedModalTestApp() -> Element {
+    rsx! {
+        ui::Modal {
+            title: "Test modal".to_string(),
+            on_close: |_| {},
+            open: false,
+            "Modal content"
+        }
+    }
+}
+
+#[component]
+fn ButtonTestApp() -> Element {
+    rsx! {
+        ui::Button { onclick: None, "Test button" }
     }
 }
 
@@ -76,6 +105,39 @@ fn global_styles_registers_primitives_in_the_document_head_on_first_render() {
 }
 
 #[test]
+fn standalone_ui_primitives_register_their_stylesheets_when_rendered() {
+    let document = Rc::new(CapturingDocument::default());
+    let document_context: Rc<dyn Document> = document.clone();
+    let mut dom = VirtualDom::new(ClosedModalTestApp);
+    dom.in_scope(ScopeId::ROOT, || provide_context(document_context));
+    dom.rebuild_in_place();
+
+    assert!(
+        document
+            .stylesheet_hrefs
+            .borrow()
+            .iter()
+            .any(|href| href.ends_with("modal.css")),
+        "关闭状态的 ui::Modal 也必须注册 modal.css，保证独立宿主首次打开时不会出现无样式内容"
+    );
+
+    let document = Rc::new(CapturingDocument::default());
+    let document_context: Rc<dyn Document> = document.clone();
+    let mut dom = VirtualDom::new(ButtonTestApp);
+    dom.in_scope(ScopeId::ROOT, || provide_context(document_context));
+    dom.rebuild_in_place();
+
+    assert!(
+        document
+            .stylesheet_hrefs
+            .borrow()
+            .iter()
+            .any(|href| href.ends_with("button.css")),
+        "ui::Button 必须在独立宿主中注册 button.css"
+    );
+}
+
+#[test]
 fn every_application_root_mounts_global_styles() {
     for (platform, source) in [
         ("web", WEB_APP),
@@ -94,5 +156,48 @@ fn confirm_dialog_does_not_bypass_hashed_button_asset() {
     assert!(
         !CONFIRM_DIALOG_CSS.contains("@import"),
         "ConfirmDialog 不得用固定 URL @import button.css；应由 GlobalStyles 的 asset! 链接加载"
+    );
+}
+
+#[test]
+fn confirm_dialog_does_not_duplicate_shared_spinner_keyframes() {
+    assert!(
+        !CONFIRM_DIALOG_CSS.contains("@keyframes ains-spin"),
+        "ains-spin 仅应由共享 button.css 定义，避免 ConfirmDialog 的重复关键帧伪装成不完整的后备样式"
+    );
+}
+
+/// ConfirmDialog 必须自行通过 asset! 引入对话框专用样式表；基础按钮/弹窗
+/// 样式则由 GlobalStyles 首屏预加载。移除该 link 会导致对话框无样式。
+#[test]
+fn confirm_dialog_links_its_own_stylesheet() {
+    assert!(
+        CONFIRM_DIALOG_RS.contains("asset!(\"/assets/components/confirm_dialog.css\")"),
+        "ConfirmDialog 必须通过 asset! 引入 confirm_dialog.css，否则对话框专用样式不会被打包"
+    );
+}
+
+/// 基础 button.css 必须显式声明 `.ains-btn--primary` 语义别名：所有 primary
+/// 按钮同时携带 `ains-btn ains-btn--primary` 两个类。若该选择器缺失，未来
+/// 修改 `.ains-btn` 基础外观会使 primary 按钮静默失去品牌渐变且无任何告警。
+#[test]
+fn button_css_defines_primary_semantic_alias() {
+    assert!(
+        has_css_selector(BUTTON_CSS, ".ains-btn--primary"),
+        "button.css 必须定义 `.ains-btn--primary`（与 .ains-btn 并列的语义别名）"
+    );
+}
+
+/// 基础 button.css 必须提供 `.ains-btn--danger`，由 ui::Button 的单元测试
+/// 验证其变体类组合，避免在此依赖源码字符串和格式。
+#[test]
+fn shared_button_css_defines_danger_variant() {
+    assert!(
+        has_css_selector(BUTTON_CSS, ".ains-btn--danger"),
+        "button.css 必须定义 `.ains-btn--danger`（破坏性操作的红色渐变样式，跨平台共享）"
+    );
+    assert!(
+        !CONFIRM_DIALOG_CSS.contains(".ains-btn--danger"),
+        "confirm_dialog.css 不应重复定义 `.ains-btn--danger`（已统一由 button.css 提供）"
     );
 }

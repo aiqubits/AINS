@@ -1,5 +1,10 @@
-/* Button — 唯一 CTA 变体 */
-.ains-btn {
+/* Button — 唯一 CTA 变体。`.ains-btn--primary` 是 `.ains-btn` 的语义别名：
+   primary 按钮总是同时携带两个类，二者必须同步演进；若未来将基础外观
+   改为中性，必须同步确认 primary 语义仍保持品牌渐变。
+   `ains-btn--primary` 必须与基础类 `ains-btn` 联用，不得单独使用 ——
+   hover/active/disabled 伪类仍挂在 `.ains-btn` 上。 */
+.ains-btn,
+.ains-btn--primary {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -41,6 +46,27 @@
 
 .ains-btn--block {
   width: 100%;
+}
+
+/* Danger 变体：破坏性操作（如登出所有设备）。红色渐变，跨平台共享 ——
+   定义在公共 button.css，不依赖 web 端组件私有样式。 */
+.ains-btn--danger {
+  color: #ffffff;
+  background: linear-gradient(135deg, #ef4444, #dc2626);
+  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+}
+
+.ains-btn--danger:hover:not(:disabled) {
+  box-shadow: 0 6px 16px rgba(239, 68, 68, 0.4);
+  filter: brightness(1.08);
+}
+
+.ains-btn--danger:active:not(:disabled) {
+  filter: brightness(0.95);
+}
+
+.ains-btn--danger:disabled {
+  box-shadow: none;
 }
 
 .ains-btn__spinner {

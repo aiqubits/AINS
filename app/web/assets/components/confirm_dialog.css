@@ -49,35 +49,3 @@
   transform: translateY(0);
   background: rgba(148, 163, 184, 0.12);
 }
-
-/* ── 危险按钮（确认破坏性操作，仅覆写 .ains-btn 的差异属性） ── */
-.ains-btn--danger {
-  color: #ffffff;
-  background: linear-gradient(135deg, #ef4444, #dc2626);
-  box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
-}
-
-.ains-btn--danger:hover:not(:disabled) {
-  box-shadow: 0 6px 16px rgba(239, 68, 68, 0.4);
-  filter: brightness(1.08);
-}
-
-.ains-btn--danger:active:not(:disabled) {
-  filter: brightness(0.95);
-}
-
-.ains-btn--danger:disabled {
-  box-shadow: none;
-}
-
-/* ── Danger 按钮加载中的 spinner 与 ains-btn 共用 ── */
-.ains-btn--danger .ains-btn__spinner {
-  width: 14px;
-  height: 14px;
-  animation: ains-spin 1s linear infinite;
-}
-
-/* @keyframes 回退定义：确保 button.css 未加载时 spinner 仍可旋转 */
-@keyframes ains-spin {
-  to { transform: rotate(360deg); }
-}
