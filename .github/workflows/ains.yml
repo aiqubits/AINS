@@ -60,6 +60,18 @@ jobs:
         # CI PostgreSQL uses password 'CHANGE_ME_POSTGRES_PASSWORD' as configured in the service
         echo "AINS_DATABASE_URL=postgres://postgres:CHANGE_ME_POSTGRES_PASSWORD@127.0.0.1:5432/ains" >> $GITHUB_ENV
 
+    # 静态检查与动态环境解耦：clippy 不依赖 Postgres/Redis，放在复制集群
+    # setup 之前执行——services 故障时仍能拿到静态检查结果并快速失败。
+    # fmt（全 workspace）由 rust-agent job 执行（本 job 已移除，避免重复）。
+    - name: Lint (Clippy)
+      run: |
+        cargo clippy --package ains-server --all-targets -- -D warnings
+        cargo clippy --package ains-server --features ains-salvo --all-targets -- -D warnings
+        # 共享 crate（server 的 path 依赖）的单测/lint 曾被 `-p ains-server` 跳过
+        # （clippy/test 只作用于指定包自身）：同 job 补齐验证（均为离线单测，
+        # 无 DB/Redis 依赖，仅复用 job 内已有的编译缓存与 services 环境）。
+        cargo clippy --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --all-targets -- -D warnings
+
     # ================================================================
     # PostgreSQL Streaming Replication Setup
     # ================================================================
@@ -166,36 +178,26 @@ jobs:
         docker exec "$PRIMARY" psql -U postgres -c \
           "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='root') THEN CREATE ROLE root WITH LOGIN; END IF; END \$\$;"
 
-    - name: Format Check
-      run: cargo fmt --check
-    - name: Lint (Clippy)
-      run: cargo clippy --package ains-server --all-targets -- -D warnings
-    - name: Lint (Clippy - Salvo)
-      run: cargo clippy --package ains-server --features ains-salvo --all-targets -- -D warnings
-    # 共享 crate（server 的 path 依赖）的单测/lint 曾被 `-p ains-server` 跳过
-    # （clippy/test 只作用于指定包自身）：同 job 补齐验证（均为离线单测，
-    # 无 DB/Redis 依赖，仅复用 job 内已有的编译缓存与 services 环境）。
-    - name: Lint (Clippy - Shared Crates)
-      run: cargo clippy --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --all-targets -- -D warnings
-    - name: Run Server Tests (Axum)
-      run: cargo test --package ains-server --verbose
-    - name: Run Shared Crate Tests
-      run: cargo test --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --verbose
-    # wechat-api 的 store/login 测试由非默认 feature memory-store 门控
-    # （离线内存实现，已实测 47 passed），单独开启补齐覆盖
-    - name: Run WeChat API Tests (memory-store)
-      run: cargo test --package wechat-api --features memory-store --verbose
-
-    - name: Run Server Tests (Salvo)
-      run: >
-        cargo test --package ains-server --features ains-salvo
-        --test salvo_integration_tests
-        --test salvo_logout_all_test
-        --test salvo_ratelimit_test
-        --verbose
-
-    - name: Run Replica Circuit Breaker Tests
-      run: cargo test --package ains-server --test replica_circuit_breaker_test --verbose
+    # replica_circuit_breaker_test 无 feature 门控，已包含在上面的默认
+    # `cargo test -p ains-server` 中，不再单独重复执行。
+    - name: Run Tests
+      run: |
+        echo "=== ains-server (default) ==="
+        cargo test --package ains-server --verbose
+        echo "=== shared crates ==="
+        cargo test --package ains-runtime --package ains-axum --package ains-salvo --package distributed-ratelimit --package emailserver --package wechat-api --verbose
+        # wechat-api 的 store/login 测试由非默认 feature memory-store 门控
+        # （离线内存实现，已实测 47 passed），单独开启补齐覆盖
+        echo "=== wechat-api (memory-store) ==="
+        cargo test --package wechat-api --features memory-store --verbose
+        # Salvo 后端测试由 ains-salvo feature 门控（默认 test 步骤不含）
+        echo "=== ains-server (salvo) ==="
+        cargo test --package ains-server --features ains-salvo \
+          --test salvo_integration_tests \
+          --test salvo_logout_all_test \
+          --test salvo_plan_test \
+          --test salvo_ratelimit_test \
+          --verbose
 
   # ========================================
   # Frontend - Web CI
@@ -273,8 +275,7 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "client-api"
-    # fmt 由 server / rust-agent job 的 `cargo fmt --check`（全 workspace）覆盖
-    # （rust-agent 无 services 依赖，作为 server job 容器故障时的兜底）
+    # fmt 由 rust-agent job 的 `cargo fmt --check`（全 workspace）覆盖
     - name: Lint (Clippy)
       run: cargo clippy --package client-api --all-targets -- -D warnings
     - name: Install wasm32 target
@@ -282,8 +283,7 @@ jobs:
     # clippy 已隐含编译检查，无需单独的 wasm32 check 步骤
     - name: Check WASM (Clippy)
       run: cargo clippy --package client-api --target wasm32-unknown-unknown -- -D warnings
-    - name: Build Client API
-      run: cargo build --package client-api --verbose
+    # cargo test 已含编译，不单独 build（避免重复编译同一目标）
     - name: Run Client API Tests
       run: cargo test --package client-api --verbose
 
@@ -298,8 +298,8 @@ jobs:
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "rust-agent"
-    # fmt 兜底：server job 的 `cargo fmt --check`（全 workspace）依赖 Postgres/Redis
-    # services 启动成功；本 job 无 services 依赖，容器故障时仍能执行格式检查。
+    # fmt（全 workspace）唯一执行点：server job 的 fmt 已移除，静态检查与
+    # Postgres/Redis services 解耦；本 job 无 services 依赖，稳定执行。
     - name: Format Check
       run: cargo fmt --check
     - name: Lint (Clippy, native)
@@ -345,10 +345,12 @@ jobs:
     # desktop 经 #[path] 复用 web 端 views/tools.rs 与 agent/service.rs
     # （含 #[test]）：cargo test 实际执行这些复用测试（本地 74 passed），
     # 验证 crate::test_shared 在 desktop 的解析与全局信号串行锁行为。
-    - name: Test
-      run: cargo test --package desktop --verbose
-    - name: Build
-      run: cargo build --package desktop --verbose
+    # Test 与 Build 合并为单步骤：bin-only crate 的 `cargo test` 仅以
+    # test-harness 形态编译，保留 `cargo build` 验证正式二进制构建。
+    - name: Test & Build
+      run: |
+        cargo test --package desktop --verbose
+        cargo build --package desktop --verbose
 
   # ========================================
   # Security - dependency vulnerability audit
