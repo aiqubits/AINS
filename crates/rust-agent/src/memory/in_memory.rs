@@ -120,7 +120,9 @@ mod tests {
     async fn in_memory_kv_list_prefix_filters_expired_and_other_prefixes() {
         let kv = InMemoryKvStore::default();
         kv.set("p:x", &json!(1), None).await.unwrap();
-        kv.set("p:y", &json!(2), Some(Duration::ZERO)).await.unwrap();
+        kv.set("p:y", &json!(2), Some(Duration::ZERO))
+            .await
+            .unwrap();
         kv.set("q:z", &json!(3), None).await.unwrap();
         // 0ms TTL：写入时点即已过期（at <= now），读路径（get/list）惰性过滤，
         // 不残留。不依赖 sleep，native 与 wasm（无 tokio::time）行为一致。
