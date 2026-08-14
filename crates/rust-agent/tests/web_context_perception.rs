@@ -55,7 +55,11 @@ fn prompt_pipeline_sections_toggle_on_web() {
     }];
     // 索引段输出为数据记录格式（name/description 均 Debug 引号化，见
     // prompt_pipeline::skills_section）：与 native 单测断言保持一致。
-    assert!(skills_section(&skills).unwrap().contains(r#"- name="pdf"; description="PDF""#));
+    assert!(
+        skills_section(&skills)
+            .unwrap()
+            .contains(r#"- name="pdf"; description="PDF""#)
+    );
 
     let input = PromptPipelineInput {
         cwd: std::path::Path::new("/tmp/ains-web-none"),
