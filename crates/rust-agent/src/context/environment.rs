@@ -1,4 +1,4 @@
-//! Environment 段探测（Phase 5.3，对齐 OpenHarness `prompts/environment.py`
+//! Environment 段探测（Phase 5.3，对齐 Harness `prompts/environment.py`
 //! 与 `_format_environment_section`）。
 //!
 //! 纯数据结构 + 渲染，不产生子进程、不读配置文件（对齐 AINS_PLAN 附录 C

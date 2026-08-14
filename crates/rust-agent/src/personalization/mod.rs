@@ -1,6 +1,6 @@
 //! 个性化（AINS_PLAN 7+.5）：会话后偏好提取 → 规则注入回路。
 //!
-//! 对齐 OpenHarness `personalization/`（`extractor` + `rules` + `session_hook`）：
+//! 对齐 Harness `personalization/`（`extractor` + `rules` + `session_hook`）：
 //! 无 LLM 的**正则启发式**从会话文本抽取用户偏好 / 本地环境事实，合并去重后以
 //! markdown 规则文档持久化（`PreferenceStore`，双 target KvStore），下次会话由
 //! [`rules_prompt_section`] 注入 System Prompt——形成"提取→存储→注入"闭环。

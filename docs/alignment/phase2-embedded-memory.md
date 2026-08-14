@@ -1,6 +1,6 @@
 # Phase 2 对齐清单：Embedded Memory
 
-对齐基线：`OpenHarness/src/openharness/memory/`（`memdir.py` / `schema.py` /
+对齐基线：`Harness/src/harness/memory/`（`memdir.py` / `schema.py` /
 `manager.py`）与 `services/`（`memory_extract.py` / `session_memory.py`）
 （提交时仓库内版本）。基线无本地 KV / 向量索引 / 文档分块对应物，
 这三层按 AINS_PLAN 第四章设计实现，逐条记录为 AINS 扩展。
@@ -78,7 +78,7 @@ DocumentStore + Parser、记忆管理策略、memdir、durable 抽取 + 会话�
 
 | 能力点 | 基线 | AINS | 结论 |
 |---|---|---|---|
-| system prompt | `EXTRACTION_SYSTEM_PROMPT` | 逐字相同（含 "OpenHarness durable memory" 表述，保留基线名词） | 对齐 |
+| system prompt | `EXTRACTION_SYSTEM_PROMPT` | 逐字相同（含 "Harness durable memory" 表述，保留基线名词） | 对齐 |
 | gating | <2 条消息跳过；本会话已写记忆跳过 | `maybe_extract(messages, memory_writes_since_last)` 同语义 | 对齐 |
 | 清单 | ≤80 文件，`[{type}] {path} ({age}) - {desc}` | `build_manifest` 同格式（age = "today"/"{n}d"） | 对齐 |
 | 转写 | 最近 12 条、单条 1200 字符；`{role}: {text}` / `tool calls -> names` / `[non-text content]` | `format_transcript` 同格式 | 对齐 |

@@ -1,4 +1,4 @@
-//! Policy 层：三态权限引擎 + Sandbox（对齐 OpenHarness `permissions/` + `sandbox/`）。
+//! Policy 层：三态权限引擎 + Sandbox（对齐 Harness `permissions/` + `sandbox/`）。
 
 pub mod permission_engine;
 pub mod sandbox;

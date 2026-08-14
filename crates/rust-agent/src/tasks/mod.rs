@@ -2,7 +2,7 @@
 //!
 //! Native 先行：后台任务本质是子进程/长时运行，依赖 `tokio::process` +
 //! `tokio::spawn`，故本模块仅在非 wasm 目标编译（Web 端无子进程模型）。
-//! 对齐 OpenHarness `tasks/`（`BackgroundTaskManager` + `TaskRecord`/`TaskStatus`
+//! 对齐 Harness `tasks/`（`BackgroundTaskManager` + `TaskRecord`/`TaskStatus`
 //! + `task_run`/`stop`/`list`/`update`/`output` 面）。
 //!
 //! 任务状态机：Running →（完成）Completed/Failed；`stop` 抢占 → Killed。

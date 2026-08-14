@@ -417,7 +417,8 @@ async fn memdir_add_scan_remove_and_prompt() {
     assert!(index.contains("- [Build Setup](build_setup.md)"));
 
     // 同签名去重：返回既有文件名，不重复建条目；基线刷新语义：
-    // 标题/正文以新写入为准（索引行保留旧标题，同基线）
+    // 标题/正文以新写入为准，索引行同步更新为新标题（upsert），
+    // 避免 MEMORY.md 索引标题与条目 frontmatter 的 name 不一致。
     let dup = store
         .add_entry(NewMemoryEntry {
             title: "Build Setup Again".into(),
@@ -433,6 +434,11 @@ async fn memdir_add_scan_remove_and_prompt() {
     assert_eq!(entries[0].name, "Build Setup Again");
     assert!(entries[0].body.contains("CARGO BUILD"));
     assert!(entries[0].id.starts_with("mem-"));
+
+    // 刷新后的索引行标题必须与条目一致（P2 回归）
+    let index = store.read_index().await.unwrap().unwrap();
+    assert!(!index.contains("[Build Setup]"));
+    assert!(index.contains("- [Build Setup Again](build_setup.md)"));
 
     let prompt = store.load_memory_prompt().await.unwrap();
     assert!(prompt.contains("```md"));
@@ -450,6 +456,132 @@ async fn memdir_add_scan_remove_and_prompt() {
             .contains("build_setup.md")
     );
     assert!(!store.remove_entry("build_setup").await.unwrap());
+}
+
+#[tokio::test]
+async fn memdir_clear_entries_hides_all_entries_and_clears_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = open_backend(&dir);
+    let store = MemdirStore::new(Arc::new(backend.table(TABLE_KV)));
+    for title in ["Build", "Deploy"] {
+        store
+            .add_entry(NewMemoryEntry {
+                title: title.to_string(),
+                description: format!("{title} workflow"),
+                body: format!("{title} steps"),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(store.clear_entries().await.unwrap(), 2);
+    assert!(store.scan(20).await.unwrap().is_empty());
+    assert_eq!(store.read_index().await.unwrap(), None);
+    // 已清空时应幂等，不能重复计数。
+    assert_eq!(store.clear_entries().await.unwrap(), 0);
+}
+
+// ── Fix 回归：clear_entries 连同损坏行一并清除（L4 收敛）──
+
+#[tokio::test]
+async fn memdir_clear_entries_removes_corrupt_rows_too() {
+    let dir = tempfile::tempdir().unwrap();
+    // 先写入一条合法条目。
+    {
+        let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+        let store = MemdirStore::new(kv);
+        store
+            .add_entry(NewMemoryEntry {
+                title: "Build".into(),
+                body: "original build body".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    // 再注入一条损坏行（Envelope 合法但 JSON 载荷非法）。
+    {
+        let payload = b"not jso";
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        use redb::TableDefinition;
+        let def: TableDefinition<&str, &[u8]> = TableDefinition::new(TABLE_KV);
+        let db = redb::Database::open(dir.path().join("ains.redb")).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(def).unwrap();
+            table
+                .insert("memdir/entries/broken.md", bytes.as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+    // clear 应把损坏行一并清除，计数包含损坏条目，索引同步清空。
+    {
+        let kv: Arc<dyn KvStore> = Arc::new(
+            RedbBackend::open(dir.path().join("ains.redb"))
+                .unwrap()
+                .table(TABLE_KV),
+        );
+        let store = MemdirStore::new(kv);
+        assert_eq!(
+            store.clear_entries().await.unwrap(),
+            2,
+            "legal + corrupt rows must all be removed"
+        );
+        assert!(store.scan(20).await.unwrap().is_empty());
+        assert_eq!(store.read_index().await.unwrap(), None);
+        // 清空后可正常重新写入（索引重建，无残留空行）。
+        store
+            .add_entry(NewMemoryEntry {
+                title: "Rebuilt".into(),
+                body: "fresh body".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let entries = store.scan(20).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Rebuilt");
+        assert_eq!(
+            store.read_index().await.unwrap().unwrap(),
+            "- [Rebuilt](rebuilt.md)\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn memdir_exact_id_delete_cannot_match_another_entries_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+    let store = MemdirStore::new(kv);
+
+    store
+        .add_entry(NewMemoryEntry {
+            title: "Target".into(),
+            body: "target body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let target_id = store.scan(10).await.unwrap()[0].id.clone();
+    store
+        .add_entry(NewMemoryEntry {
+            // The UI passes `target_id`; a fuzzy deletion API must not select
+            // this separate record merely because its title happens to match.
+            title: target_id.clone(),
+            body: "different body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    assert!(store.delete_entry_by_id(&target_id).await.unwrap());
+    let entries = store.scan(10).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].name, target_id);
 }
 
 #[tokio::test]
@@ -632,6 +764,52 @@ async fn memdir_index_lines_are_anchored_on_filename() {
     let index = store.read_index().await.unwrap().unwrap();
     assert!(index.contains("(web_build.md)"));
     assert!(!index.contains("(build.md)"));
+}
+
+#[tokio::test]
+async fn memdir_append_index_sanitizes_title_like_upsert() {
+    // 修复回归（review P3）：append 路径（新条目）与 upsert 刷新路径
+    // 必须用同一清洗口径，否则标题含换行/`]` 会破坏 `- [title](file)`
+    // 索引行的 markdown 链接结构（换行分裂多行、`]` 提前闭合链接）。
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+    let store = MemdirStore::new(kv);
+
+    let filename = store
+        .add_entry(NewMemoryEntry {
+            title: "Build\nnotes [v1]".into(),
+            body: "body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let index = store.read_index().await.unwrap().unwrap();
+    // 换行与方括号被剥除，索引保持单行、链接结构完好
+    assert_eq!(
+        index,
+        format!("- [Buildnotes v1]({filename})\n"),
+        "append index line must sanitize title exactly like upsert"
+    );
+    assert_eq!(
+        index.lines().count(),
+        1,
+        "title newline must not split index"
+    );
+
+    // 相同 body 再 add 走刷新（upsert）路径：与 append 同口径清洗，
+    // 且不产生重复索引行（slugify("Build\nnotes [v1]") == "build_notes_v1"）
+    let updated = store
+        .add_entry(NewMemoryEntry {
+            title: "Build\nnotes [v1]".into(),
+            body: "body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(updated, filename);
+    let index = store.read_index().await.unwrap().unwrap();
+    assert_eq!(index.matches("(build_notes_v1.md)").count(), 1);
 }
 
 // ── Review 回归：H2 软删除后 re-add 恢复索引行；M3 同名条目不被禁用项遮蔽 ──
@@ -2584,6 +2762,109 @@ async fn memdir_scan_survives_corrupt_entry_row() {
         .await
         .unwrap();
     assert_eq!(store.scan(10).await.unwrap().len(), 2);
+}
+
+// ── Fix 回归：损坏行文件名被复用自愈（M2）──
+
+#[tokio::test]
+async fn memdir_reuses_corrupt_row_filename_self_heals() {
+    let dir = tempfile::tempdir().unwrap();
+    // 先写入一条合法条目，产生 `build.md` 文件名。
+    {
+        let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+        let store = MemdirStore::new(kv);
+        store
+            .add_entry(NewMemoryEntry {
+                title: "Build".into(),
+                body: "original build body".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+    // 把 `build.md` 的行替换为 Envelope 合法但 JSON 载荷非法的损坏行，
+    // 模拟条目被写坏（`list_prefix` 能列出该键，`scan_raw`/`get` 报
+    // Serialization）。
+    {
+        let payload = b"not jso";
+        let mut bytes = vec![0u8];
+        bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(payload);
+        use redb::TableDefinition;
+        let def: TableDefinition<&str, &[u8]> = TableDefinition::new(TABLE_KV);
+        let db = redb::Database::open(dir.path().join("ains.redb")).unwrap();
+        let write = db.begin_write().unwrap();
+        {
+            let mut table = write.open_table(def).unwrap();
+            table
+                .insert("memdir/entries/build.md", bytes.as_slice())
+                .unwrap();
+        }
+        write.commit().unwrap();
+    }
+    // 同名但不同正文：不触发签名去重，`unique_filename` 应识别该键为损坏
+    // 行并复用 `build.md`（而非退避成 `build_2.md`），随后覆写完成自愈。
+    {
+        let kv: Arc<dyn KvStore> = Arc::new(
+            RedbBackend::open(dir.path().join("ains.redb"))
+                .unwrap()
+                .table(TABLE_KV),
+        );
+        let store = MemdirStore::new(kv);
+        let filename = store
+            .add_entry(NewMemoryEntry {
+                title: "Build".into(),
+                body: "rebuilt build body".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(filename, "build.md", "corrupt row filename must be reused");
+        let entries = store.scan(10).await.unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "corrupt row must be healed, not duplicated"
+        );
+        assert_eq!(entries[0].body.trim(), "rebuilt build body");
+    }
+}
+
+// ── Fix 回归：upsert 索引行不产生多余空行且清洗标题（L2）──
+
+#[tokio::test]
+async fn memdir_upsert_index_line_no_double_newline_and_sanitizes_title() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(open_backend(&dir).table(TABLE_KV));
+    let store = MemdirStore::new(kv);
+
+    // 初次写入产生单行索引：`- [Alpha](alpha.md)\n`。
+    store
+        .add_entry(NewMemoryEntry {
+            title: "Alpha".into(),
+            body: "same body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    // 同签名（同 body）再写 → 去重刷新走 `upsert_index_line`，标题含
+    // `[`/`]` 应被清洗，且重写后不能出现多余空行。
+    store
+        .add_entry(NewMemoryEntry {
+            title: "Be]ta[".into(),
+            body: "same body".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let index = store.read_index().await.unwrap().unwrap();
+    assert_eq!(
+        index, "- [Beta](alpha.md)\n",
+        "title sanitized and no double trailing newline; got: {index:?}"
+    );
+    assert!(!index.contains("\n\n"), "no blank lines allowed: {index:?}");
 }
 
 // ── Fix 回归：文档 meta 损坏不阻断 list / 重新索引 ──

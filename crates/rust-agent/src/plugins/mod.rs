@@ -1,13 +1,14 @@
 //! Plugin System（AINS_PLAN 7+.2）：聚合贡献包，把
-//! **skills / commands / tools / hooks / MCP** 五个注册面统一注入运行时。
-//! 对齐 OpenHarness `plugins/` 的 `LoadedPlugin`（manifest + 五类贡献）。
+//! **commands / tools / hooks / MCP** 四个注册面统一注入运行时。
+//! Skill packages are deliberately excluded: user-issued `/skill-create` is
+//! the only path that can persist a Skill.
 //!
 //! 与基线的有意偏差：Python 插件可动态加载工具代码；AINS 是**编译型双 target**
 //! 运行时（wasm 无动态原生加载），故 `tools` 面为**声明式**——引用内置工具或
 //! MCP 工具并纳入白名单，而非携带可执行代码。commands 复用
 //! [`crate::commands::SlashCommand`]，hooks 复用 [`crate::hooks`] 类型，二者可
-//! 直接注入既有注册表；skills / tools / mcp 贡献由 `inject` 汇总，交上层分别接入
-//! `SkillStore` / `ToolRuntime` / MCP 子系统。
+//! 直接注入既有注册表；tools / mcp 贡献由 `inject` 汇总，交上层分别接入
+//! `ToolRuntime` / MCP 子系统。
 
 use serde::{Deserialize, Serialize};
 
@@ -29,13 +30,6 @@ pub struct PluginManifest {
     pub description: String,
     #[serde(default = "default_false")]
     pub enabled_by_default: bool,
-}
-
-/// skill 贡献：SKILL.md 原文（frontmatter + body），由上层写入 SkillStore。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PluginSkill {
-    pub name: String,
-    pub content: String,
 }
 
 /// 工具贡献来源（声明式）。
@@ -97,8 +91,9 @@ pub struct PluginCommandSpec {
     pub markdown: String,
 }
 
-/// 插件规格（可由 JSON 清单反序列化；内联五类贡献，无需文件系统）。
+/// 插件规格（可由 JSON 清单反序列化；Skill 正文不是插件贡献面）。
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PluginSpec {
     pub name: String,
     #[serde(default)]
@@ -107,8 +102,6 @@ pub struct PluginSpec {
     pub description: String,
     #[serde(default = "default_false")]
     pub enabled_by_default: bool,
-    #[serde(default)]
-    pub skills: Vec<PluginSkill>,
     #[serde(default)]
     pub commands: Vec<PluginCommandSpec>,
     #[serde(default)]
@@ -124,7 +117,6 @@ pub struct PluginSpec {
 pub struct Plugin {
     pub manifest: PluginManifest,
     pub enabled: bool,
-    pub skills: Vec<PluginSkill>,
     pub commands: Vec<SlashCommand>,
     pub tools: Vec<PluginToolDecl>,
     pub hooks: Vec<PluginHook>,
@@ -162,7 +154,6 @@ impl Plugin {
                 enabled_by_default: spec.enabled_by_default,
             },
             enabled,
-            skills: spec.skills,
             commands,
             tools: spec.tools,
             hooks: spec.hooks,
@@ -172,8 +163,8 @@ impl Plugin {
 }
 
 /// 校验清单中参与注册 / 汇总的名称（与 commands 的 `is_valid_name` 同口径）：
-/// 空名 / 含空白名会作为空 key 或冲突条目透出到上层注册面（SkillStore、
-/// MCP 子系统等），必须在解析期拒绝（review 修复）。命令名由
+/// 空名 / 含空白名会作为空 key 或冲突条目透出到上层注册面（MCP 子系统等），
+/// 必须在解析期拒绝（review 修复）。命令名由
 /// [`SlashCommand::from_markdown`] 自校验，不在此重复。
 fn validate_plugin_names(spec: &PluginSpec) -> Result<(), CommandError> {
     if !crate::commands::is_valid_name(&spec.name) {
@@ -181,14 +172,6 @@ fn validate_plugin_names(spec: &PluginSpec) -> Result<(), CommandError> {
             "plugin name {:?} must be non-empty and contain no whitespace",
             spec.name
         )));
-    }
-    for skill in &spec.skills {
-        if !crate::commands::is_valid_name(&skill.name) {
-            return Err(CommandError::InvalidFormat(format!(
-                "plugin skill name {:?} must be non-empty and contain no whitespace",
-                skill.name
-            )));
-        }
     }
     for tool in &spec.tools {
         if !crate::commands::is_valid_name(&tool.name) {
@@ -217,13 +200,12 @@ fn validate_plugin_names(spec: &PluginSpec) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// 五注册面统一注入的汇总：命令 / hooks 已直接注入既有注册表；
-/// skills / tools / mcp 贡献在此汇总，交上层接入各自子系统。
+/// 四注册面统一注入的汇总：命令 / hooks 已直接注入既有注册表；
+/// tools / mcp 贡献在此汇总，交上层接入各自子系统。
 #[derive(Debug, Default)]
 pub struct InjectionSummary {
     pub commands_injected: usize,
     pub hooks_injected: usize,
-    pub skills: Vec<PluginSkill>,
     pub tools: Vec<PluginToolDecl>,
     pub mcp_servers: Vec<PluginMcpServer>,
 }
@@ -241,7 +223,7 @@ impl PluginRegistry {
 
     pub fn register(&mut self, plugin: Plugin) {
         // 同名插件替换（last-wins，与命令面覆盖语义一致）：避免重复注册
-        // 同名插件后 inject 汇总面（skills/tools/mcp）出现重复条目
+        // 同名插件后 inject 汇总面（tools/mcp）出现重复条目
         // （review 修复：历史实现 push，同名插件两次注册会双份注入）。
         if let Some(existing) = self
             .plugins
@@ -267,11 +249,11 @@ impl PluginRegistry {
         self.plugins.iter().filter(|p| p.enabled)
     }
 
-    /// **五注册面统一注入**：把所有已启用插件的 commands / hooks 注入传入的
-    /// 注册表，并汇总 skills / tools / mcp 贡献返回。禁用插件完全惰性
+    /// **四注册面统一注入**：把所有已启用插件的 commands / hooks 注入传入的
+    /// 注册表，并汇总 tools / mcp 贡献返回。禁用插件完全惰性
     /// （不贡献任何面）。同名 command 后注册覆盖（`CommandRegistry` 语义）；
     /// 汇总面按贡献去重（review 修复：同一 inject 调用内重复贡献只汇总
-    /// 一次，宿主重复注入不会得到重复 skill/tool/mcp 条目）。
+    /// 一次，宿主重复注入不会得到重复 tool/mcp 条目）。
     pub fn inject(
         &self,
         commands: &mut CommandRegistry,
@@ -294,11 +276,6 @@ impl PluginRegistry {
                 }
             }
             // 汇总面去重（内容相等即重复）：插件规模极小，线性 contains 足够。
-            for skill in &plugin.skills {
-                if !summary.skills.contains(skill) {
-                    summary.skills.push(skill.clone());
-                }
-            }
             for tool in &plugin.tools {
                 if !summary.tools.contains(tool) {
                     summary.tools.push(tool.clone());
@@ -322,7 +299,6 @@ mod tests {
         "name": "demo-plugin",
         "version": "1.0.0",
         "description": "A demo bundle",
-        "skills": [{"name": "greet", "content": "---\ndescription: Greet\n---\nSay hi"}],
         "commands": [{"name": "hello", "markdown": "---\ndescription: Say hello\n---\nGreet $ARGUMENTS"}],
         "tools": [{"name": "read_file", "description": "read", "source": {"kind": "builtin"}},
                   {"name": "search", "source": {"kind": "mcp", "server": "docs"}}],
@@ -331,11 +307,10 @@ mod tests {
     }"#;
 
     #[test]
-    fn from_json_parses_all_five_surfaces() {
+    fn from_json_parses_all_supported_surfaces() {
         let plugin = Plugin::from_json(MANIFEST, None).unwrap();
         assert_eq!(plugin.manifest.name, "demo-plugin");
         assert!(!plugin.enabled); // 未显式信任的清单默认禁用
-        assert_eq!(plugin.skills.len(), 1);
         assert_eq!(plugin.commands.len(), 1);
         assert_eq!(plugin.commands[0].name, "hello");
         assert_eq!(plugin.tools.len(), 2);
@@ -373,8 +348,7 @@ mod tests {
         // hooks 面已注入 HookRegistry
         assert_eq!(summary.hooks_injected, 1);
         assert_eq!(hooks.get(HookEvent::PreToolUse).len(), 1);
-        // skills / tools / mcp 面已汇总
-        assert_eq!(summary.skills.len(), 1);
+        // tools / mcp 面已汇总；plugins may not carry Skill content.
         assert_eq!(summary.tools.len(), 2);
         assert_eq!(summary.mcp_servers.len(), 1);
     }
@@ -395,7 +369,7 @@ mod tests {
     #[test]
     fn inject_deduplicates_summary_surfaces_across_reinjection() {
         // review 修复回归：同一插件重复 inject（或重复注册）时，汇总面
-        // （skills/tools/mcp）不得出现重复条目。
+        // （tools/mcp）不得出现重复条目。
         let plugin = Plugin::from_json(MANIFEST, Some(true)).unwrap();
         let mut registry = PluginRegistry::new();
         registry.register(plugin);
@@ -403,12 +377,10 @@ mod tests {
         let mut hooks = HookRegistry::new();
 
         let first = registry.inject(&mut commands, &mut hooks);
-        assert_eq!(first.skills.len(), 1);
         assert_eq!(first.tools.len(), 2);
         assert_eq!(first.mcp_servers.len(), 1);
 
         let second = registry.inject(&mut commands, &mut hooks);
-        assert_eq!(second.skills.len(), 1, "skills 重复注入必须去重");
         assert_eq!(second.tools.len(), 2, "tools 重复注入必须去重");
         assert_eq!(second.mcp_servers.len(), 1, "mcp 重复注入必须去重");
     }
@@ -437,7 +409,6 @@ mod tests {
 
         assert_eq!(summary.commands_injected, 0);
         assert_eq!(summary.hooks_injected, 0);
-        assert!(summary.skills.is_empty());
         assert!(summary.tools.is_empty());
         assert!(summary.mcp_servers.is_empty());
         assert!(commands.is_empty());
@@ -472,6 +443,17 @@ mod tests {
     }
 
     #[test]
+    fn plugin_skill_content_is_rejected() {
+        assert!(
+            Plugin::from_json(
+                r#"{"name":"not-a-skill-source","skills":[{"name":"greet","content":"---"}]}"#,
+                Some(true),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn tool_source_variants_deserialize() {
         let plugin = Plugin::from_json(MANIFEST, None).unwrap();
         assert_eq!(plugin.tools[0].source, PluginToolSource::Builtin);
@@ -486,12 +468,10 @@ mod tests {
     #[test]
     fn invalid_registration_names_reject_plugin() {
         // review 修复回归：空名 / 含空白名会作为空 key 或冲突条目透出到
-        // 上层注册面（SkillStore / MCP 子系统），必须在解析期拒绝。
+        // 上层注册面（MCP 子系统），必须在解析期拒绝。
         let bad_names = [
             r#"{"name":""}"#,
             r#"{"name":"has space"}"#,
-            r#"{"name":"ok","skills":[{"name":"","content":"x"}]}"#,
-            r#"{"name":"ok","skills":[{"name":"bad skill","content":"x"}]}"#,
             r#"{"name":"ok","tools":[{"name":"","description":"d","source":{"kind":"builtin"}}]}"#,
             r#"{"name":"ok","tools":[{"name":"t","description":"d","source":{"kind":"mcp","server":""}}]}"#,
             r#"{"name":"ok","mcp_servers":[{"name":"bad server","transport":"http","url":"https://x"}]}"#,

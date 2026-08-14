@@ -3,9 +3,9 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -22,7 +22,11 @@ use rust_agent::model_client::{
     UsageSnapshot,
 };
 use rust_agent::platform::Platform;
-use rust_agent::tools::{Tool, ToolCategory, ToolContext, ToolDef, ToolMetadata, ToolResult};
+use rust_agent::skills::{SkillManage, SkillStore, open_platform_skill_files};
+use rust_agent::tools::{
+    SkillLoadTool, SkillResourceLoadTool, Tool, ToolCategory, ToolContext, ToolDef, ToolMetadata,
+    ToolResult,
+};
 
 // ── KvStore mock ────────────────────────────────────────────────
 
@@ -162,6 +166,191 @@ async fn tool_invalid_input_maps_to_tool_error_and_agent_error() {
     assert!(matches!(err, ToolError::InvalidInput(_)));
     let agent_err: AgentError = err.into();
     assert!(matches!(agent_err, AgentError::Tool(_)));
+}
+
+#[tokio::test]
+async fn skill_load_tool_returns_saved_workflow() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemKvStore::default());
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(SkillStore::new(
+        kv,
+        open_platform_skill_files(root.path()).await.unwrap(),
+    ));
+    store
+        .create_skill(
+            "repeatable",
+            "---\nname: repeatable\ndescription: reusable\n---\n# Steps\n1. Verify",
+        )
+        .await
+        .unwrap();
+    let tool = SkillLoadTool::new();
+    tool.attach(
+        Arc::clone(&store),
+        Platform::Desktop,
+        HashSet::from(["skill".to_string()]),
+        Arc::new(RwLock::new(HashSet::new())),
+    );
+    let mut metadata = ToolMetadata::new();
+    let mut ctx = ToolContext {
+        cwd: Path::new("/tmp"),
+        metadata: &mut metadata,
+    };
+
+    let result = tool
+        .execute(json!({"name": "repeatable"}), &mut ctx)
+        .await
+        .unwrap();
+
+    assert!(!result.is_error);
+    assert!(result.output.starts_with("---\nname: repeatable"));
+    assert!(result.output.contains("description: reusable"));
+    assert!(result.output.contains("# Steps"));
+}
+
+#[tokio::test]
+async fn skill_load_tool_does_not_reinterpret_standard_allowed_tools_as_private_gating() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemKvStore::default());
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(SkillStore::new(
+        kv,
+        open_platform_skill_files(root.path()).await.unwrap(),
+    ));
+    store
+        .create_skill(
+            "needs-shell",
+            "---\nname: needs-shell\ndescription: reusable\nallowed-tools: Bash(sh)\n---\n# Steps\n1. Verify",
+        )
+        .await
+        .unwrap();
+    let disabled = Arc::new(RwLock::new(HashSet::from(["shell_command".to_string()])));
+    let tool = SkillLoadTool::new();
+    tool.attach(
+        store,
+        Platform::Desktop,
+        HashSet::from(["skill".to_string(), "shell_command".to_string()]),
+        Arc::clone(&disabled),
+    );
+    let mut metadata = ToolMetadata::new();
+    let mut ctx = ToolContext {
+        cwd: Path::new("/tmp"),
+        metadata: &mut metadata,
+    };
+
+    let result = tool
+        .execute(json!({"name": "needs-shell"}), &mut ctx)
+        .await
+        .unwrap();
+    assert!(result.output.contains("# Steps"));
+
+    disabled.write().unwrap().clear();
+    let result = tool
+        .execute(json!({"name": "needs-shell"}), &mut ctx)
+        .await
+        .unwrap();
+    assert!(result.output.contains("# Steps"));
+}
+
+#[tokio::test]
+async fn skill_resource_tool_loads_referenced_standard_file() {
+    let kv: Arc<dyn KvStore> = Arc::new(MemKvStore::default());
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(SkillStore::new(
+        kv,
+        open_platform_skill_files(root.path()).await.unwrap(),
+    ));
+    store
+        .create_skill(
+            "deploy",
+            "---\nname: deploy\ndescription: deploy\n---\nRead references/check.md",
+        )
+        .await
+        .unwrap();
+    store
+        .put_reference("deploy", "references/check.md", "# Check\n1. Verify")
+        .await
+        .unwrap();
+    let disabled = Arc::new(RwLock::new(HashSet::new()));
+    let loader = SkillLoadTool::new();
+    loader.attach(
+        Arc::clone(&store),
+        Platform::Desktop,
+        HashSet::from(["skill".to_string(), "skill_resource".to_string()]),
+        Arc::clone(&disabled),
+    );
+    let tool = SkillResourceLoadTool::with_activated(loader.activated_skills());
+    tool.attach(
+        Arc::clone(&store),
+        Platform::Desktop,
+        HashSet::from(["skill".to_string(), "skill_resource".to_string()]),
+        Arc::clone(&disabled),
+    );
+    assert!(
+        tool.is_available(),
+        "attached resource tool must be advertised"
+    );
+    let mut metadata = ToolMetadata::new();
+    let mut ctx = ToolContext {
+        cwd: Path::new("/tmp"),
+        metadata: &mut metadata,
+    };
+    let blocked = tool
+        .execute(
+            json!({"name":"deploy", "path":"references/check.md"}),
+            &mut ctx,
+        )
+        .await
+        .unwrap_err();
+    assert!(blocked.to_string().contains("has not been loaded"));
+
+    loader
+        .execute(json!({"name":"deploy"}), &mut ctx)
+        .await
+        .unwrap();
+    let result = tool
+        .execute(
+            json!({"name":"deploy", "path":"references/check.md"}),
+            &mut ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!result.is_error);
+    assert!(result.output.contains("Verify"));
+
+    // A same-name package update invalidates the old activation.  The resource
+    // reader must require the model to load the new instructions first rather
+    // than treating a historical name match as authorization.
+    store
+        .update_skill(
+            "deploy",
+            "---\nname: deploy\ndescription: updated deploy\n---\nRead the updated checks",
+        )
+        .await
+        .unwrap();
+    let stale = tool
+        .execute(
+            json!({"name":"deploy", "path":"references/check.md"}),
+            &mut ctx,
+        )
+        .await
+        .unwrap_err();
+    assert!(stale.to_string().contains("current version"));
+    loader
+        .execute(json!({"name":"deploy"}), &mut ctx)
+        .await
+        .unwrap();
+    assert!(
+        !tool
+            .execute(
+                json!({"name":"deploy", "path":"references/check.md"}),
+                &mut ctx,
+            )
+            .await
+            .unwrap()
+            .is_error
+    );
+
+    disabled.write().unwrap().insert("skill".into());
+    assert!(!tool.is_available());
 }
 
 #[test]
@@ -697,7 +886,7 @@ async fn document_store_contract_index_dedup_scope_delete() {
 // ── SkillLoader / SkillManage mock ──────────────────────────────
 
 use rust_agent::error::SkillsError;
-use rust_agent::skills::{SkillContent, SkillContext, SkillLoader, SkillManage, SkillSummary};
+use rust_agent::skills::{SkillContent, SkillContext, SkillLoader, SkillSummary};
 
 /// 内存 skill 库：`list` 阶段按 `available_tools` 门控过滤（不匹配完全不可见）。
 #[derive(Default)]
@@ -795,6 +984,13 @@ impl SkillManage for MemSkillStore {
             .remove(name)
             .map(|_| ())
             .ok_or_else(|| SkillsError::NotFound(name.to_string()))
+    }
+
+    async fn clear_all_skills(&self) -> Result<u64, SkillsError> {
+        let mut skills = self.skills.lock().unwrap();
+        let removed = skills.len() as u64;
+        skills.clear();
+        Ok(removed)
     }
 }
 

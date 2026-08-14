@@ -1,6 +1,6 @@
 # Phase 1 对齐清单：Agent Kernel + FSM
 
-对齐基线：`OpenHarness/src/openharness/engine/`（`query.py` / `messages.py` /
+对齐基线：`Harness/src/harness/engine/`（`query.py` / `messages.py` /
 `stream_events.py`）与 `api/client.py`（提交时仓库内版本）。
 范围：Phase 1.1–1.9（AgentState FSM、消息 sanitize、StreamEvent、AgentKernel
 主循环、tool_metadata 状态袋、ContextStore、Mock ModelClient、单元/集成测试）。

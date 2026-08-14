@@ -1,4 +1,4 @@
-//! 上下文压缩四级降级链（Phase 5.5，对齐 OpenHarness `services/compact`）。
+//! 上下文压缩四级降级链（Phase 5.5，对齐 Harness `services/compact`）。
 //!
 //! 降级链（逐级执行，每级后复查阈值，达标即返回）：
 //! 1. microcompact：清除旧的可压缩工具结果（保留最近 N 个），无 LLM 调用；

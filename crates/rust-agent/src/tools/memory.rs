@@ -57,7 +57,7 @@ fn require_content(input: &Value) -> Result<String, ToolError> {
     require_string(input, "content")
 }
 
-/// 读取已 attach 的 MemoryService；未装配（disable / 初始化失败）时返回工具错误。
+/// 读取已 attach 的 MemoryService；仅在初始化失败时返回工具错误。
 fn attached_service(
     service: &Arc<RwLock<Option<Arc<MemoryService>>>>,
 ) -> Result<Arc<MemoryService>, ToolError> {

@@ -1,7 +1,7 @@
 //! Gateway ModelClient（Phase 5.2）：`ModelClient` trait 的真实传输实现，
 //! 底层复用 `client-api` 的 AI 传输层（`POST /api/ai/response`）。
 //!
-//! 对齐 OpenHarness `api/client.py` 的最小流式协议：
+//! 对齐 Harness `api/client.py` 的最小流式协议：
 //! - 重试常量：`MAX_RETRIES=3`、`BASE_DELAY=1.0s`、`MAX_DELAY=30.0s`、
 //!   可重试状态码 {429, 500, 502, 503, 529}；退避 = min(1.0 × 2^attempt, 30)
 //!   + 均匀抖动（0..delay×0.25）。

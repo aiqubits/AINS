@@ -1,5 +1,5 @@
 //! 客户端上下文管线（Phase 5.3–5.5）：分段系统提示流水线、会话持久化、
-//! 上下文压缩。对齐 OpenHarness `prompts` / `services/session_storage` /
+//! 上下文压缩。对齐 Harness `prompts` / `services/session_storage` /
 //! `services/compact`。
 //!
 //! 会话内的 `ContextStore`（对话历史 + tool_metadata 状态袋）位于

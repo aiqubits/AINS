@@ -1,4 +1,4 @@
-//! 三态权限引擎（对齐 OpenHarness `permissions/checker.py` + `modes.py`）。
+//! 三态权限引擎（对齐 Harness `permissions/checker.py` + `modes.py`）。
 //!
 //! 决策序（修正基线已知缺陷）：
 //! 内置敏感路径黑名单（最高优先级、不可覆盖）→ 工具显式 deny → 命令 deny
@@ -31,7 +31,7 @@ pub enum PermissionMode {
 }
 
 /// 内置敏感路径黑名单：无论模式与用户配置均拒绝（防 prompt injection 定向
-/// 读取凭据）。与基线 `SENSITIVE_PATH_PATTERNS` 一致，OpenHarness 自有凭据
+/// 读取凭据）。与基线 `SENSITIVE_PATH_PATTERNS` 一致，Harness 自有凭据
 /// 库两项替换为 AINS 对应路径（偏差记录见对齐清单）。
 pub const SENSITIVE_PATH_PATTERNS: &[&str] = &[
     // SSH keys and config

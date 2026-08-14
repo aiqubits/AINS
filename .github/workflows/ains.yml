@@ -306,6 +306,14 @@ jobs:
       run: cargo clippy --package rust-agent --all-targets -- -D warnings
     - name: Build & Test (native)
       run: cargo test --package rust-agent --verbose
+    - name: Install Agent Skills reference validator
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Validate Agent Skills fixture against the reference implementation
+      run: |
+        python -m pip install git+https://github.com/agentskills/agentskills.git@69ef37e9424c0a7ea9dd2293b559e43ec8176379#subdirectory=skills-ref
+        skills-ref validate crates/rust-agent/tests/fixtures/agent-skills/release-check
     - name: Install wasm32 target
       run: rustup target add wasm32-unknown-unknown
     - name: Lint (Clippy, wasm32)

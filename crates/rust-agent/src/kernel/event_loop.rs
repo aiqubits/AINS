@@ -1,4 +1,4 @@
-//! AgentKernel：FSM 驱动的流式工具调用循环（对齐 OpenHarness
+//! AgentKernel：FSM 驱动的流式工具调用循环（对齐 Harness
 //! `engine/query_engine.py` + `query.py`）。
 //!
 //! Kernel 仅负责 Event Receive → State Transition → Service Dispatch，

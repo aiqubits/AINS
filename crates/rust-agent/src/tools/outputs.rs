@@ -1,4 +1,4 @@
-//! 工具输出 inline/preview 字符预算（对齐 OpenHarness `services/tool_outputs.py`
+//! 工具输出 inline/preview 字符预算（对齐 Harness `services/tool_outputs.py`
 //! + `engine/query.py::_offload_tool_output_if_needed`）。
 //!
 //! 超长工具输出外置存储（ArtifactSink）并在 tool_result 中留引用 + 内联预览，

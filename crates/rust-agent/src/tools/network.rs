@@ -1,4 +1,4 @@
-//! Network Tool（web_fetch）与 SSRF 防护（对齐 OpenHarness `web_fetch_tool.py`
+//! Network Tool（web_fetch）与 SSRF 防护（对齐 Harness `web_fetch_tool.py`
 //! + `utils/network_guard.py`）。
 //!
 //! Native 端：仅 http/https、禁内嵌凭据、拒绝非公网/回环/metadata 目标、

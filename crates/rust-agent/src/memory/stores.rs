@@ -68,6 +68,10 @@ pub struct MemoryStores {
     /// 共享 stores 持有。Weak 值会在最后一个 session service 释放后自然回收，
     /// 避免历史 session id 使 map 无界增长。
     extraction_sessions: Arc<RwLock<HashMap<String, Weak<ExtractionSessionState>>>>,
+    /// 跨会话 durable 写入/删除门闩。管理页的“清空全部”影响的是当前
+    /// owner/project 的所有会话，不能只与某一个 session 的 extraction gate
+    /// 串行，否则正在执行的另一会话抽取会在清空后重新写入数据。
+    pub(crate) durable_mutation_gate: Arc<futures::lock::Mutex<()>>,
 }
 
 impl MemoryStores {
@@ -99,6 +103,7 @@ impl MemoryStores {
             embedding_contract_gate: Arc::new(futures::lock::Mutex::new(())),
             document_index_gate: Arc::new(futures::lock::Mutex::new(())),
             extraction_sessions: Arc::new(RwLock::new(HashMap::new())),
+            durable_mutation_gate: Arc::new(futures::lock::Mutex::new(())),
         }
     }
 

@@ -1,7 +1,7 @@
 //! 子代理 / Swarm（AINS_PLAN 7+.3）：进程内 `TeammateExecutor` 后端 +
 //! KV 信箱 IPC + 权限上收 lead + `AgentDefinition`。
 //!
-//! 对齐 OpenHarness `swarm/`（in_process 后端 + mailbox）+ `coordinator/`
+//! 对齐 Harness `swarm/`（in_process 后端 + mailbox）+ `coordinator/`
 //! （`AgentDefinition`）。AINS 首选**进程内**后端：子代理是同进程内以受限
 //! `AgentDefinition`（工具白名单 + 模型覆盖 + 系统提示）运行的 agent，经
 //! **KV 信箱**（而非文件系统）与 lead 及彼此收发消息，双 target 可用。

@@ -1,5 +1,39 @@
 /* ChatView / ChatInput —— Phase 6.3（对齐 tokens.css 浅色主题设计变量） */
 
+/* AgentChat owns the available viewport height.  The web app-shell turns this
+   into the remaining area below its header; desktop retains the legacy
+   viewport-sized fallback.  Only the message list may scroll vertically. */
+.ains-agent-chat {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 132px);
+  min-height: 420px;
+}
+
+.ains-app-shell__content--chat .ains-agent-chat {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+
+.ains-agent-chat__toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 16px 8px;
+  flex: 0 0 auto;
+}
+
+.ains-agent-chat__todos {
+  padding: 0 16px 8px;
+  /* Todo data comes from tool output and is unbounded.  Keep the composer and
+     message pane usable by containing an unusually long list here. */
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(30vh, 260px);
+  overflow-y: auto;
+}
+
 .ains-chat__scroll {
   flex: 1;
   min-height: 0;
@@ -257,6 +291,8 @@
   display: flex;
   flex-direction: column;
   gap: 6px;
+  max-height: min(55vh, 420px);
+  overflow-y: auto;
 }
 
 .ains-chat__tool-section-label {
@@ -265,6 +301,7 @@
   color: var(--color-text-muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  flex-shrink: 0;
 }
 
 .ains-chat__tool-pre {
@@ -278,8 +315,8 @@
   font-size: 12px;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 240px;
-  overflow-y: auto;
+  min-height: 0;
+  flex-shrink: 0;
 }
 
 /* ── 输入区 ── */
@@ -288,6 +325,7 @@
   position: relative;
   display: flex;
   flex-direction: column;
+  flex: 0 0 auto;
 }
 
 /* Slash 命令建议下拉（Phase 6.12） */

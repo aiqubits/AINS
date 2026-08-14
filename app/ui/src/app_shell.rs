@@ -7,14 +7,21 @@ use dioxus::prelude::*;
 /// 注意：设计令牌 `tokens.css` 由 `ui::GlobalStyles` 在根 App 统一注入，
 /// 本组件不再重复加载。消费方必须确保根 App 挂载了 `ui::GlobalStyles {}`。
 #[component]
-pub fn AppShell(sidebar: Element, top_header: Element, children: Element) -> Element {
+pub fn AppShell(
+    sidebar: Element,
+    top_header: Element,
+    children: Element,
+    /// Route-level modifier for views that manage their own scrolling.
+    #[props(default)]
+    content_class: String,
+) -> Element {
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/app_shell.css") }
         div { class: "ains-app-shell",
             {sidebar}
             div { class: "ains-app-shell__main",
                 {top_header}
-                main { class: "ains-app-shell__content", {children} }
+                main { class: "ains-app-shell__content {content_class}", {children} }
             }
         }
     }

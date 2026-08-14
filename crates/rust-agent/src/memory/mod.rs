@@ -4,6 +4,7 @@
 pub mod document;
 pub mod engine;
 pub mod extract;
+pub mod in_memory;
 pub mod kv;
 pub mod kv_crypto;
 pub mod manage;
@@ -34,6 +35,7 @@ pub use extract::{
     MemoryExtractor, SESSION_MEMORY_KEY, SessionCheckpoint, build_session_memory,
     format_transcript, load_session_checkpoint, parse_memory_records, save_session_checkpoint,
 };
+pub use in_memory::InMemoryKvStore;
 pub use kv::{
     KvStore, TABLE_DOCUMENTS, TABLE_EMBEDDINGS, TABLE_HNSW_CACHE, TABLE_KV, TABLE_MEMORIES, now_ms,
 };
@@ -45,9 +47,10 @@ pub use memdir::{
 };
 pub use parser::{DocumentKind, MAX_CHUNK_CHARS, chunk_document, extract_pdf_text};
 pub use service::{
-    DurableMemoryMetadata, EmbeddingContract, ExtractionReason, ExtractionState, ExtractionToken,
-    MemoryContext, MemoryHit, MemoryService, MemoryServiceConfig, SessionMemoryClearOutcome,
-    build_durable_manifest, extract_digest, is_visible, owner_key_for_id,
+    DurableMemoryManifestItem, DurableMemoryMetadata, EmbeddingContract, ExtractionReason,
+    ExtractionState, ExtractionToken, MemoryContext, MemoryHit, MemoryService, MemoryServiceConfig,
+    SessionMemoryClearOutcome, build_durable_library_manifest_items, build_durable_manifest,
+    build_durable_manifest_items, extract_digest, is_visible, owner_key_for_id,
 };
 pub use stores::{MemoryBackend, MemoryStores, open_memory_stores, prepare_encryption};
 pub use ttl::{DEFAULT_SWEEP_INTERVAL, SweeperHandle, spawn_ttl_sweeper};

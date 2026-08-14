@@ -1,6 +1,6 @@
 //! 可移植 Sandbox 策略模型（Phase 7.1 Layer 1，纯 Rust 双 target）。
 //!
-//! 对齐 OpenHarness `config/settings.py` 的 `SandboxNetworkSettings` /
+//! 对齐 Harness `config/settings.py` 的 `SandboxNetworkSettings` /
 //! `SandboxFilesystemSettings`：网络域白/黑名单 + 文件系统读写四象限。
 //!
 //! 本层是**平台无关**的策略判定，对 web / mobile / desktop 一致生效：

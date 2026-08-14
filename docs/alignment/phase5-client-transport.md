@@ -1,6 +1,6 @@
 # Phase 5 对齐清单：客户端 AI 传输层 + 上下文管线
 
-对齐基线：`OpenHarness/src/openharness/api/client.py`（+ `api/usage.py`、
+对齐基线：`Harness/src/harness/api/client.py`（+ `api/usage.py`、
 `api/errors.py`）、`prompts/`（`context.py`、`system_prompt.py`、
 `environment.py`、`claudemd.py`）、`services/session_storage.py`、
 `services/compact/`、`services/token_estimation.py`（提交时仓库内版本）。

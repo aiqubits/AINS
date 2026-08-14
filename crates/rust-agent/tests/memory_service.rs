@@ -23,8 +23,9 @@ use rust_agent::memory::{
     DefaultVectorIndexManager, DurableMemoryMetadata, ExtractionReason, KvStore, MemoryBackend,
     MemoryContext, MemoryEngine, MemoryEntry, MemoryNamespace, MemoryScope, MemoryService,
     MemoryServiceConfig, MemoryStores, MemoryType, Metric, NewMemoryEntry, RedbBackend,
-    VectorIndexConfig, VectorIndexManager, build_durable_manifest, extract_digest, is_visible,
-    now_ms, open_memory_stores, owner_key_for_id, prepare_encryption, vector_to_value,
+    VectorIndexConfig, VectorIndexManager, build_durable_library_manifest_items,
+    build_durable_manifest, build_durable_manifest_items, extract_digest, is_visible, now_ms,
+    open_memory_stores, owner_key_for_id, prepare_encryption, vector_to_value,
 };
 use std::time::Duration;
 
@@ -217,6 +218,50 @@ struct FailingKv {
     inner: Box<dyn KvStore>,
     fail_on: Vec<usize>,
     sets: std::sync::atomic::AtomicUsize,
+}
+
+/// Returns a corruption error for one configured row while allowing all other
+/// storage operations.  This models a stale/undecryptable record belonging to
+/// another account in the shared durable-memory table.
+struct FailingGetKeyKv {
+    inner: Box<dyn KvStore>,
+    failed_key: String,
+}
+
+impl FailingGetKeyKv {
+    fn new(inner: impl KvStore + 'static, failed_key: String) -> Self {
+        Self {
+            inner: Box::new(inner),
+            failed_key,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl KvStore for FailingGetKeyKv {
+    async fn get(&self, key: &str) -> Result<Option<serde_json::Value>, MemoryError> {
+        if key == self.failed_key {
+            return Err(MemoryError::Serialization("injected corrupt row".into()));
+        }
+        self.inner.get(key).await
+    }
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<Duration>,
+    ) -> Result<(), MemoryError> {
+        self.inner.set(key, value, ttl).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
 }
 
 impl FailingKv {
@@ -1400,6 +1445,257 @@ async fn clear_current_session_deletes_only_its_memories_and_vectors() {
             .unwrap()
             .is_some()
     );
+}
+
+#[tokio::test]
+async fn clear_visible_memories_respects_owner_and_project_scope() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-a", "session-a", "owner-a"),
+    )
+    .await;
+    let same_owner_other_project = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-b", "session-b", "owner-a"),
+    )
+    .await;
+    let other_owner = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-a", "session-c", "owner-b"),
+    )
+    .await;
+
+    let private_id = current
+        .write_memory(record("owner a private", MemoryScope::Private))
+        .await
+        .unwrap();
+    let project_id = current
+        .write_memory(record("owner a project a", MemoryScope::Project))
+        .await
+        .unwrap();
+    let other_project_id = same_owner_other_project
+        .write_memory(record("owner a project b", MemoryScope::Project))
+        .await
+        .unwrap();
+    let other_owner_id = other_owner
+        .write_memory(record("owner b private", MemoryScope::Private))
+        .await
+        .unwrap();
+
+    assert_eq!(current.clear_visible_memories().await.unwrap(), 2);
+    for id in [private_id, project_id] {
+        assert!(
+            stores
+                .memories
+                .get(&MemoryNamespace::Personal.storage_key(&id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    for id in [other_project_id, other_owner_id] {
+        assert!(
+            stores
+                .memories
+                .get(&MemoryNamespace::Personal.storage_key(&id))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[tokio::test]
+async fn library_clear_and_manifest_cover_an_owners_projects_consistently() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty());
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-a", "session-a", "owner-a"),
+    )
+    .await;
+    let same_owner_other_project = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-b", "session-b", "owner-a"),
+    )
+    .await;
+    let other_owner = service(
+        stores.clone(),
+        Arc::clone(&model) as Arc<dyn ModelClient>,
+        MemoryContext::for_owner("project-a", "session-c", "owner-b"),
+    )
+    .await;
+
+    let private_id = current
+        .write_memory(record("owner a library private", MemoryScope::Private))
+        .await
+        .unwrap();
+    let project_a_id = current
+        .write_memory(record("owner a library project a", MemoryScope::Project))
+        .await
+        .unwrap();
+    let project_b_id = same_owner_other_project
+        .write_memory(record("owner a library project b", MemoryScope::Project))
+        .await
+        .unwrap();
+    let other_owner_id = other_owner
+        .write_memory(record("owner b library private", MemoryScope::Private))
+        .await
+        .unwrap();
+
+    let manifest_context = MemoryContext::for_owner("project-a", "browser", "owner-a");
+    let manifest = build_durable_library_manifest_items(&*stores.memories, &manifest_context)
+        .await
+        .unwrap();
+    let ids = manifest
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&private_id.as_str()));
+    assert!(ids.contains(&project_a_id.as_str()));
+    assert!(ids.contains(&project_b_id.as_str()));
+    assert!(!ids.contains(&other_owner_id.as_str()));
+
+    // 管理页跨项目展示的条目必须能用同一账户级授权规则单条删除；运行时
+    // `delete_visible_memory` 只允许当前 project，不能用于该入口。
+    assert!(current.delete_library_memory(&project_b_id).await.unwrap());
+    assert!(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&project_b_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !current
+            .delete_library_memory(&other_owner_id)
+            .await
+            .unwrap(),
+        "账户级删除仍不得跨 owner"
+    );
+
+    assert_eq!(current.clear_library_memories().await.unwrap(), 2);
+    for id in [private_id, project_a_id] {
+        assert!(
+            stores
+                .memories
+                .get(&MemoryNamespace::Personal.storage_key(&id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+    assert!(
+        stores
+            .memories
+            .get(&MemoryNamespace::Personal.storage_key(&other_owner_id))
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn clear_visible_memories_skips_unreadable_other_owner_rows() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("ains.redb")).unwrap());
+    let stores = open_memory_stores(&MemoryBackend::Native(Arc::clone(&backend)), None);
+    let model = Arc::new(MockModel::empty()) as Arc<dyn ModelClient>;
+    let current = service(
+        stores.clone(),
+        Arc::clone(&model),
+        MemoryContext::for_owner("project-a", "session-a", "owner-a"),
+    )
+    .await;
+    let other = service(
+        stores,
+        Arc::clone(&model),
+        MemoryContext::for_owner("project-a", "session-b", "owner-b"),
+    )
+    .await;
+    let current_id = current
+        .write_memory(record("current owner fact", MemoryScope::Private))
+        .await
+        .unwrap();
+    let other_id = other
+        .write_memory(record("other owner fact", MemoryScope::Private))
+        .await
+        .unwrap();
+
+    let faulty_stores = MemoryStores::from_parts(
+        Arc::new(backend.table(TABLE_KV)),
+        Arc::new(FailingGetKeyKv::new(
+            backend.table(TABLE_MEMORIES),
+            MemoryNamespace::Personal.storage_key(&other_id),
+        )),
+        Arc::new(backend.table(TABLE_EMBEDDINGS)),
+        Arc::new(backend.table(TABLE_DOCUMENTS)),
+        Arc::new(backend.table(TABLE_HNSW_CACHE)),
+    );
+    let clearer = service(
+        faulty_stores,
+        model,
+        MemoryContext::for_owner("project-a", "memory-browser", "owner-a"),
+    )
+    .await;
+
+    assert_eq!(clearer.clear_visible_memories().await.unwrap(), 1);
+    assert!(
+        backend
+            .table(TABLE_MEMORIES)
+            .get(&MemoryNamespace::Personal.storage_key(&current_id))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn durable_mutation_gate_is_shared_between_sessions() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty()) as Arc<dyn ModelClient>;
+    let first = service(stores.clone(), Arc::clone(&model), context("proj-a", "one")).await;
+    let second = service(stores, model, context("proj-a", "two")).await;
+
+    let first_gate = first.durable_mutation_gate();
+    let second_gate = second.durable_mutation_gate();
+    assert!(Arc::ptr_eq(&first_gate, &second_gate));
+    let _guard = first_gate.lock().await;
+    assert!(second_gate.try_lock().is_none());
+}
+
+#[tokio::test]
+async fn auto_extraction_setting_is_owner_scoped_and_persists_for_live_services() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let stores = open_stores(&dir);
+    let model = Arc::new(MockModel::empty()) as Arc<dyn ModelClient>;
+    let first = service(
+        stores.clone(),
+        Arc::clone(&model),
+        MemoryContext::for_owner("project-a", "one", "owner-a"),
+    )
+    .await;
+    let other_owner = service(
+        stores,
+        model,
+        MemoryContext::for_owner("project-a", "two", "owner-b"),
+    )
+    .await;
+    assert!(first.auto_extract_enabled().await.unwrap());
+    first.set_auto_extract_enabled(false).await.unwrap();
+    assert!(!first.auto_extract_enabled().await.unwrap());
+    assert!(other_owner.auto_extract_enabled().await.unwrap());
 }
 
 #[tokio::test]
@@ -3459,4 +3755,30 @@ async fn manifest_skips_encryption_error_rows() {
         manifest.err()
     );
     assert!(manifest.unwrap().is_empty(), "加密行被跳过不进入清单");
+}
+
+#[tokio::test]
+async fn manifest_items_expose_canonical_id_for_direct_management_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let stores = open_stores(&dir);
+    let svc = service(
+        stores.clone(),
+        Arc::new(MockModel::empty()) as Arc<dyn ModelClient>,
+        context("proj-a", "s1"),
+    )
+    .await;
+    let id = svc
+        .write_memory(record("directly manageable fact", MemoryScope::Private))
+        .await
+        .unwrap();
+
+    let items = build_durable_manifest_items(&*stores.memories, &context("proj-a", "browser"))
+        .await
+        .unwrap();
+
+    assert!(items.iter().any(|item| {
+        item.id == id
+            && item.title.starts_with("directly manageable")
+            && item.description.contains("directly manageable fact")
+    }));
 }

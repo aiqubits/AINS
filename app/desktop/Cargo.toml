@@ -17,6 +17,10 @@ tracing = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = "0.9"
 chrono = { workspace = true }
+# Reuse Dioxus Desktop's portal backend; avoid enabling rfd's default Wayland
+# stack, which is unnecessary here and keeps the packaged dependency surface
+# aligned with the host shell.
+rfd = { version = "0.17.2", default-features = false, features = ["xdg-portal"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [dev-dependencies]

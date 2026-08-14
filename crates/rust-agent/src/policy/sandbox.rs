@@ -1,4 +1,4 @@
-//! Sandbox trait 与 NoopSandbox 占位实现（对齐 OpenHarness `sandbox/`）。
+//! Sandbox trait 与 NoopSandbox 占位实现（对齐 Harness `sandbox/`）。
 //!
 //! Phase 3 仅落地能力探测 + 路径边界校验 + 占位桩；平台级运行时
 //! （Linux namespace；seccomp profile 待接线；macOS sandbox-exec、Windows Job Object）

@@ -1,4 +1,4 @@
-//! 交互 / 元工具（对齐 OpenHarness `todo_write_tool.py` / `ask_user_question_tool.py`
+//! 交互 / 元工具（对齐 Harness `todo_write_tool.py` / `ask_user_question_tool.py`
 //! / `enter_plan_mode_tool.py` / `exit_plan_mode_tool.py`）。
 //!
 //! - `todo_write`：markdown 清单增改（Native 落 cwd 下文件；Web 无文件系统，

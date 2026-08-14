@@ -1,4 +1,4 @@
-//! Model Client：Agent 与 AI Gateway 之间的纯传输层（对齐 OpenHarness `api/client.py`）。
+//! Model Client：Agent 与 AI Gateway 之间的纯传输层（对齐 Harness `api/client.py`）。
 //!
 //! - 对话主通道（chat / vision）为单方法流式协议，事件为 delta / complete / retry
 //!   三联合类型；重试作为流内事件上报而非静默（基线 `ApiRetryEvent` 语义）。

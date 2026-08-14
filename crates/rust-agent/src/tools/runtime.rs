@@ -1,4 +1,4 @@
-//! ToolRuntime：统一注册表 + 分发管线（对齐 OpenHarness `tools/base.py::ToolRegistry`
+//! ToolRuntime：统一注册表 + 分发管线（对齐 Harness `tools/base.py::ToolRegistry`
 //! + `engine/query.py::_execute_tool_call`）。
 //!
 //! 分发管线：pre_tool_use hook → 三态权限（允许/询问/拒绝）→ 执行 →
@@ -343,19 +343,24 @@ impl ToolRuntime {
             .iter()
             .filter_map(|tool| {
                 let definition = tool.definition();
-                (!disabled.contains(&definition.name)).then_some(definition)
+                (!disabled.contains(&definition.name) && tool.is_available()).then_some(definition)
             })
             .collect()
     }
 
-    /// 全部工具的 schema（不经过禁用过滤，保持注册序）——快照/面板展示用：
-    /// 需包含已禁用的工具（面板卡片是重新启用的唯一入口），且不依赖"新建
+    /// 全部常驻可用工具的 schema（不经过禁用过滤，保持注册序）——快照/面板展示用：
+    /// 需包含已禁用的工具（面板卡片是重新启用的唯一入口），但不暴露宿主
+    /// 一次性授权的临时工具，且不依赖"新建
     /// runtime 禁用集合为空"的隐式前提（`api_schemas` 过滤被禁工具；若快照
     /// 路径未来注入共享禁用源，已禁用工具会从面板消失且无法重新启用）。语义
     /// 与 [`Self::registered_names`] 一致（注册表全量视角），对比模型上下文
     /// 视角的 [`Self::api_schemas`]。
     pub fn all_schemas(&self) -> Vec<ToolDef> {
-        self.tools.iter().map(|tool| tool.definition()).collect()
+        self.tools
+            .iter()
+            .filter(|tool| tool.is_available())
+            .map(|tool| tool.definition())
+            .collect()
     }
 
     /// 当前已注册的全部工具名（不经过禁用过滤）——宿主注册契约断言与调试
@@ -415,6 +420,13 @@ impl ToolRuntime {
             let result = ToolResult::err(format!("Unknown tool: {}", tool_use.name));
             return self.apply_output_budget(tool_use, result, ctx);
         };
+        if !tool.is_available() {
+            let result = ToolResult::err(format!(
+                "Tool '{}' is not authorized for the current request",
+                tool_use.name
+            ));
+            return self.apply_output_budget(tool_use, result, ctx);
+        }
 
         // 4. 三态权限：路径/命令归一化后求值（对齐 _resolve_permission_file_path）
         {

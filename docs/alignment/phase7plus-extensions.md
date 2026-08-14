@@ -1,6 +1,6 @@
 # Phase 7+ 对齐清单：扩展特性（Slash Commands / 插件 / 子代理 / 后台任务 / 个性化）
 
-对齐基线 OpenHarness `commands/` `plugins/` `swarm/`+`coordinator/` `tasks/`
+对齐基线 Harness `commands/` `plugins/` `swarm/`+`coordinator/` `tasks/`
 `personalization/`。本轮交付 Phase 7+ 全部 P2 项（7+.1–7+.5）。
 
 > **范围说明**：本页的“交付/验收”仅表示 `rust-agent` 的组件契约已实现并通过测试；

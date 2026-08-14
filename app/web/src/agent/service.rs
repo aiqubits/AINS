@@ -11,24 +11,30 @@ use std::sync::{Arc, OnceLock, RwLock};
 use futures::channel::mpsc;
 
 use client_api::Client;
+use rust_agent::context::BASE_SYSTEM_PROMPT;
 use rust_agent::context::session::{SessionSaveInput, SessionStore, project_slug};
 use rust_agent::kernel::{
     AgentEvent, AgentKernel, AgentKernelConfig, AsyncSystemPromptProvider, ConversationMessage,
     StreamEvent,
 };
 use rust_agent::memory::{
-    KvStore, MemdirStore, MemoryContext, MemoryHit, MemoryService, MemoryStores, open_memory_stores,
+    DurableMemoryManifestItem, InMemoryKvStore, KvStore, MemdirStore, MemoryContext, MemoryHit,
+    MemoryService, MemoryStores, build_durable_library_manifest_items, open_memory_stores,
 };
 use rust_agent::model_client::UsageSnapshot;
 use rust_agent::model_service::GatewayModelClient;
 use rust_agent::policy::{PermissionEngine, PermissionMode, PermissionSettings, SandboxPolicy};
-use rust_agent::skills::KvSkillStore;
+use rust_agent::skills::{
+    SkillContext, SkillLoader, SkillStore, open_platform_skill_files, schema_stub_skill_files,
+};
 use rust_agent::tools::compute::{CalculatorTool, DateTool, JsonTool, MarkdownTool, TextTool};
 #[cfg(any(target_arch = "wasm32", unix))]
 use rust_agent::tools::interact::TodoWriteTool;
 use rust_agent::tools::interact::{AskUserQuestionTool, EnterPlanModeTool, ExitPlanModeTool};
 use rust_agent::tools::network::WebFetchTool;
-use rust_agent::tools::{ToolCategory, ToolMetadata, ToolRuntime};
+use rust_agent::tools::{
+    SkillCreateTool, SkillLoadTool, SkillResourceLoadTool, ToolCategory, ToolMetadata, ToolRuntime,
+};
 use ui::{
     PERSIST_IDLE, PERSIST_PENDING, PERSIST_STATE, TOOL_STATE_LOAD_ERROR, persist_task_in_flight,
     should_sync_persist_error, sync_persist_error,
@@ -49,6 +55,7 @@ const TOOL_STATES_KEY: &str = "tool_states";
 /// 时尽力写入、成功时清除；/tools 视图挂载时读取并提示——组件级 Signal
 /// 在视图重挂载后清空，仅靠它无法让"切换未落盘"跨挂载/跨重启可见。
 const TOOL_STATES_PERSIST_ERROR_KEY: &str = "tool_states_persist_error";
+const TOOL_STATE_OWNER_CHANGED: &str = "tool states owner changed before persistence";
 
 /// 工具活跃状态的进程级单例（纯内存）。Kernel 的 `ToolRuntime` 与 /tools
 /// 面板共享同一 `Arc<RwLock<HashSet>>`：面板切换后 Kernel 下一轮
@@ -70,6 +77,10 @@ const TOOL_STATES_PERSIST_ERROR_KEY: &str = "tool_states_persist_error";
 pub struct ToolStateService {
     disabled: Arc<RwLock<HashSet<String>>>,
     dirty: Arc<AtomicU64>,
+    /// 当前内存快照所属的持久化 owner。Web 的 IndexedDB 在浏览器 profile
+    /// 内跨账号共享；仅以 key 分区还不够，切换账号时也必须丢弃上一账号
+    /// 已加载到进程内存的禁用集合。
+    scope: Arc<RwLock<Option<String>>>,
 }
 
 impl ToolStateService {
@@ -77,6 +88,7 @@ impl ToolStateService {
         Self {
             disabled: Arc::new(RwLock::new(HashSet::new())),
             dirty: Arc::new(AtomicU64::new(0)),
+            scope: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -122,6 +134,7 @@ impl ToolStateService {
     /// 与 `ToolRuntime::import_disabled` 的语义差异（review Nit）：后者
     /// 无条件替换且不检查版本号——存储恢复只能走本方法，误用 runtime 侧
     /// 导入会覆盖用户刚做的未落盘切换（破坏 fail-closed 语义）。
+    #[cfg_attr(not(test), allow(dead_code))]
     fn apply_from_store(&self, disabled: Vec<String>) {
         let mut guard = self.disabled.write().expect("tool state lock poisoned");
         if self.dirty.load(Ordering::SeqCst) != 0 {
@@ -135,6 +148,74 @@ impl ToolStateService {
         guard.extend(disabled);
     }
 
+    /// 将持久化快照应用到指定 owner scope。scope 变化表示浏览器账户已
+    /// 切换：即使旧账户仍有 dirty 内存修改，也绝不能将其带入新账户，故
+    /// 原子清空并替换为新 scope 的快照；同一 scope 内仍保留原有的 dirty
+    /// 防覆盖语义。
+    fn apply_from_store_for_scope(&self, scope: String, disabled: Vec<String>) {
+        let mut scope_guard = self.scope.write().expect("tool state scope lock poisoned");
+        let scope_changed = scope_guard.as_deref() != Some(scope.as_str());
+        let mut disabled_guard = self.disabled.write().expect("tool state lock poisoned");
+        if !scope_changed && self.dirty.load(Ordering::SeqCst) != 0 {
+            tracing::debug!("tool states: local changes pending, skipping stale store apply");
+            return;
+        }
+        disabled_guard.clear();
+        disabled_guard.extend(disabled);
+        if scope_changed {
+            self.dirty.store(0, Ordering::SeqCst);
+        }
+        *scope_guard = Some(scope);
+    }
+
+    /// 切换到一个 owner 前先隔离内存状态。读取该 owner 的记录若失败，调用
+    /// 方不会再执行 `apply_from_store_for_scope`；因此必须在 IO 前完成清空，
+    /// 否则损坏/不可读的新记录会让上一账户的禁用清单残留在内存中。
+    fn activate_scope(&self, scope: &str) {
+        let mut scope_guard = self.scope.write().expect("tool state scope lock poisoned");
+        if scope_guard.as_deref() == Some(scope) {
+            return;
+        }
+        self.disabled
+            .write()
+            .expect("tool state lock poisoned")
+            .clear();
+        self.dirty.store(0, Ordering::SeqCst);
+        *scope_guard = Some(scope.to_string());
+    }
+
+    /// owner 无法确认时按 fail-open 重置状态。保留上一个账户的禁用集合会
+    /// 在下一个账户的工具页/会话中形成跨账户状态泄露。
+    fn clear_active_scope(&self) {
+        let mut scope_guard = self.scope.write().expect("tool state scope lock poisoned");
+        self.disabled
+            .write()
+            .expect("tool state lock poisoned")
+            .clear();
+        self.dirty.store(0, Ordering::SeqCst);
+        *scope_guard = None;
+    }
+
+    fn active_scope(&self) -> Option<String> {
+        self.scope
+            .read()
+            .expect("tool state scope lock poisoned")
+            .clone()
+    }
+
+    /// 仅为当前 owner 生成落盘快照。scope 在异步写入前后均会被检查，
+    /// 所以账户切换不会把新账户的内存状态写回旧账户的 key。
+    fn snapshot_with_version_for_scope(&self, scope: &str) -> Result<(Vec<String>, u64), String> {
+        let scope_guard = self.scope.read().expect("tool state scope lock poisoned");
+        if scope_guard.as_deref() != Some(scope) {
+            return Err(TOOL_STATE_OWNER_CHANGED.to_string());
+        }
+        let disabled_guard = self.disabled.read().expect("tool state lock poisoned");
+        let mut names: Vec<String> = disabled_guard.iter().cloned().collect();
+        names.sort();
+        Ok((names, self.dirty.load(Ordering::SeqCst)))
+    }
+
     /// 当前禁用集合快照 + 修改版本号（单次读锁内原子采样，review 中等
     /// 问题 3 修复）：落盘前记录版本号与快照必须一致——分开采样时，两者
     /// 之间发生切换（set_enabled）会让快照已含新变更而版本号未含，
@@ -142,6 +223,7 @@ impl ToolStateService {
     /// （fail-safe 但多一轮无谓落盘，且版本号语义失真）。持读锁期间与
     /// `set_enabled`/`apply_from_store` 的写锁互斥，读取一致；dirty 为
     /// 原子量，读锁内 load 同样安全（与 `has_retained_state` 同模式）。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot_with_version(&self) -> (Vec<String>, u64) {
         let guard = self.disabled.read().expect("tool state lock poisoned");
         let mut names: Vec<String> = guard.iter().cloned().collect();
@@ -194,15 +276,32 @@ impl ToolStateService {
             .ok();
     }
 
+    /// owner-scoped 条件清脏：仅在当前活跃 scope 仍等于落盘时的 scope 时
+    /// 才执行 [`Self::mark_clean`]。落盘 `store.set` await 期间账户切换会让
+    /// 新账户的 dirty 从 0 重新计数，若恰好累计到旧账户落盘时记录的版本号，
+    /// 裸 `mark_clean` 的 CAS 会把新账户未落盘修改误清零（review P2：跨
+    /// owner 竞态），下次存储加载用旧值静默覆盖新账户切换。scope 校验把
+    /// 竞态窗口从"await 期间（毫秒级）"收敛到两次顺序读锁之间（微秒级），
+    /// 该窗口内还需新账户版本号撞号，实际不可达。
+    fn mark_clean_for_scope(&self, scope: &str, persisted_at: u64) {
+        if self.active_scope().as_deref() != Some(scope) {
+            tracing::debug!("tool states: owner changed during persist, skip clean");
+            return;
+        }
+        self.mark_clean(persisted_at);
+    }
+
     /// 测试辅助：重置为默认全活跃（清空禁用集合并清除脏标记）。
     /// cfg 与 tests 模块一致：wasm32 下无 native 测试引用，避免 dead_code。
     #[cfg(all(test, not(target_arch = "wasm32")))]
     fn reset_all(&self) {
+        let mut scope = self.scope.write().expect("tool state scope lock poisoned");
         self.disabled
             .write()
             .expect("tool state lock poisoned")
             .clear();
         self.dirty.store(0, Ordering::SeqCst);
+        *scope = None;
     }
 }
 
@@ -212,21 +311,128 @@ pub fn tool_state_service() -> &'static ToolStateService {
     SERVICE.get_or_init(ToolStateService::new)
 }
 
+/// 当前活跃 scope 的不可识别 token，供后台落盘任务在 panic 恢复时把失败
+/// marker 写回其启动时所属账户，而不是账户切换后的当前账户。
+pub fn active_tool_state_scope() -> Option<String> {
+    tool_state_service().active_scope()
+}
+
+/// 将工具状态绑定到持久化 owner。Web key 使用不可逆 owner key，避免把
+/// 用户 id 暴露在 IndexedDB 的可枚举 key 中；Native 保留既有单用户 key。
+#[cfg(target_arch = "wasm32")]
+fn tool_state_scope(owner_id: &str) -> String {
+    rust_agent::memory::owner_key_for_id(owner_id)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tool_state_scope(_owner_id: &str) -> String {
+    "local".to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn tool_state_key(scope: &str) -> String {
+    format!("owners/{scope}/{TOOL_STATES_KEY}")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tool_state_key(_scope: &str) -> String {
+    TOOL_STATES_KEY.to_string()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn tool_state_persist_error_key(scope: &str) -> String {
+    format!("owners/{scope}/{TOOL_STATES_PERSIST_ERROR_KEY}")
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn tool_state_persist_error_key(_scope: &str) -> String {
+    TOOL_STATES_PERSIST_ERROR_KEY.to_string()
+}
+
 /// 从本地存储加载工具活跃状态到进程级单例（会话装配 / 面板打开时调用）。
 /// 无记录时保持默认全活跃；存储值格式不识别（数据损坏 / 旧版本格式）时
 /// 返回 Err 走 fail-open 横幅路径（显式告知“设置未恢复”，而非静默清空
 /// 用户停用列表）。本进程存在未落盘修改时跳过覆盖（见
 /// [`ToolStateService::apply_from_store`]）。
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
-pub async fn load_tool_states() -> Result<(), String> {
-    load_tool_states_from(open_kv_store().await?.as_ref()).await
+pub async fn load_tool_states(client: &Client) -> Result<(), String> {
+    let owner = match resolve_memory_owner(client).await {
+        Ok(owner) => owner,
+        Err(e) => {
+            tool_state_service().clear_active_scope();
+            return Err(e);
+        }
+    };
+    load_tool_states_for_owner(&owner).await
+}
+
+async fn load_tool_states_for_owner(owner: &str) -> Result<(), String> {
+    let scope = tool_state_scope(owner);
+    let store = open_kv_store().await?;
+    load_tool_states_from_scope(store.as_ref(), &scope).await
 }
 
 /// 将当前禁用集合持久化到本地存储（面板切换后调用）。落盘前与当前已
 /// 注册工具清单求交，过滤已不存在的陈旧工具名；成功后清除脏标记。
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 pub async fn persist_tool_states() -> Result<(), String> {
-    persist_tool_states_to(open_kv_store().await?.as_ref()).await
+    let Some(scope) = tool_state_service().active_scope() else {
+        return Err("tool states owner is not resolved".to_string());
+    };
+    let store = open_kv_store().await?;
+    match persist_tool_states_to_scope(store.as_ref(), &scope, registered_tool_names().clone())
+        .await
+    {
+        // 账户切换已将内存状态原子替换为新 scope；旧后台任务无需再报告
+        // "保存失败"，其 PENDING 后继轮会持久化新账户的最新快照。
+        Err(e) if e == TOOL_STATE_OWNER_CHANGED => Ok(()),
+        result => result,
+    }
+}
+
+/// 从指定 owner scope 读取状态。无记录也必须激活该 scope 并清空内存，
+/// 否则新账户会继续使用上一个账户已加载的禁用清单。
+async fn load_tool_states_from_scope(store: &dyn KvStore, scope: &str) -> Result<(), String> {
+    let _guard = PERSIST_LOCK.lock().await;
+    // 先切换内存 owner，再做可能失败的异步读取。见 `activate_scope`：失败
+    // 不能让前一账户状态继续生效。
+    tool_state_service().activate_scope(scope);
+    let key = tool_state_key(scope);
+    let disabled = load_tool_states_value(store, &key).await?;
+    tool_state_service().apply_from_store_for_scope(scope.to_string(), disabled);
+    Ok(())
+}
+
+async fn load_tool_states_value(store: &dyn KvStore, key: &str) -> Result<Vec<String>, String> {
+    match store.get(key).await {
+        Ok(Some(value)) => {
+            let Some(items) = value.as_array() else {
+                tracing::warn!(
+                    "tool states: stored value has unexpected format, ignoring: {value:?}"
+                );
+                return Err(
+                    "tool states: stored value has unexpected format (expected JSON array of tool names)"
+                        .to_string(),
+                );
+            };
+            let mut disabled = Vec::with_capacity(items.len());
+            for v in items {
+                let Some(s) = v.as_str() else {
+                    tracing::warn!(
+                        "tool states: array contains non-string element, ignoring: {v:?}"
+                    );
+                    return Err(
+                        "tool states: array contains non-string element (expected JSON array of tool names)"
+                            .to_string(),
+                    );
+                };
+                disabled.push(s.to_string());
+            }
+            Ok(disabled)
+        }
+        Ok(None) => Ok(Vec::new()),
+        Err(e) => Err(format!("tool states: {e}")),
+    }
 }
 
 /// [`load_tool_states`] 的核心，接收任意存储后端（测试注入 mock）。
@@ -237,6 +443,7 @@ pub async fn persist_tool_states() -> Result<(), String> {
 /// 横幅提示）。持锁后 load 与 persist 互斥：load 先跑则 persist 无法清
 /// dirty（apply 跳过陈旧值），persist 先跑则 load 读到最终值；锁序与
 /// persist 一致（先 PERSIST_LOCK 后 disabled 锁），无死锁。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn load_tool_states_from(store: &dyn KvStore) -> Result<(), String> {
     // 与持久化写串行化锁互斥（见 PERSIST_LOCK 注释），消除陈旧读窗口
     let _guard = PERSIST_LOCK.lock().await;
@@ -301,26 +508,18 @@ static PERSIST_LOCK: futures::lock::Mutex<()> = futures::lock::Mutex::new(());
 static REGISTERED_TOOL_NAMES: OnceLock<HashSet<String>> = OnceLock::new();
 
 /// 进程内已注册工具名集合（惰性初始化）。持久化落盘前与禁用集合求交，
-/// 过滤已不存在的陈旧工具名。
+/// 过滤已不存在的陈旧工具名。取**静态注册名集**（`registered_names`，
+/// 不过滤装配态可用性）：skill 的 schema 可见性依赖 attach 状态，而
+/// 落盘过滤只关心"工具在注册表中是否真实存在"，避免因装配态波动误丢
+/// 用户禁用设置（review：快照修复后 persist 路径未 attach skill）。
 fn registered_tool_names() -> &'static HashSet<String> {
-    REGISTERED_TOOL_NAMES.get_or_init(|| {
-        tool_schema_snapshot()
-            .into_iter()
-            .map(|(name, _, _)| name)
-            .collect()
-    })
-}
-
-/// [`persist_tool_states`] 的核心，接收任意存储后端（测试注入 mock）。
-/// 落盘前记录当前修改版本号：落盘期间若用户继续切换（版本号递增），
-/// 完成时的条件清除会被跳过，保证后续加载不会回灌陈旧状态。
-async fn persist_tool_states_to(store: &dyn KvStore) -> Result<(), String> {
-    persist_tool_states_to_with_known(store, registered_tool_names().clone()).await
+    REGISTERED_TOOL_NAMES.get_or_init(tool_registry_names)
 }
 
 /// 落盘核心（测试可注入自定义“已知工具注册表”，避免耦合真实
 /// `tool_schema_snapshot()` 的注册内容）。串行化锁在此获取：
 /// [`persist_tool_states_to`] 的并发调用在锁上排队，后发起者覆盖写最新快照。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn persist_tool_states_to_with_known(
     store: &dyn KvStore,
     known: HashSet<String>,
@@ -364,9 +563,47 @@ async fn persist_tool_states_to_with_known(
     Ok(())
 }
 
+/// owner-scoped 落盘实现。与 legacy 测试辅助函数分开保留，避免测试误把
+/// 未分区 key 当作 Web 生产协议；Web 的数据和失败标记都必须同 scope。
+async fn persist_tool_states_to_scope(
+    store: &dyn KvStore,
+    scope: &str,
+    known: HashSet<String>,
+) -> Result<(), String> {
+    let _persist_guard = PERSIST_LOCK.lock().await;
+    let (snapshot, persisted_at) = tool_state_service().snapshot_with_version_for_scope(scope)?;
+    let names: Vec<String> = snapshot
+        .into_iter()
+        .filter(|name| known.contains(name))
+        .collect();
+    let value =
+        serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect());
+    let key = tool_state_key(scope);
+    let marker_key = tool_state_persist_error_key(scope);
+    if let Err(e) = store.set(&key, &value, None).await {
+        if let Err(marker_err) = store
+            .set(
+                &marker_key,
+                &serde_json::json!(format!("tool states: {e}")),
+                None,
+            )
+            .await
+        {
+            tracing::warn!("tool states persist error marker write failed: {marker_err}");
+        }
+        return Err(format!("tool states: {e}"));
+    }
+    if let Err(marker_err) = store.delete(&marker_key).await {
+        tracing::warn!("tool states persist error marker delete failed: {marker_err}");
+    }
+    tool_state_service().mark_clean_for_scope(scope, persisted_at);
+    Ok(())
+}
+
 /// 读取"上次持久化失败"标记：存在表示最近一次切换未落盘，跨挂载/跨重启
 /// 可能回滚，需继续提示用户。无标记返回 None。视图挂载同步的完整流程见
 /// [`sync_persist_error_on_mount`]。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn pending_persist_error_from(store: &dyn KvStore) -> Option<String> {
     match store.get(TOOL_STATES_PERSIST_ERROR_KEY).await {
         Ok(Some(value)) => value.as_str().map(String::from),
@@ -383,8 +620,20 @@ async fn pending_persist_error_from(store: &dyn KvStore) -> Option<String> {
 /// 再决定置位/清空（无任务会再修改 marker，此刻读取即最终状态）。与 /tools
 /// 与会话视图挂载共用，两视图对"在途任务未收敛"感知一致。
 pub async fn sync_persist_error_on_mount(message: &str) {
+    let Some(scope) = tool_state_service().active_scope() else {
+        // owner 未确认时不得读取任意共享 marker，也不能保留前一账户的
+        // 横幅；将其显式清空以保证 UI 与 fail-open 工具状态一致。
+        sync_persist_error(None, message);
+        return;
+    };
     if let Ok(store) = open_kv_store().await {
-        sync_persist_error_on_mount_from(store.as_ref(), message, persist_task_in_flight()).await;
+        sync_persist_error_on_mount_from_key(
+            store.as_ref(),
+            &tool_state_persist_error_key(&scope),
+            message,
+            persist_task_in_flight(),
+        )
+        .await;
     }
     // 存储不可用无法读取标记：与"无标记"同处理（加载失败已有横幅），
     // 不额外提示。
@@ -393,8 +642,19 @@ pub async fn sync_persist_error_on_mount(message: &str) {
 /// [`sync_persist_error_on_mount`] 的核心，接收任意存储后端（测试注入
 /// mock）；`in_flight` 为挂载时刻是否存在在途落盘任务（测试可注入，不依赖
 /// 进程级状态机）。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn sync_persist_error_on_mount_from(store: &dyn KvStore, message: &str, in_flight: bool) {
-    let pending = mount_persist_error_pending(store, in_flight).await;
+    sync_persist_error_on_mount_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message, in_flight)
+        .await;
+}
+
+async fn sync_persist_error_on_mount_from_key(
+    store: &dyn KvStore,
+    marker_key: &str,
+    message: &str,
+    in_flight: bool,
+) {
+    let pending = mount_persist_error_pending_from_key(store, marker_key, in_flight).await;
     if should_sync_persist_error(&pending, in_flight) {
         sync_persist_error(pending, message);
     }
@@ -408,25 +668,46 @@ async fn sync_persist_error_on_mount_from(store: &dyn KvStore, message: &str, in
 /// 落盘任务（写/删 marker），无在途任务时重读一次缩小该窗口；有在途
 /// 任务时由任务完成路径（成功清空 / 失败置位信号）收敛最终状态，重读
 /// 反而可能读到写入前的 None 而误清任务即将置位的失败信号，故不重读。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn mount_persist_error_pending(store: &dyn KvStore, in_flight: bool) -> Option<String> {
-    let pending = pending_persist_error_from(store).await;
+    mount_persist_error_pending_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, in_flight).await
+}
+
+async fn mount_persist_error_pending_from_key(
+    store: &dyn KvStore,
+    marker_key: &str,
+    in_flight: bool,
+) -> Option<String> {
+    let pending = pending_persist_error_from_key(store, marker_key).await;
     if !in_flight {
-        pending_persist_error_from(store).await
+        pending_persist_error_from_key(store, marker_key).await
     } else {
         pending
+    }
+}
+
+async fn pending_persist_error_from_key(store: &dyn KvStore, marker_key: &str) -> Option<String> {
+    match store.get(marker_key).await {
+        Ok(Some(value)) => value.as_str().map(String::from),
+        _ => None,
     }
 }
 
 /// 尽力写入"上次持久化失败"标记（panic 恢复与持久化失败路径共用，接收
 /// 任意存储后端供测试注入 mock）。写入失败仅记 warn：存储不可用时该次
 /// 提示缺失可接受（加载失败已有横幅兜底）。
+#[cfg_attr(not(test), allow(dead_code))]
 async fn record_persist_error_marker_from(store: &dyn KvStore, message: &str) {
+    record_persist_error_marker_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message).await;
+}
+
+async fn record_persist_error_marker_from_key(
+    store: &dyn KvStore,
+    marker_key: &str,
+    message: &str,
+) {
     if let Err(marker_err) = store
-        .set(
-            TOOL_STATES_PERSIST_ERROR_KEY,
-            &serde_json::json!(message),
-            None,
-        )
+        .set(marker_key, &serde_json::json!(message), None)
         .await
     {
         tracing::warn!("tool states persist error marker write failed: {marker_err}");
@@ -454,9 +735,19 @@ async fn record_persist_error_marker_from(store: &dyn KvStore, message: &str) {
 /// #[must_use]：返回值是补轮信号，忽略即静默丢弃挂起切换（仅 marker
 /// 提示兜底）——未来新增调用方必须显式消费。
 #[must_use]
-pub async fn recover_persist_panic(message: &str) -> bool {
+pub async fn recover_persist_panic(scope: Option<&str>, message: &str) -> bool {
+    let Some(scope) = scope else {
+        return converge_persist_state();
+    };
     match open_kv_store().await {
-        Ok(store) => recover_persist_panic_from(store.as_ref(), message).await,
+        Ok(store) => {
+            recover_persist_panic_from_key(
+                store.as_ref(),
+                &tool_state_persist_error_key(scope),
+                message,
+            )
+            .await
+        }
         Err(_) => converge_persist_state(),
     }
 }
@@ -464,9 +755,18 @@ pub async fn recover_persist_panic(message: &str) -> bool {
 /// [`recover_persist_panic`] 的核心，接收任意存储后端（测试注入 mock）。
 /// 返回语义同 [`recover_persist_panic`]（#[must_use]：见其文档）。
 #[must_use]
+#[cfg_attr(not(test), allow(dead_code))]
 async fn recover_persist_panic_from(store: &dyn KvStore, message: &str) -> bool {
+    recover_persist_panic_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message).await
+}
+
+async fn recover_persist_panic_from_key(
+    store: &dyn KvStore,
+    marker_key: &str,
+    message: &str,
+) -> bool {
     if tool_state_service().dirty_version() != 0 {
-        record_persist_error_marker_from(store, message).await;
+        record_persist_error_marker_from_key(store, marker_key, message).await;
     }
     converge_persist_state()
 }
@@ -512,6 +812,9 @@ pub struct AgentBridge {
     pub cwd: String,
     /// 生产 MemoryService（每 session 实例；禁用时为 None）。
     pub memory: Option<Arc<MemoryService>>,
+    /// One-shot authorizer for a user-command-triggered Skill creation.  The
+    /// tool is otherwise hidden from the model and rejects execution.
+    pub skill_create: Arc<SkillCreateTool>,
 }
 
 impl AgentBridge {
@@ -785,10 +1088,82 @@ impl AsyncSystemPromptProvider for MemoryProvider {
     }
 }
 
-/// 装配生产 MemoryService（每 session 实例；配置禁用或装配失败时返回
-/// `None`——Memory 任一失败不阻断主 Agent，观测信息记录在 service 内）。
+/// 会话级动态提示词提供者。工具启用状态可在 `/tools` 页面运行时改变，技能
+/// 索引也会被 Agent 写入；因此不能只在会话初始化时把它们拼入静态 prompt。
+/// 每个 Querying 轮在与 tool schema 相同的禁用集合快照下重新筛选技能，确保
+/// 被禁用的 `skill` 工具不会留下模型无法执行的技能说明。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+struct SessionPromptProvider {
+    memory: Option<MemoryProvider>,
+    skill_store: Option<Arc<SkillStore>>,
+    registered_tools: HashSet<String>,
+    disabled_tools: Arc<RwLock<HashSet<String>>>,
+}
+
+fn skill_context_from_tool_state(
+    registered_tools: &HashSet<String>,
+    disabled_tools: &Arc<RwLock<HashSet<String>>>,
+) -> SkillContext {
+    let disabled = disabled_tools
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    SkillContext {
+        platform: rust_agent::platform::Platform::current(),
+        available_tools: registered_tools
+            .iter()
+            .filter(|name| !disabled.contains(*name))
+            .cloned()
+            .collect(),
+    }
+}
+
+/// 当前用户界面可用的技能加载上下文。`/skill` 与 Agent 的 `skill` 工具都
+/// 必须使用这一份动态快照，避免绕过 `/tools` 的禁用状态或 skill 依赖门控。
+pub fn current_skill_context() -> SkillContext {
+    skill_context_from_tool_state(registered_tool_names(), &tool_state_service().shared())
+}
+
+impl SessionPromptProvider {
+    fn skill_context(&self) -> SkillContext {
+        skill_context_from_tool_state(&self.registered_tools, &self.disabled_tools)
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl AsyncSystemPromptProvider for SessionPromptProvider {
+    async fn provide(&self, messages: &[ConversationMessage]) -> Option<String> {
+        let mut sections = Vec::new();
+        let skill_context = self.skill_context();
+        if skill_context
+            .available_tools
+            .iter()
+            .any(|name| name == "skill")
+            && let Some(skill_store) = &self.skill_store
+        {
+            match skill_store.list(&skill_context).await {
+                Ok(skills) => {
+                    if let Some(section) = rust_agent::context::skills_section(&skills) {
+                        sections.push(section);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "skill index load failed"),
+            }
+        }
+        if let Some(memory) = &self.memory
+            && let Some(section) = memory.provide(messages).await
+        {
+            sections.push(section);
+        }
+        (!sections.is_empty()).then(|| sections.join("\n\n"))
+    }
+}
+
+/// 装配生产 MemoryService（每 session 实例；装配失败不阻断主 Agent，观测
+/// 信息记录在 service 内）。记忆召回始终可用；长期自动提取由记忆库中的
+/// owner-scoped 开关控制，默认开启。
 /// 配置来自 [`MemoryServiceConfig::from_env`]（§18；web 无 env 走默认值），
-/// 不再硬编码 enabled。
+/// 仅保留容量、阈值和 embedding profile 等运行参数，不包含启用开关。
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 async fn build_memory_service(
     model: &Arc<rust_agent::model_service::GatewayModelClient<Rt>>,
@@ -797,10 +1172,6 @@ async fn build_memory_service(
     owner_id: &str,
 ) -> Option<Arc<MemoryService>> {
     let config = rust_agent::memory::MemoryServiceConfig::from_env();
-    if !config.enabled {
-        tracing::info!("memory service disabled by config");
-        return None;
-    }
     let stores = match open_memory_stores_handle().await {
         Ok(stores) => stores,
         Err(e) => {
@@ -847,6 +1218,28 @@ async fn build_memory_service(
     }
 }
 
+/// 为记忆管理页装配最小 durable 删除服务。读取、删除和清空不需要生成
+/// embedding；仅在底层存储或索引确实不可用时失败。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+async fn build_memory_management_service(
+    model: &Arc<rust_agent::model_service::GatewayModelClient<Rt>>,
+    cwd: &str,
+    owner_id: &str,
+) -> Result<Arc<MemoryService>, String> {
+    let config = rust_agent::memory::MemoryServiceConfig::from_env();
+    let stores = open_memory_stores_handle().await?;
+    let context = MemoryContext::for_owner(project_slug(cwd), "memory-browser", owner_id);
+    MemoryService::new(
+        stores,
+        Arc::clone(model) as Arc<dyn rust_agent::model_client::ModelClient>,
+        context,
+        config,
+    )
+    .await
+    .map(Arc::new)
+    .map_err(|error| format!("initialize durable memory management: {error}"))
+}
+
 /// Run durable extraction under the strongest session lock available on the
 /// host. `MemoryStores` already serializes independent service instances in a
 /// single runtime; browsers additionally need an origin-wide lock because each
@@ -858,6 +1251,8 @@ pub async fn extract_durable_serialized(
     messages: Vec<ConversationMessage>,
     reason: rust_agent::memory::ExtractionReason,
 ) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
+    let mutation_gate = memory.durable_mutation_gate();
+    let _mutation_guard = mutation_gate.lock().await;
     memory
         .extract_durable_if_current(extraction_token, messages, reason)
         .await
@@ -870,6 +1265,8 @@ pub async fn clear_current_session_serialized(
     memory: Arc<MemoryService>,
     force_forget_memories: bool,
 ) -> Result<rust_agent::memory::SessionMemoryClearOutcome, rust_agent::error::MemoryError> {
+    let mutation_gate = memory.durable_mutation_gate();
+    let _mutation_guard = mutation_gate.lock().await;
     memory.clear_current_session(force_forget_memories).await
 }
 
@@ -893,6 +1290,28 @@ struct WebLockedMemoryWriter {
     memory: Arc<MemoryService>,
 }
 
+/// Native has one runtime, so the process-shared `MemoryStores` mutex is the
+/// equivalent of the browser's origin-wide Web Lock.  Route model-triggered
+/// `memory_write` through it too: a confirmed library clear must not race a
+/// direct write from another active session.
+#[cfg(not(target_arch = "wasm32"))]
+struct ProcessLockedMemoryWriter {
+    memory: Arc<MemoryService>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[async_trait::async_trait]
+impl rust_agent::tools::MemoryWriter for ProcessLockedMemoryWriter {
+    async fn write(
+        &self,
+        record: rust_agent::memory::NewMemoryEntry,
+    ) -> Result<String, rust_agent::error::MemoryError> {
+        let mutation_gate = self.memory.durable_mutation_gate();
+        let _mutation_guard = mutation_gate.lock().await;
+        self.memory.write_memory(record).await
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 #[async_trait::async_trait(?Send)]
 impl rust_agent::tools::MemoryWriter for WebLockedMemoryWriter {
@@ -900,8 +1319,10 @@ impl rust_agent::tools::MemoryWriter for WebLockedMemoryWriter {
         &self,
         record: rust_agent::memory::NewMemoryEntry,
     ) -> Result<String, rust_agent::error::MemoryError> {
-        let lock_name = self.memory.extraction_lock_name();
-        with_web_lock(&lock_name, self.memory.write_memory(record)).await
+        with_durable_write_locks(Arc::clone(&self.memory), |memory: Arc<MemoryService>| {
+            Box::pin(async move { memory.write_memory(record).await })
+        })
+        .await
     }
 }
 
@@ -910,6 +1331,43 @@ impl rust_agent::tools::MemoryWriter for WebLockedMemoryWriter {
 /// extraction fails closed while the primary Agent conversation remains usable;
 /// running without a lock would reintroduce duplicate, non-deterministic
 /// durable-memory writes.
+#[cfg(target_arch = "wasm32")]
+const DURABLE_MEMORY_WRITE_LOCK: &str = "ains-durable-memory-write-v1";
+
+/// Run one durable-memory mutation under the origin-wide lock shared by every
+/// browser tab.  Preference updates use this too: otherwise a second tab can
+/// flip automatic extraction off while a first tab has already passed its
+/// preference check and is about to persist extracted records.
+#[cfg(target_arch = "wasm32")]
+async fn with_durable_memory_write_lock<T, E>(
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E>
+where
+    E: From<rust_agent::error::MemoryError>,
+{
+    with_web_lock(DURABLE_MEMORY_WRITE_LOCK, operation).await
+}
+
+/// Serialize every durable-memory mutation across browser tabs.  A per-session
+/// lock alone cannot protect management deletes from an extraction in another
+/// session/tab, which could otherwise recreate a record immediately after it
+/// is removed.  Always acquire the global lock before the session lock.
+#[cfg(target_arch = "wasm32")]
+async fn with_durable_write_locks<T>(
+    memory: Arc<MemoryService>,
+    operation: impl FnOnce(
+        Arc<MemoryService>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, rust_agent::error::MemoryError>>>,
+    >,
+) -> Result<T, rust_agent::error::MemoryError> {
+    let session_lock = memory.extraction_lock_name();
+    with_durable_memory_write_lock(
+        async move { with_web_lock(&session_lock, operation(memory)).await },
+    )
+    .await
+}
+
 #[cfg(target_arch = "wasm32")]
 async fn with_web_lock<T, E>(
     lock_name: &str,
@@ -978,11 +1436,13 @@ pub async fn extract_durable_serialized(
     messages: Vec<ConversationMessage>,
     reason: rust_agent::memory::ExtractionReason,
 ) -> Result<rust_agent::memory::ExtractionOutcome, rust_agent::error::MemoryError> {
-    let lock_name = memory.extraction_lock_name();
-    with_web_lock(
-        &lock_name,
-        memory.extract_durable_if_current(extraction_token, messages, reason),
-    )
+    with_durable_write_locks(memory, move |memory: Arc<MemoryService>| {
+        Box::pin(async move {
+            memory
+                .extract_durable_if_current(extraction_token, messages, reason)
+                .await
+        })
+    })
     .await
 }
 
@@ -991,11 +1451,9 @@ pub async fn clear_current_session_serialized(
     memory: Arc<MemoryService>,
     force_forget_memories: bool,
 ) -> Result<rust_agent::memory::SessionMemoryClearOutcome, rust_agent::error::MemoryError> {
-    let lock_name = memory.extraction_lock_name();
-    with_web_lock(
-        &lock_name,
-        memory.clear_current_session(force_forget_memories),
-    )
+    with_durable_write_locks(memory, move |memory: Arc<MemoryService>| {
+        Box::pin(async move { memory.clear_current_session(force_forget_memories).await })
+    })
     .await
 }
 
@@ -1005,9 +1463,8 @@ pub async fn save_checkpoint_serialized(
     messages: Vec<ConversationMessage>,
     metadata: Option<rust_agent::memory::SessionCheckpoint>,
 ) -> Result<(), rust_agent::error::MemoryError> {
-    let lock_name = memory.extraction_lock_name();
-    with_web_lock(&lock_name, async move {
-        memory.save_checkpoint(&messages, metadata.as_ref()).await
+    with_durable_write_locks(memory, move |memory: Arc<MemoryService>| {
+        Box::pin(async move { memory.save_checkpoint(&messages, metadata.as_ref()).await })
     })
     .await
 }
@@ -1020,7 +1477,7 @@ mod web_lock_tests {
     use gloo_timers::future::TimeoutFuture;
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
-    use super::with_web_lock;
+    use super::with_durable_memory_write_lock;
     use rust_agent::error::MemoryError;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -1028,10 +1485,9 @@ mod web_lock_tests {
     #[wasm_bindgen_test]
     async fn web_locks_serialize_same_name_operations_and_release_after_completion() {
         let trace = Rc::new(RefCell::new(Vec::new()));
-        let lock_name = format!("ains-web-lock-regression-{}", rust_agent::memory::now_ms());
 
         let first_trace = Rc::clone(&trace);
-        let first = with_web_lock(&lock_name, async move {
+        let first = with_durable_memory_write_lock(async move {
             first_trace.borrow_mut().push("first-acquired");
             // Keep the critical section pending long enough for the second
             // request to enqueue against the same browser-global lock.
@@ -1040,7 +1496,7 @@ mod web_lock_tests {
             Ok::<(), MemoryError>(())
         });
         let second_trace = Rc::clone(&trace);
-        let second = with_web_lock(&lock_name, async move {
+        let second = with_durable_memory_write_lock(async move {
             second_trace.borrow_mut().push("second-acquired");
             Ok::<(), MemoryError>(())
         });
@@ -1105,6 +1561,44 @@ fn memdir_store_for_owner(kv: Arc<dyn KvStore>, owner_id: &str) -> Arc<MemdirSto
 #[cfg(not(target_arch = "wasm32"))]
 fn memdir_store_for_owner(kv: Arc<dyn KvStore>, _owner_id: &str) -> Arc<MemdirStore> {
     Arc::new(MemdirStore::new(kv))
+}
+
+#[cfg(target_arch = "wasm32")]
+#[allow(clippy::arc_with_non_send_sync)]
+async fn skill_store_for_owner(
+    kv: Arc<dyn KvStore>,
+    owner_id: &str,
+) -> Result<Arc<SkillStore>, String> {
+    let scope = rust_agent::memory::owner_key_for_id(owner_id);
+    let files = open_platform_skill_files(scope.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(SkillStore::new_scoped(kv, files, scope)))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn native_skill_root(data_root: &std::path::Path, scope: &str) -> std::path::PathBuf {
+    data_root.join("skills").join(scope)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn skill_store_for_owner(
+    kv: Arc<dyn KvStore>,
+    owner_id: &str,
+) -> Result<Arc<SkillStore>, String> {
+    // Keep Native/Desktop equivalent to Web: both the KV namespace and the
+    // package filesystem belong to one authenticated storage owner.  New
+    // deployments have no legacy unscoped skills to migrate.
+    let scope = rust_agent::memory::owner_key_for_id(owner_id);
+    let data_root = native_data_path()?
+        .parent()
+        .ok_or_else(|| "skill data root missing".to_string())?
+        .to_path_buf();
+    let root = native_skill_root(&data_root, &scope);
+    let files = open_platform_skill_files(root)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(Arc::new(SkillStore::new_scoped(kv, files, scope)))
 }
 
 /// Native storage-encryption key environment variable.  The value is exactly
@@ -1184,20 +1678,53 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 /// Skills 面板的轻量入口：不拉起 Kernel，仅打开存储（Phase 6.4）。
 // 双端统一用 Arc（native 多线程需要；wasm 单线程下非 Send 无害）
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
-pub async fn open_skill_store() -> Result<Arc<KvSkillStore>, String> {
-    Ok(Arc::new(KvSkillStore::new(open_kv_store().await?)))
+pub async fn open_skill_store(client: Client) -> Result<Arc<SkillStore>, String> {
+    let owner = resolve_memory_owner(&client).await?;
+    skill_store_for_owner(open_kv_store().await?, &owner).await
 }
 
-/// 生产 durable memory manifest 的轻量入口（§9.4 / P2 `/memory` 向量搜索）：
-/// 无 MemoryService 实例，直接读 `memories` 表并按当前项目可见性过滤。
-/// 返回 `[{type}] {title} ({age}) - {description}` 行（≤80 条）。
-pub async fn open_durable_manifest(client: Client) -> Result<Vec<String>, String> {
-    use rust_agent::memory::build_durable_manifest;
+/// Export one complete standard Agent Skills package. Callers may serialize the
+/// returned relative file map as a directory or archive without AINS metadata.
+/// `views/skills.rs` calls this on wasm32/desktop builds; `#[allow(dead_code)]`
+/// only covers the server-only build where no UI calls it.
+#[allow(dead_code)]
+pub async fn export_skill_package(
+    client: Client,
+    name: &str,
+) -> Result<rust_agent::skills::SkillPackage, String> {
+    open_skill_store(client)
+        .await?
+        .export_package(name)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Import a standard Agent Skills package into the current owner's library.
+/// `views/skills.rs` calls this on wasm32/desktop builds; `#[allow(dead_code)]`
+/// only covers the server-only build where no UI calls it.
+#[allow(dead_code)]
+pub async fn import_skill_package(
+    client: Client,
+    package: rust_agent::skills::SkillPackage,
+) -> Result<rust_agent::skills::SkillSummary, String> {
+    open_skill_store(client)
+        .await?
+        .import_package(package)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// 记忆库 durable manifest 的轻量入口：不拉起 Agent，仅读 `memories` 表。
+/// Private / Project 记录按当前账户跨项目聚合，Team 记录仅限当前 team；返回
+/// 带 canonical id 的管理项（≤80 条），供页面展示和精确删除。
+pub async fn open_durable_manifest(
+    client: Client,
+) -> Result<Vec<DurableMemoryManifestItem>, String> {
     let stores = open_memory_stores_handle().await?;
     let project_key = project_slug(&bridge_cwd()?);
     let owner = resolve_memory_owner(&client).await?;
     let context = MemoryContext::for_owner(project_key, "manifest", owner);
-    build_durable_manifest(&*stores.memories, &context)
+    build_durable_library_manifest_items(&*stores.memories, &context)
         .await
         .map_err(|e| e.to_string())
 }
@@ -1218,13 +1745,89 @@ pub async fn search_durable_memory(
     let cwd = bridge_cwd()?;
     let owner = resolve_memory_owner(&client).await?;
     let model = GatewayModelClient::<Rt>::shared(client.clone());
-    let service = build_memory_service(&model, &cwd, Some("memory-browser"), &owner)
-        .await
-        .ok_or_else(|| "memory service is unavailable or disabled".to_string())?;
+    let service = build_memory_management_service(&model, &cwd, &owner).await?;
     service
         .search(query, top_k.clamp(1, 20))
         .await
         .map_err(|e| e.to_string())
+}
+
+/// Read the owner-scoped automatic durable-memory extraction preference.
+pub async fn memory_auto_extract_enabled(client: Client) -> Result<bool, String> {
+    let cwd = bridge_cwd()?;
+    let owner = resolve_memory_owner(&client).await?;
+    let model = GatewayModelClient::<Rt>::shared(client);
+    build_memory_management_service(&model, &cwd, &owner)
+        .await?
+        .auto_extract_enabled()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Persist the memory-library switch. Existing Agent sessions read this value
+/// immediately before scheduling durable extraction, so no restart is needed.
+pub async fn set_memory_auto_extract_enabled(client: Client, enabled: bool) -> Result<(), String> {
+    let cwd = bridge_cwd()?;
+    let owner = resolve_memory_owner(&client).await?;
+    let model = GatewayModelClient::<Rt>::shared(client);
+    let service = build_memory_management_service(&model, &cwd, &owner).await?;
+    // The browser's IndexedDB is shared by tabs.  Reuse the same origin-wide
+    // lock as extraction/deletion, so a successful toggle is a boundary: no
+    // extraction that began before the toggle can write after it completes.
+    #[cfg(target_arch = "wasm32")]
+    let result = with_durable_memory_write_lock(service.set_auto_extract_enabled(enabled)).await;
+    #[cfg(not(target_arch = "wasm32"))]
+    let result = service.set_auto_extract_enabled(enabled).await;
+    result.map_err(|e| e.to_string())
+}
+
+/// 记忆库“清空全部”的 durable-vector 部分。与管理页清单同口径：个人和
+/// 项目记录按账户跨项目清理，团队记录仅限当前 team。
+pub async fn clear_durable_memories(client: Client) -> Result<usize, String> {
+    let cwd = bridge_cwd()?;
+    let owner = resolve_memory_owner(&client).await?;
+    let model = GatewayModelClient::<Rt>::shared(client);
+    let service = build_memory_management_service(&model, &cwd, &owner).await?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        with_durable_memory_write_lock(service.clear_library_memories())
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mutation_gate = service.durable_mutation_gate();
+        let _mutation_guard = mutation_gate.lock().await;
+        service
+            .clear_library_memories()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// 删除记忆库中的一条 durable memory；服务层按账户级库的授权范围重新校验：
+/// Private / Project 可跨该账户项目删除，Team 仍只限当前 team。UI 传入的 id
+/// 不构成越权能力。
+pub async fn delete_durable_memory(client: Client, id: &str) -> Result<bool, String> {
+    let cwd = bridge_cwd()?;
+    let owner = resolve_memory_owner(&client).await?;
+    let model = GatewayModelClient::<Rt>::shared(client);
+    let service = build_memory_management_service(&model, &cwd, &owner).await?;
+    #[cfg(target_arch = "wasm32")]
+    {
+        with_durable_memory_write_lock(service.delete_library_memory(id))
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mutation_gate = service.durable_mutation_gate();
+        let _mutation_guard = mutation_gate.lock().await;
+        service
+            .delete_library_memory(id)
+            .await
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Memory 浏览器的轻量入口（Phase 6.6）：打开 memdir 长期记忆库。
@@ -1262,27 +1865,75 @@ fn resolve_schema_workspace(cwd: Result<String, String>) -> std::path::PathBuf {
         .unwrap_or_else(|_| std::path::PathBuf::from(SCHEMA_PLACEHOLDER_WORKSPACE))
 }
 
-/// Tool 面板的轻量入口（Phase 6.7）：仅构造 ToolRuntime 取（name,
-/// description, category）快照，不装配 Kernel/会话恢复/权限通道。
-pub fn tool_schema_snapshot() -> Vec<(String, String, ToolCategory)> {
+/// 快照/注册名投影共用的轻量 runtime：仅构造 ToolRuntime 与注册表，
+/// 不装配 Kernel/会话恢复/权限通道。The snapshot never executes tools,
+/// but pass a real workspace when it is available so the registered
+/// background-task schema has the same safe construction path as a live
+/// agent session. 进程 cwd 不可用时回退占位路径（
+/// [`resolve_schema_workspace`]），保证 background_task 始终注册（review
+/// Major #1：缺失注册会让持久化过滤掉该工具的禁用设置）。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
+fn schema_runtime() -> (ToolRuntime, RegisteredAgentTools) {
     let engine = PermissionEngine::new(PermissionMode::Default, PermissionSettings::default());
     let (interaction, _interaction_rx) = UiInteraction::channel();
     let mut runtime = ToolRuntime::new();
-    // The snapshot never executes tools, but pass a real workspace when it is
-    // available so the registered background-task schema has the same safe
-    // construction path as a live agent session. 进程 cwd 不可用时回退占位
-    // 路径（[`resolve_schema_workspace`]），保证 background_task 始终注册
-    //（review Major #1：缺失注册会让持久化过滤掉该工具的禁用设置）。
     #[cfg(target_arch = "wasm32")]
     let schema_workspace: Option<std::path::PathBuf> = None;
     #[cfg(not(target_arch = "wasm32"))]
     let schema_workspace = Some(resolve_schema_workspace(bridge_cwd()));
-    register_tools(
+    let tools = register_tools(
         &mut runtime,
         &engine,
         interaction,
         &SandboxPolicy::default(),
         schema_workspace.as_deref(),
+    );
+    (runtime, tools)
+}
+
+/// 静态注册工具名集合（不过滤装配态可用性）：`REGISTERED_TOOL_NAMES`
+/// 缓存（持久化落盘过滤白名单）的数据源。与 `tool_schema_snapshot`
+/// （面板展示，`all_schemas` 过滤 `is_available`）不同，这里反映"注册表
+/// 是否静态存在该工具"。skill 工具在真实会话必然 attach、快照 attach 桩
+/// 后同样可见；一次性授权 skill_create 与平台缺失工具（clipboard 等）
+/// 也包含在内——禁用集合只能来自 /tools 面板（不含这些工具），白名单
+/// 更宽不会误丢任何真实工具的禁用设置（review：快照修复后 persist 路径
+/// 未 attach skill，契约断言不得再依赖装配态可用性）。
+fn tool_registry_names() -> HashSet<String> {
+    let (runtime, _) = schema_runtime();
+    runtime.registered_names().into_iter().collect()
+}
+
+/// Tool 面板的轻量入口（Phase 6.7）：仅构造 ToolRuntime 取（name,
+/// description, category）快照，不装配 Kernel/会话恢复/权限通道。
+pub fn tool_schema_snapshot() -> Vec<(String, String, ToolCategory)> {
+    let (runtime, (_, _, skill_load, skill_resource, _)) = schema_runtime();
+    // skill 工具在真实会话装配中必然 attach 存储；快照路径没有（也不该
+    // 有）真实存储。attach 无状态内存桩使 skill/skill_resource 的 schema
+    // 投影与真实会话一致——否则 REGISTERED_TOOL_NAMES 缺失 skill，用户
+    // 禁用 skill 的设置会在落盘求交时被静默过滤丢弃（与 background_task
+    // 同因，review）。桩存储绝不执行：快照只做注册表投影，任何对桩的
+    // 执行调用都会失败（这正是想要的）。
+    let stub_store = Arc::new(SkillStore::new(
+        Arc::new(InMemoryKvStore::default()),
+        schema_stub_skill_files(),
+    ));
+    let stub_disabled = Arc::new(RwLock::new(HashSet::new()));
+    // 桩 attach 的 registered_tools 必须与真实会话一致（静态注册名集）：
+    // skill_resource 的可用性依赖 available_tools 含 "skill"，若传空集其
+    // schema 投影缺失，面板将看不到 skill_resource（review：时序 bug 同源）。
+    let stub_registered = runtime.registered_names();
+    skill_load.attach(
+        Arc::clone(&stub_store),
+        rust_agent::platform::Platform::current(),
+        stub_registered.clone(),
+        Arc::clone(&stub_disabled),
+    );
+    skill_resource.attach(
+        Arc::clone(&stub_store),
+        rust_agent::platform::Platform::current(),
+        stub_registered,
+        Arc::clone(&stub_disabled),
     );
     runtime
         .all_schemas()
@@ -1347,8 +1998,17 @@ fn bridge_cwd() -> Result<String, String> {
 /// - Shell + 系统集成：仅 Desktop 原生（Mobile 的 Android/iOS 应用沙箱禁止/
 ///   无法有用地派生子进程；Web 由浏览器隔离）。
 ///
-/// 返回 memory_read / memory_write 工具的共享句柄（P3）：工具在装配期始终
-/// 注册（注册集静态稳定），会话装配完成 MemoryService 后由调用方 attach。
+/// 返回 Memory 写工具、Skill 加载/资源读取工具及受命令授权的创建工具共享句柄。
+/// 它们在装配期注册，
+/// 存储就绪后由调用方 attach；未 attach 时显式报错，避免对模型宣称成功。
+type RegisteredAgentTools = (
+    Arc<rust_agent::tools::memory::MemoryReadTool>,
+    Arc<rust_agent::tools::memory::MemoryWriteTool>,
+    Arc<SkillLoadTool>,
+    Arc<SkillResourceLoadTool>,
+    Arc<SkillCreateTool>,
+);
+
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 fn register_tools(
     runtime: &mut ToolRuntime,
@@ -1356,12 +2016,14 @@ fn register_tools(
     interaction: Arc<UiInteraction>,
     policy: &SandboxPolicy,
     workspace: Option<&std::path::Path>,
-) -> (
-    Arc<rust_agent::tools::memory::MemoryReadTool>,
-    Arc<rust_agent::tools::memory::MemoryWriteTool>,
-) {
+) -> RegisteredAgentTools {
     let memory_read = Arc::new(rust_agent::tools::memory::MemoryReadTool::new());
     let memory_write = Arc::new(rust_agent::tools::memory::MemoryWriteTool::new());
+    let skill_load = Arc::new(SkillLoadTool::new());
+    let skill_resource = Arc::new(SkillResourceLoadTool::with_activated(
+        skill_load.activated_skills(),
+    ));
+    let skill_create = Arc::new(SkillCreateTool::new());
     #[cfg(target_arch = "wasm32")]
     let _ = workspace;
     runtime.register(Box::new(CalculatorTool));
@@ -1382,6 +2044,9 @@ fn register_tools(
     // service 由调用方在会话装配完成后 attach（clone 共享内部 RwLock）。
     runtime.register(Box::new((*memory_read).clone()));
     runtime.register(Box::new((*memory_write).clone()));
+    runtime.register(Box::new((*skill_load).clone()));
+    runtime.register(Box::new((*skill_resource).clone()));
+    runtime.register(Box::new((*skill_create).clone()));
 
     #[cfg(not(target_arch = "wasm32"))]
     {
@@ -1432,20 +2097,26 @@ fn register_tools(
     // （落盘过滤已知工具集用）必须与实际注册集一致。缓存可能已由先前落盘经
     // `registered_tool_names()` 创建——若不一致，说明引入了动态注册（如
     // MCP 热插拔）或注册条件变化，缓存已失效，用户禁用设置会在落盘时被
-    // 静默过滤（需在注册点失效缓存）。比较用无过滤的 `registered_names`
-    // （review Nit 1）：api_schemas 带禁用过滤，若 runtime 已 share_disabled
-    // 且禁用集合非空，过滤后的集合必然 ⊆ 缓存，debug 断言会误报 panic，
-    // 掩盖真实的缓存失效；原始注册集语义与缓存（fresh runtime 快照）一致。
+    // 静默过滤（需在注册点失效缓存）。比较用**静态注册名集**
+    // （`registered_names`，与装配态可用性无关）：skill 的 schema 可见性
+    // 依赖 attach（快照路径用桩、persist 路径未 attach），若比较过滤后的
+    // `all_schemas` 会把装配态波动误判为动态注册（review 修复）。
     #[cfg(debug_assertions)]
     if let Some(cached) = REGISTERED_TOOL_NAMES.get() {
-        let actual = runtime.registered_names();
+        let actual: HashSet<String> = runtime.registered_names().into_iter().collect();
         debug_assert_eq!(
             cached, &actual,
             "registered tool set diverged from REGISTERED_TOOL_NAMES cache; \
              dynamic registration requires cache invalidation"
         );
     }
-    (memory_read, memory_write)
+    (
+        memory_read,
+        memory_write,
+        skill_load,
+        skill_resource,
+        skill_create,
+    )
 }
 
 /// 装配 Agent 会话。`client` 由宿主提供（Web 复用已认证的 AuthState
@@ -1454,12 +2125,29 @@ fn register_tools(
 #[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     let kv = open_kv_store().await?;
+    // Web IndexedDB is shared by every account in a browser profile. Resolve
+    // the owner before reading tool-state keys too; otherwise a newly logged
+    // in account could inherit the previous account's disabled tools.
+    let storage_owner = match resolve_memory_owner(&client).await {
+        Ok(owner) => Some(owner),
+        Err(e) => {
+            tracing::warn!("persistent storage owner unavailable: {e}");
+            None
+        }
+    };
     // 恢复工具活跃状态。读取失败不阻断会话（存储不可读时无法恢复禁用
     // 清单），但必须升级为 error 并明确告知：这是 fail-open 回退——
     // 用户此前禁用的工具会在本会话恢复为活跃，防止静默失效。失败信息
     // 写入进程级信号 TOOL_STATE_LOAD_ERROR（/tools 与会话视图共享订阅，
     // 替代原 AgentBridge 装配时快照，review Minor 1 修复）。
-    match load_tool_states().await {
+    let tool_state_restore = match storage_owner.as_deref() {
+        Some(owner) => load_tool_states_for_owner(owner).await,
+        None => {
+            tool_state_service().clear_active_scope();
+            Err("tool states owner is not resolved".to_string())
+        }
+    };
+    match tool_state_restore {
         Ok(()) => *TOOL_STATE_LOAD_ERROR.write() = None,
         Err(e) => {
             tracing::error!("tool state restore failed, tools default to active: {e}");
@@ -1498,7 +2186,7 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
     // 幂等：后续装配仅读取。
     let _ = registered_tool_names();
     let mut runtime = ToolRuntime::new();
-    let (memory_read, memory_write) = register_tools(
+    let (memory_read, memory_write, skill_load, skill_resource, skill_create) = register_tools(
         &mut runtime,
         &engine,
         interaction,
@@ -1512,24 +2200,21 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         tool_state_service().shared(),
         Some(tool_state_service().dirty_observer()),
     );
+    // 取静态注册名集（registered_names）而非 all_schemas：all_schemas 过滤
+    // is_available，而 skill/skill_resource 的 schema 可见性依赖 attach（此刻
+    // 尚未 attach）。若在此捕获，SkillContext.available_tools 将缺失 "skill"，
+    // load_raw_for_context / skill_resource 的可用性门检查全部失败，真实会话
+    // 中 skill 功能整体不可用（review：时序 bug）。
+    let registered_tools: HashSet<String> = runtime.registered_names();
+    let disabled_tools = tool_state_service().shared();
     let runtime = runtime.with_permissions(Arc::clone(&engine), Some(prompt));
 
     let config = AgentKernelConfig {
         cwd: cwd.clone().into(),
+        system_prompt: Some(BASE_SYSTEM_PROMPT.to_string()),
         ..AgentKernelConfig::default()
     };
     let model = GatewayModelClient::<Rt>::shared(client.clone());
-    // Web IndexedDB is shared by every account in a browser profile. Resolve
-    // the owner before touching session/memdir keys; if this lookup fails,
-    // persistence is disabled for this bridge rather than falling back to the
-    // legacy shared namespace.
-    let storage_owner = match resolve_memory_owner(&client).await {
-        Ok(owner) => Some(owner),
-        Err(e) => {
-            tracing::warn!("persistent storage owner unavailable: {e}");
-            None
-        }
-    };
     let session_store = storage_owner
         .as_deref()
         .map(|owner| session_store_for_owner(Arc::clone(&kv), owner));
@@ -1580,17 +2265,55 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
             memory: Arc::clone(service),
         }));
         #[cfg(not(target_arch = "wasm32"))]
-        memory_write.attach(Arc::clone(service));
+        memory_write.attach_writer(Arc::new(ProcessLockedMemoryWriter {
+            memory: Arc::clone(service),
+        }));
     }
-    // Kernel 动态 memory recall（§12）：Querying 前 await provider。
+    // Skill 创建工具仅由对话页 `/skill-create` 命令授予一次性权限；普通
+    // Agent 轮次中它既不出现在 schema 也不能执行。命令请求中的具体名称和
+    // SKILL.md 则由模型按开源 Skill 格式生成。
+    let mut skill_store = None;
+    if let Some(owner) = storage_owner.as_deref() {
+        // 装配失败不阻断 Agent：与 memory（build_memory_service 降级为
+        // None）一致，skill 功能整体不可用时主会话仍可用——skill 工具的
+        // schema 依赖 attach，未 attach 即不暴露，模型不会调用。
+        match skill_store_for_owner(Arc::clone(&kv), owner).await {
+            Ok(store) => {
+                skill_load.attach(
+                    Arc::clone(&store),
+                    rust_agent::platform::Platform::current(),
+                    registered_tools.clone(),
+                    Arc::clone(&disabled_tools),
+                );
+                skill_resource.attach(
+                    Arc::clone(&store),
+                    rust_agent::platform::Platform::current(),
+                    registered_tools.clone(),
+                    Arc::clone(&disabled_tools),
+                );
+                skill_create.attach(Arc::clone(&store));
+                skill_store = Some(store);
+            }
+            Err(err) => {
+                tracing::warn!(owner, error = %err, "skill store assembly failed; skill tools disabled");
+            }
+        }
+    }
+    // Kernel Querying 前动态组合 memory recall 和 skill 索引：二者都可能在
+    // 会话存活期间变化，不能在 initialize 时固化进 base system prompt。
     let mut config = config;
-    config.memory_provider = memory.as_ref().map(|service| {
-        let provider: Arc<dyn AsyncSystemPromptProvider> = Arc::new(MemoryProvider {
-            service: Arc::clone(service),
-            cache: RwLock::new(HashMap::new()),
+    if memory.is_some() || skill_store.is_some() {
+        let provider: Arc<dyn AsyncSystemPromptProvider> = Arc::new(SessionPromptProvider {
+            memory: memory.as_ref().map(|service| MemoryProvider {
+                service: Arc::clone(service),
+                cache: RwLock::new(HashMap::new()),
+            }),
+            skill_store,
+            registered_tools,
+            disabled_tools,
         });
-        provider
-    });
+        config.memory_provider = Some(provider);
+    }
     let (mut kernel, event_tx, stream_rx) = AgentKernel::<Rt>::with_runtime(model, runtime, config);
     let interrupt = kernel.interrupt_handle();
     if let Some(snapshot) = restored_snapshot {
@@ -1611,6 +2334,7 @@ pub async fn initialize(client: Client) -> Result<AgentBridge, String> {
         session_id,
         cwd,
         memory,
+        skill_create,
     })
 }
 
@@ -1701,6 +2425,8 @@ mod tests {
     use futures::StreamExt;
     use rust_agent::error::{AgentError, MemoryError};
     use rust_agent::model_client::{EventStream, ModelStreamEvent};
+    use rust_agent::skills::SkillManage;
+
     // rsx! 宏展开需要 dioxus_elements 命名空间（tools.rs 同模式），且
     // GlobalSignal（PERSIST_ERROR）读写需 dioxus runtime（VirtualDom 提供）。
     use dioxus::prelude::*;
@@ -2495,6 +3221,71 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dynamic_skill_prompt_tracks_the_shared_disabled_state() {
+        // `/tools` 在会话已经创建后仍可禁用 `skill`。提示词必须每轮读取
+        // 同一个共享禁用集合，而不是保留 initialize 时的技能摘要快照。
+        futures::executor::block_on(async {
+            let root = std::env::temp_dir().join(format!(
+                "ains-skill-prompt-test-{}",
+                rust_agent::memory::now_ms()
+            ));
+            let store = Arc::new(SkillStore::new(
+                Arc::new(MemoryKvStore::new()),
+                open_platform_skill_files(root).await.unwrap(),
+            ));
+            store
+            .create_skill(
+                "release-checklist",
+                "---\nname: release-checklist\ndescription: Release checklist\nallowed-tools: calculator\n---\nVerify the release.",
+            )
+            .await
+            .unwrap();
+            let disabled = Arc::new(RwLock::new(HashSet::from(["skill".to_string()])));
+            let provider = SessionPromptProvider {
+                memory: None,
+                skill_store: Some(store),
+                registered_tools: HashSet::from(["calculator".to_string(), "skill".to_string()]),
+                disabled_tools: Arc::clone(&disabled),
+            };
+
+            assert!(
+                provider.provide(&[]).await.is_none(),
+                "disabled skill loader must not make skills appear usable"
+            );
+            disabled.write().unwrap().remove("skill");
+            assert!(
+                provider
+                    .provide(&[])
+                    .await
+                    .is_some_and(|prompt| prompt.contains("# Available Skills")),
+                "re-enabling skill must make the index appear without recreating the session"
+            );
+            disabled.write().unwrap().insert("skill".to_string());
+            assert!(
+                provider.provide(&[]).await.is_none(),
+                "disabling skill after it was visible must remove the stale index"
+            );
+        });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_skill_root_is_isolated_by_owner_scope() {
+        let root = std::path::Path::new("/var/lib/ains");
+        let first = rust_agent::memory::owner_key_for_id("first-user");
+        let second = rust_agent::memory::owner_key_for_id("second-user");
+        assert_ne!(first, second);
+        assert_eq!(
+            native_skill_root(root, &first),
+            root.join("skills").join(&first)
+        );
+        assert_ne!(
+            native_skill_root(root, &first),
+            native_skill_root(root, &second),
+        );
+    }
+
     #[tokio::test]
     async fn tool_schema_snapshot_includes_disabled_tools() {
         // 面板契约（review 建议 4）：tool_schema_snapshot 必须返回全部注册
@@ -2514,8 +3305,49 @@ mod tests {
             names.contains(&"calculator".to_string()),
             "snapshot must include disabled tools (re-enable entry point): {names:?}"
         );
+        assert!(
+            !names.contains(&"skill_create".to_string()),
+            "skill creation must remain exclusive to the explicit chat command: {names:?}"
+        );
+        assert!(
+            names.contains(&"skill".to_string()),
+            "saved workflows must be loadable by the Agent: {names:?}"
+        );
         assert!(!tool_state_service().is_enabled("calculator"));
         tool_state_service().reset_all();
+    }
+
+    #[test]
+    fn tool_state_scope_switch_discards_previous_accounts_memory_snapshot() {
+        // 回归：IndexedDB key 即使已经按 owner 分区，进程级 ToolStateService
+        // 仍会把前一账户已加载的禁用集合留在内存；账户切换后新账户在其
+        // 自己的 key 尚无记录时会错误继承它。scope 改变必须强制替换，且
+        // 旧 scope 的落盘快照不得再被取得。
+        let service = ToolStateService::new();
+        service.apply_from_store_for_scope("owner-a".to_string(), vec!["date".to_string()]);
+        service.set_enabled("calculator", false);
+        assert!(!service.is_enabled("date"));
+        assert!(!service.is_enabled("calculator"));
+        assert_ne!(service.dirty_version(), 0);
+
+        // 模拟 owner-b 的 IndexedDB 记录损坏/不可读：加载在读取阶段返回
+        // 错误而不调用 apply，预先激活 scope 仍须清空 owner-a 的状态。
+        service.activate_scope("owner-b");
+
+        assert!(service.is_enabled("date"));
+        assert!(service.is_enabled("calculator"));
+        assert_eq!(service.dirty_version(), 0);
+        assert!(
+            service.snapshot_with_version_for_scope("owner-a").is_err(),
+            "a stale persist task must not write the new account snapshot to owner-a"
+        );
+        assert_eq!(
+            service
+                .snapshot_with_version_for_scope("owner-b")
+                .unwrap()
+                .0,
+            Vec::<String>::new(),
+        );
     }
 
     #[tokio::test]
@@ -2936,6 +3768,44 @@ mod tests {
         // 最新落盘（版本 2）完成后清除；此后存储值可安全回灌
         tool_state_service().mark_clean(2);
         assert_eq!(tool_state_service().dirty_version(), 0);
+    }
+
+    #[tokio::test]
+    async fn tool_state_scope_changed_during_persist_does_not_clear_new_owner_dirty() {
+        // 修复回归（review P2：跨 owner 竞态）：落盘 await 期间账户切换，
+        // 新账户 dirty 从 0 重新计数，若恰好等于旧账户落盘时记录的版本号，
+        // 裸 mark_clean 的 CAS 会把新账户未落盘修改误清零，存储加载随后用
+        // 旧值静默覆盖。mark_clean_for_scope 校验 scope 后拒绝清零。
+        let _guard = STATE_TEST_LOCK.lock().await;
+        tool_state_service().reset_all();
+
+        // 账户 A：切换一个工具 → 版本 1，模拟落盘开始（记录落盘时版本号）
+        tool_state_service().activate_scope("owner-a");
+        tool_state_service().set_enabled("date", false);
+        let persisted_at = tool_state_service().dirty_version();
+        assert_eq!(persisted_at, 1);
+
+        // 落盘 await 期间切到账户 B（清空 dirty 重新计数），B 恰好累计到 1
+        tool_state_service().activate_scope("owner-b");
+        tool_state_service().set_enabled("calculator", false);
+        assert_eq!(tool_state_service().dirty_version(), 1);
+
+        // A 的落盘完成：scope 已切换，必须拒绝清零 B 的未落盘修改
+        tool_state_service().mark_clean_for_scope("owner-a", persisted_at);
+        assert_eq!(
+            tool_state_service().dirty_version(),
+            1,
+            "stale owner flush must not clear new owner's pending edits"
+        );
+
+        // 同 scope 正常路径不受影响：B 自己落盘后可安全清除
+        tool_state_service().mark_clean_for_scope("owner-b", 1);
+        assert_eq!(tool_state_service().dirty_version(), 0);
+        // 清空后 B 的 scope 仍保持（非误清，仅 dirty 收敛）
+        assert_eq!(
+            tool_state_service().active_scope().as_deref(),
+            Some("owner-b")
+        );
     }
 
     #[tokio::test]

@@ -1,4 +1,4 @@
-//! 消息与内容块（对齐 OpenHarness `engine/messages.py` 的判别式 content block 模型）。
+//! 消息与内容块（对齐 Harness `engine/messages.py` 的判别式 content block 模型）。
 //!
 //! wire 形状：`{"type": "text" | "image" | "tool_use" | "tool_result", ...}`。
 
@@ -28,7 +28,7 @@ pub enum ContentBlock {
         content: String,
         #[serde(default)]
         is_error: bool,
-        /// 工具特定的结构化结果（对齐 OpenHarness `result_metadata`）。
+        /// 工具特定的结构化结果（对齐 Harness `result_metadata`）。
         #[serde(default)]
         result_metadata: Value,
     },

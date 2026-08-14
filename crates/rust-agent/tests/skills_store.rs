@@ -1,753 +1,1330 @@
-//! Phase 6.4 KvSkillStore 契约测试（Native / redb 后端）。
-//!
-//! Web 端同一契约见 `tests/web_skills.rs`（CI wasm-pack 浏览器执行）。
-
+//! Native contract: package content lives in an OS file tree, never in KV.
 #![cfg(not(target_arch = "wasm32"))]
 
-use std::sync::Arc;
-
-use serde_json::json;
-
-use rust_agent::error::SkillsError;
-use rust_agent::memory::{KvStore, RedbBackend, TABLE_KV, now_ms};
+use rust_agent::memory::{KvStore, RedbBackend, TABLE_KV};
 use rust_agent::platform::Platform;
 use rust_agent::skills::{
-    AUTO_ROLLBACK_CONSECUTIVE_FAILURES, KvSkillStore, SkillContext, SkillLoader, SkillManage,
-    SkillMeta, SkillPruner, SkillTrust, skill_checksum, split_frontmatter,
+    MAX_SKILL_MD_BYTES, MAX_SKILL_PACKAGE_FILES, MAX_SKILL_RESOURCE_BYTES, SkillContext,
+    SkillLoader, SkillManage, SkillPackage, SkillPruner, SkillStore, SkillTrust, SkillVersion,
+    open_platform_skill_files, validate_agent_skill_package,
+};
+use std::collections::BTreeMap;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
-const SKILL_MD: &str = "---\nname: csv-report\ndescription: CSV report workflow\n---\n# CSV Report Workflow\n\n## Procedure\n1. read\n2. write\n";
-
-fn kv(dir: &tempfile::TempDir) -> Arc<dyn KvStore> {
-    Arc::new(
-        RedbBackend::open(dir.path().join("skills.redb"))
-            .expect("open redb")
-            .table(TABLE_KV),
-    )
+struct FailFirstSetKv {
+    inner: Arc<dyn KvStore>,
+    fail_next_set: AtomicBool,
 }
 
-fn meta(description: &str) -> SkillMeta {
-    SkillMeta {
-        description: description.to_string(),
-        category: "data".into(),
-        requires_tools: vec![],
-        platforms: vec![],
-        trust_level: SkillTrust::Generated,
-        creator: "agent".into(),
-        created_at: now_ms(),
-        permissions: vec![],
-        checksum: String::new(), // put_skill 重算
+struct FailOneSetKv {
+    inner: Arc<dyn KvStore>,
+    /// One-based `set` invocation to fail. `usize::MAX` disables injection.
+    fail_on_set: std::sync::atomic::AtomicUsize,
+    set_calls: std::sync::atomic::AtomicUsize,
+}
+
+/// Fail only the normal-import → system-trust promotion write. This keeps the
+/// test independent of the number of KV writes made by package import itself.
+struct FailSystemPromotionKv {
+    inner: Arc<dyn KvStore>,
+    fail_next_system_promotion: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl KvStore for FailFirstSetKv {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, rust_agent::error::MemoryError> {
+        self.inner.get(key).await
     }
-}
 
-fn ctx(platform: Platform, tools: &[&str]) -> SkillContext {
-    SkillContext {
-        platform,
-        available_tools: tools.iter().map(|t| t.to_string()).collect(),
-    }
-}
-
-#[tokio::test]
-async fn list_entries_empty_store() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    assert!(store.list_entries().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn put_and_list_entries_sorted_with_meta() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.put_skill("zeta", SKILL_MD, meta("z")).await.unwrap();
-    store.put_skill("alpha", SKILL_MD, meta("a")).await.unwrap();
-
-    let entries = store.list_entries().await.unwrap();
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].name, "alpha");
-    assert_eq!(entries[1].name, "zeta");
-    assert!(!entries[0].corrupted);
-    let m = entries[0].meta.as_ref().expect("meta present");
-    assert_eq!(m.description, "a");
-    assert_eq!(m.checksum, skill_checksum(SKILL_MD));
-}
-
-#[tokio::test]
-async fn corrupted_meta_deserialization_is_flagged_not_skipped() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.put_skill("ok", SKILL_MD, meta("ok")).await.unwrap();
-    // 直接向 meta key 写入非法结构
-    backend
-        .set("skills_meta:bad", &json!({"not": "a meta"}), None)
-        .await
-        .unwrap();
-    backend
-        .set("skills:bad", &json!(SKILL_MD), None)
-        .await
-        .unwrap();
-
-    let entries = store.list_entries().await.unwrap();
-    assert_eq!(entries.len(), 2);
-    let bad = entries.iter().find(|e| e.name == "bad").unwrap();
-    assert!(bad.corrupted);
-    assert!(bad.meta.is_none());
-    assert!(!entries.iter().find(|e| e.name == "ok").unwrap().corrupted);
-}
-
-#[tokio::test]
-async fn checksum_mismatch_is_flagged_corrupted() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.put_skill("drift", SKILL_MD, meta("d")).await.unwrap();
-    // 篡改原文（模拟存储损坏 / 部分写入）
-    backend
-        .set("skills:drift", &json!("tampered content"), None)
-        .await
-        .unwrap();
-
-    let entries = store.list_entries().await.unwrap();
-    let drift = entries.iter().find(|e| e.name == "drift").unwrap();
-    assert!(drift.corrupted);
-    // 元数据本身可读，面板仍能展示名称与删除入口
-    assert!(drift.meta.is_some());
-}
-
-#[tokio::test]
-async fn delete_removes_both_keys_atomically_visible() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.put_skill("gone", SKILL_MD, meta("g")).await.unwrap();
-
-    store.delete_skill("gone").await.unwrap();
-    assert!(backend.get("skills:gone").await.unwrap().is_none());
-    assert!(backend.get("skills_meta:gone").await.unwrap().is_none());
-    assert!(store.list_entries().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn delete_missing_skill_reports_not_found() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    match store.delete_skill("ghost").await {
-        Err(SkillsError::NotFound(name)) => assert_eq!(name, "ghost"),
-        other => panic!("expected NotFound, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn orphan_meta_is_listed_corrupted_and_deletable() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    let meta_value = serde_json::to_value(meta("orphan")).unwrap();
-    backend
-        .set("skills_meta:orphan", &meta_value, None)
-        .await
-        .unwrap();
-
-    let entries = store.list_entries().await.unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].name, "orphan");
-    assert!(entries[0].corrupted);
-
-    store.delete_skill("orphan").await.unwrap();
-    assert!(store.list_entries().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn load_parses_frontmatter_and_body() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.put_skill("csv", SKILL_MD, meta("c")).await.unwrap();
-
-    let content = store.load("csv").await.unwrap();
-    assert_eq!(
-        content
-            .frontmatter
-            .get("description")
-            .and_then(|v| v.as_str()),
-        Some("CSV report workflow")
-    );
-    assert!(content.body.starts_with("# CSV Report Workflow"));
-
-    match store.load("missing").await {
-        Err(SkillsError::NotFound(_)) => {}
-        other => panic!("expected NotFound, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn load_without_frontmatter_returns_null_frontmatter() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    let raw = "# Plain skill\nbody only\n";
-    store.put_skill("plain", raw, meta("p")).await.unwrap();
-
-    let content = store.load("plain").await.unwrap();
-    assert!(content.frontmatter.is_null());
-    assert_eq!(content.body, raw);
-}
-
-#[tokio::test]
-async fn loader_list_applies_platform_and_tool_gating() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-
-    let mut desktop_only = meta("desktop only");
-    desktop_only.platforms = vec![Platform::Desktop];
-    store
-        .put_skill("desk", SKILL_MD, desktop_only)
-        .await
-        .unwrap();
-
-    let mut needs_shell = meta("needs shell");
-    needs_shell.requires_tools = vec!["shell_command".into()];
-    store
-        .put_skill("shelly", SKILL_MD, needs_shell)
-        .await
-        .unwrap();
-
-    store
-        .put_skill("anywhere", SKILL_MD, meta("any"))
-        .await
-        .unwrap();
-
-    // Web + 无 shell：只有无门控的 skill 可见
-    let visible = store
-        .list(&ctx(Platform::Web, &["file_read"]))
-        .await
-        .unwrap();
-    assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].name, "anywhere");
-
-    // Desktop + shell：全部可见
-    let visible = store
-        .list(&ctx(Platform::Desktop, &["file_read", "shell_command"]))
-        .await
-        .unwrap();
-    let names: Vec<_> = visible.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["anywhere", "desk", "shelly"]);
-}
-
-#[tokio::test]
-async fn command_allowed_tools_are_preserved_as_skill_gating() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    let content =
-        "---\ndescription: command-backed skill\nallowed-tools:\n  - shell_command\n---\nRun it";
-    store.create_skill("command-backed", content).await.unwrap();
-
-    let visible_without_shell = store
-        .list(&ctx(Platform::Web, &["file_read"]))
-        .await
-        .unwrap();
-    assert!(visible_without_shell.is_empty());
-
-    let visible_with_shell = store
-        .list(&ctx(Platform::Web, &["shell_command"]))
-        .await
-        .unwrap();
-    assert_eq!(visible_with_shell.len(), 1);
-    assert_eq!(visible_with_shell[0].requires_tools, vec!["shell_command"]);
-}
-
-#[tokio::test]
-async fn loader_list_excludes_corrupted_entries_from_model_surface() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.put_skill("good", SKILL_MD, meta("g")).await.unwrap();
-    backend
-        .set("skills:broken", &json!(SKILL_MD), None)
-        .await
-        .unwrap(); // 无 meta → 损坏
-
-    let summaries = store.list(&ctx(Platform::Web, &[])).await.unwrap();
-    assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].name, "good");
-    // 面板面仍可见损坏条目
-    assert_eq!(store.list_entries().await.unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn create_update_rollback_versioning_and_active_mirror() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-
-    // create → v1.0 Active，面板/Loader 可见
-    let s = store.create_skill("csv", SKILL_MD).await.unwrap();
-    assert_eq!(s.description, "CSV report workflow");
-    let vers = store.list_versions("csv").await.unwrap();
-    assert_eq!(vers.len(), 1);
-    assert_eq!(vers[0].0.label(), "v1.0");
-    assert_eq!(vers[0].1.status, rust_agent::skills::SkillStatus::Active);
-    // 重复创建报错
-    assert!(store.create_skill("csv", SKILL_MD).await.is_err());
-    // 活跃镜像可被 Loader 读取
-    assert!(store.load("csv").await.is_ok());
-
-    // update → v1.1 Active，v1.0 Deprecated
-    let md2 = "---\nname: csv\ndescription: CSV v2\n---\n# CSV v2\n";
-    store.update_skill("csv", md2).await.unwrap();
-    let vers = store.list_versions("csv").await.unwrap();
-    let labels: Vec<_> = vers.iter().map(|(v, _)| v.label()).collect();
-    assert_eq!(labels, ["v1.0", "v1.1"]);
-    let v10 = vers.iter().find(|(v, _)| v.label() == "v1.0").unwrap();
-    let v11 = vers.iter().find(|(v, _)| v.label() == "v1.1").unwrap();
-    assert_eq!(v10.1.status, rust_agent::skills::SkillStatus::Deprecated);
-    assert_eq!(v11.1.status, rust_agent::skills::SkillStatus::Active);
-    // 活跃镜像已切到 v1.1 内容
-    assert_eq!(
-        store
-            .load("csv")
-            .await
-            .unwrap()
-            .frontmatter
-            .get("description")
-            .and_then(|v| v.as_str()),
-        Some("CSV v2")
-    );
-
-    // rollback 到 v1.0 → 新大版本 v2.0（内容=v1.0），v1.1 降级
-    store.rollback_skill("csv", "v1.0").await.unwrap();
-    let vers = store.list_versions("csv").await.unwrap();
-    let labels: Vec<_> = vers.iter().map(|(v, _)| v.label()).collect();
-    assert_eq!(labels, ["v1.0", "v1.1", "v2.0"]);
-    let v20 = vers.iter().find(|(v, _)| v.label() == "v2.0").unwrap();
-    assert_eq!(v20.1.status, rust_agent::skills::SkillStatus::Active);
-    assert_eq!(
-        store
-            .load("csv")
-            .await
-            .unwrap()
-            .frontmatter
-            .get("description")
-            .and_then(|v| v.as_str()),
-        Some("CSV report workflow")
-    );
-
-    // 回滚目标超出保留范围 → 报错
-    assert!(store.rollback_skill("csv", "v9.9").await.is_err());
-
-    // delete 清除全部版本 + 头 + 镜像
-    store.delete_skill("csv").await.unwrap();
-    assert!(store.list_versions("csv").await.unwrap().is_empty());
-    assert!(store.list_entries().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn record_outcome_auto_rollback_after_consecutive_failures() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.create_skill("wf", SKILL_MD).await.unwrap();
-    // 让 v1.0 攒下高成功率
-    for _ in 0..8 {
-        store.record_outcome("wf", true).await.unwrap();
-    }
-    // 升级到 v1.1（当前 active），随后 v1.1 连续失败 5 次
-    let md2 = "---\nname: wf\ndescription: wf bad\n---\n# bad\n";
-    store.update_skill("wf", md2).await.unwrap();
-    let mut auto = false;
-    for _ in 0..AUTO_ROLLBACK_CONSECUTIVE_FAILURES {
-        auto = store.record_outcome("wf", false).await.unwrap();
-    }
-    assert!(auto, "连续失败达阈值且存在更优版本应触发自动回滚");
-    // 触发后应产生新大版本 v2.0（内容=v1.0 高分版）
-    let vers = store.list_versions("wf").await.unwrap();
-    assert!(
-        vers.iter().any(
-            |(v, r)| v.label() == "v2.0" && r.status == rust_agent::skills::SkillStatus::Active
-        )
-    );
-
-    // 防抖动（Code Review 修正）：v2.0 内容与 Golden v1.0 字节相同，
-    // 再度连续失败不得重升同一内容（否则每 5 次失败无限增长版本号）。
-    let before = store.list_versions("wf").await.unwrap().len();
-    for _ in 0..(AUTO_ROLLBACK_CONSECUTIVE_FAILURES * 2) {
-        let rolled = store.record_outcome("wf", false).await.unwrap();
-        assert!(!rolled, "同内容候选不应触发二次自动回滚");
-    }
-    assert_eq!(
-        store.list_versions("wf").await.unwrap().len(),
-        before,
-        "防抖动：版本数不增长"
-    );
-}
-
-#[tokio::test]
-async fn rollback_with_stale_candidate_after_prune_surfaces_error() {
-    // 回滚与清理的竞态：UI 先列出候选 → prune 淘汰目标版本 → 用户点击
-    // 回滚。存储层按当前保留集重新校验，过期候选必须报错（UI 据此
-    // 渲染错误横幅）而非静默成功或 panic。
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.create_skill("stale", SKILL_MD).await.unwrap();
-    for i in 1..=4 {
-        let md = format!("---\nname: stale\ndescription: v{i}\n---\n# v{i}\n");
-        store.update_skill("stale", &md).await.unwrap();
-    }
-    // 此刻候选含 v1.2（最近 3 之内）——模拟 UI 已展示的旧列表
-    let candidates = store.rollback_candidates("stale").await.unwrap();
-    assert!(candidates.contains(&"v1.2".to_string()), "{candidates:?}");
-
-    // 再升两版并 prune，v1.2 被淘汰出保留集
-    for i in 5..=6 {
-        let md = format!("---\nname: stale\ndescription: v{i}\n---\n# v{i}\n");
-        store.update_skill("stale", &md).await.unwrap();
-    }
-    SkillPruner.prune(&store, "stale").await.unwrap();
-    let remaining: Vec<_> = store
-        .list_versions("stale")
-        .await
-        .unwrap()
-        .iter()
-        .map(|(v, _)| v.label())
-        .collect();
-    assert!(!remaining.contains(&"v1.2".to_string()), "{remaining:?}");
-
-    // 过期候选回滚 → 显式错误（保留范围校验先于版本读取，不泄漏
-    // 内部状态、不产生新版本）
-    match store.rollback_skill("stale", "v1.2").await {
-        Err(SkillsError::InvalidFormat(msg)) => {
-            assert!(msg.contains("outside the retained range"), "{msg}");
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), rust_agent::error::MemoryError> {
+        if self.fail_next_set.swap(false, Ordering::SeqCst) {
+            return Err(rust_agent::error::MemoryError::Storage(
+                "injected set failure".into(),
+            ));
         }
-        other => panic!("expected InvalidFormat for pruned candidate, got {other:?}"),
+        self.inner.set(key, value, ttl).await
     }
-    // 失败的回滚不得产生新版本或改变活跃版
-    assert_eq!(
-        store.active_version("stale").await.unwrap().as_deref(),
-        Some("v1.6")
-    );
+
+    async fn delete(&self, key: &str) -> Result<(), rust_agent::error::MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, rust_agent::error::MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
 }
 
-#[tokio::test]
-async fn skill_pruner_keeps_recent_and_golden() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.create_skill("p", SKILL_MD).await.unwrap();
-    // v1.0 设为 Golden（高成功率）
-    for _ in 0..10 {
-        store.record_outcome("p", true).await.unwrap();
+#[async_trait::async_trait]
+impl KvStore for FailOneSetKv {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, rust_agent::error::MemoryError> {
+        self.inner.get(key).await
     }
-    // 连续 update 造出 v1.1..v1.5（低分）
-    for i in 1..=5 {
-        let md = format!("---\nname: p\ndescription: v{i}\n---\n# v{i}\n");
-        store.update_skill("p", &md).await.unwrap();
+
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), rust_agent::error::MemoryError> {
+        let call = self.set_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == self.fail_on_set.load(Ordering::SeqCst) {
+            return Err(rust_agent::error::MemoryError::Storage(
+                "injected set failure".into(),
+            ));
+        }
+        self.inner.set(key, value, ttl).await
     }
-    let before = store.list_versions("p").await.unwrap().len();
-    assert_eq!(before, 6); // v1.0..v1.5
-    let pruner = SkillPruner;
-    let removed = pruner.prune(&store, "p").await.unwrap();
-    assert!(removed >= 1);
-    let after: Vec<_> = store
-        .list_versions("p")
-        .await
-        .unwrap()
-        .iter()
-        .map(|(v, _)| v.label())
-        .collect();
-    // Golden v1.0 与最近版本（含活跃 v1.5）保留
-    assert!(after.contains(&"v1.0".to_string()), "Golden 应保留");
-    assert!(after.contains(&"v1.5".to_string()), "活跃版本应保留");
+
+    async fn delete(&self, key: &str) -> Result<(), rust_agent::error::MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, rust_agent::error::MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
 }
 
-#[tokio::test]
-async fn pruner_keeps_golden_consistent_with_rollback_candidates() {
-    // 回滚候选与清理保留集单一权威：旧高分 Golden 被挤出最近 N
-    // 窗口后，清理仍须保留它，且它仍作为可回滚候选（防 UI 列出
-    // 却回滚拒用的不一致）。
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir)); // 默认窗口 3
-    store.create_skill("g", SKILL_MD).await.unwrap();
-    // v1.0 攒高成功率成为 Golden
-    for _ in 0..10 {
-        store.record_outcome("g", true).await.unwrap();
+#[async_trait::async_trait]
+impl KvStore for FailSystemPromotionKv {
+    async fn get(
+        &self,
+        key: &str,
+    ) -> Result<Option<serde_json::Value>, rust_agent::error::MemoryError> {
+        self.inner.get(key).await
     }
-    // 升至 v1.5，将 v1.0 挤出最近 3（v1.3/v1.4/v1.5）
-    for i in 1..=5 {
-        let md = format!("---\nname: g\ndescription: v{i}\n---\n# v{i}\n");
-        store.update_skill("g", &md).await.unwrap();
-    }
-    let candidates = store.rollback_candidates("g").await.unwrap();
-    assert!(
-        candidates.contains(&"v1.0".to_string()),
-        "Golden 应作为回滚候选: {candidates:?}"
-    );
 
-    // 清理后 Golden 仍在且仍可真实回滚
-    SkillPruner.prune(&store, "g").await.unwrap();
-    let remaining: Vec<_> = store
-        .list_versions("g")
-        .await
-        .unwrap()
-        .iter()
-        .map(|(v, _)| v.label())
-        .collect();
-    assert!(
-        remaining.contains(&"v1.0".to_string()),
-        "清理后 Golden 必须保留: {remaining:?}"
-    );
-    for candidate in store.rollback_candidates("g").await.unwrap() {
-        assert!(
-            remaining.contains(&candidate),
-            "候选 {candidate} 必须在剩余版本内"
-        );
+    async fn set(
+        &self,
+        key: &str,
+        value: &serde_json::Value,
+        ttl: Option<std::time::Duration>,
+    ) -> Result<(), rust_agent::error::MemoryError> {
+        let is_system_promotion = key.starts_with("skills_runtime:")
+            && value.get("trust_level").and_then(serde_json::Value::as_str) == Some("system");
+        if is_system_promotion
+            && self
+                .fail_next_system_promotion
+                .swap(false, Ordering::SeqCst)
+        {
+            return Err(rust_agent::error::MemoryError::Storage(
+                "injected system-promotion failure".into(),
+            ));
+        }
+        self.inner.set(key, value, ttl).await
     }
-    store.rollback_skill("g", "v1.0").await.unwrap();
+
+    async fn delete(&self, key: &str) -> Result<(), rust_agent::error::MemoryError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, rust_agent::error::MemoryError> {
+        self.inner.list_prefix(prefix).await
+    }
 }
 
-#[tokio::test]
-async fn version_only_orphan_is_deletable_not_leaked() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    // 模拟 create 中断：仅残留版本记录（无镜像/头）
-    backend
-        .set(
-            "skills_ver:ghost:v1.0",
-            &serde_json::json!({"content":"x","checksum":"c","status":"active","score":{"successes":0,"failures":0,"consecutive_failures":0},"created_at":0}),
-            None,
-        )
-        .await
-        .unwrap();
-    // 面板不可见（镜像/头均无），但 delete 必须能回收而非 NotFound
-    store.delete_skill("ghost").await.unwrap();
-    assert!(
-        backend
-            .get("skills_ver:ghost:v1.0")
-            .await
+fn md(name: &str, description: &str) -> String {
+    format!("---\nname: {name}\ndescription: {description}\n---\n# Workflow\n\n1. Do the work.\n")
+}
+async fn store(dir: &tempfile::TempDir) -> SkillStore {
+    let kv: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
             .unwrap()
-            .is_none()
+            .table(TABLE_KV),
     );
-    // 彻底清空后再删才报 NotFound
-    assert!(matches!(
-        store.delete_skill("ghost").await,
-        Err(SkillsError::NotFound(_))
-    ));
-}
-
-#[tokio::test]
-async fn reference_files_put_and_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    store.create_skill("ref", SKILL_MD).await.unwrap();
-    store
-        .put_reference("ref", "references/schema.md", "# Schema\ncol,type")
-        .await
-        .unwrap();
-    assert_eq!(
-        store
-            .load_reference("ref", "references/schema.md")
+    SkillStore::new(
+        kv,
+        open_platform_skill_files(dir.path().join("skills"))
             .await
             .unwrap(),
-        "# Schema\ncol,type"
+    )
+}
+fn context() -> SkillContext {
+    SkillContext {
+        platform: Platform::Desktop,
+        available_tools: vec!["skill".into()],
+    }
+}
+
+#[tokio::test]
+async fn skill_md_is_file_source_of_truth_and_kv_contains_only_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let store = SkillStore::new(
+        Arc::clone(&kv),
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
     );
-    match store.load_reference("ref", "references/missing.md").await {
-        Err(SkillsError::NotFound(_)) => {}
-        other => panic!("expected NotFound, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn load_reference_rejects_tampered_or_checksumless_payload() {
-    // Level 2 完整性门控与 load 同口径：篡改/无 checksum 的引用
-    // 不可注入模型上下文
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.create_skill("ref", SKILL_MD).await.unwrap();
     store
-        .put_reference("ref", "references/a.md", "original")
+        .create_skill("release-check", &md("release-check", "Run release checks"))
         .await
         .unwrap();
-
-    // 篡改 content（checksum 不再匹配）
-    backend
-        .set(
-            "skills_ref:ref:references/a.md",
-            &json!({"content": "tampered", "checksum": skill_checksum("original")}),
-            None,
-        )
-        .await
-        .unwrap();
-    match store.load_reference("ref", "references/a.md").await {
-        Err(SkillsError::InvalidFormat(msg)) => {
-            assert!(msg.contains("integrity"), "{msg}");
-        }
-        other => panic!("expected InvalidFormat on tampered reference, got {other:?}"),
-    }
-
-    // 裸字符串载荷（无 checksum，无法验证）同样拒绝
-    backend
-        .set(
-            "skills_ref:ref:references/b.md",
-            &json!("no checksum"),
-            None,
-        )
-        .await
-        .unwrap();
-    match store.load_reference("ref", "references/b.md").await {
-        Err(SkillsError::InvalidFormat(_)) => {}
-        other => panic!("expected InvalidFormat on checksumless payload, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn custom_retention_window_shared_by_rollback_and_pruner() {
-    // 保留窗口单一权威源：存储配置的窗口同时约束回滚候选与
-    // Pruner 保留集，不得出现“清理保留的版本回滚却拒用”
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::with_retention(kv(&dir), 5);
-    store.create_skill("w", SKILL_MD).await.unwrap();
-    for i in 1..=5 {
-        let md = format!("---\nname: w\ndescription: v{i}\n---\n# v{i}\n");
-        store.update_skill("w", &md).await.unwrap();
-    }
-    // 窗口 5：v1.1..v1.5 均为回滚候选（默认窗口 3 会拒用 v1.1/v1.2）
-    let candidates = store.rollback_candidates("w").await.unwrap();
-    assert!(candidates.contains(&"v1.1".to_string()), "{candidates:?}");
-    store.rollback_skill("w", "v1.1").await.unwrap();
-
-    // Pruner 用同一窗口：清理后剩余版本包含全部回滚候选
-    SkillPruner.prune(&store, "w").await.unwrap();
-    let remaining: Vec<_> = store
-        .list_versions("w")
-        .await
-        .unwrap()
-        .iter()
-        .map(|(v, _)| v.label())
-        .collect();
-    let candidates = store.rollback_candidates("w").await.unwrap();
-    for candidate in &candidates {
-        assert!(
-            remaining.contains(candidate),
-            "候选 {candidate} 必须在剩余版本内: {remaining:?}"
-        );
-    }
-    // 全部候选均可真实回滚（窗口一致性的行为面验证）
-    let target = candidates.first().cloned().expect("non-empty candidates");
-    store.rollback_skill("w", &target).await.unwrap();
-}
-
-#[tokio::test]
-async fn skill_name_validation_rejects_injection() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = KvSkillStore::new(kv(&dir));
-    for bad in ["", " padded ", "a/b", "a\\b", "a:b", "a\nb"] {
-        assert!(
-            store.put_skill(bad, SKILL_MD, meta("m")).await.is_err(),
-            "name `{bad:?}` should be rejected"
-        );
-        assert!(store.delete_skill(bad).await.is_err());
-    }
-}
-
-#[tokio::test]
-async fn load_rejects_checksum_mismatch_and_missing_meta() {
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.put_skill("drift", SKILL_MD, meta("d")).await.unwrap();
-    // 篑改原文（checksum 不再匹配 meta）→ load 拒绝注入
-    backend
-        .set("skills:drift", &json!("tampered content"), None)
-        .await
-        .unwrap();
-    match store.load("drift").await {
-        Err(SkillsError::InvalidFormat(_)) => {}
-        other => panic!("expected InvalidFormat on checksum mismatch, got {other:?}"),
-    }
-
-    // 有原文无 meta（无法验证完整性）→ 同样拒绝
-    backend
-        .set("skills:orphan", &json!(SKILL_MD), None)
-        .await
-        .unwrap();
-    match store.load("orphan").await {
-        Err(SkillsError::InvalidFormat(_)) => {}
-        other => panic!("expected InvalidFormat on missing meta, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn promote_preserves_creator_and_trust_across_update_and_rollback() {
-    // Code Review 非阻断项 #4：system 来源技能经 update/rollback 后
-    // creator/trust 不得被 meta_from_content 的默认值（agent/Generated）改写
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.create_skill("sys", SKILL_MD).await.unwrap();
-    // 模拟系统来源：直接改写头元数据的 creator/trust_level
-    let mut head = backend.get("skills_head:sys").await.unwrap().unwrap();
-    head["meta"]["creator"] = json!("system");
-    head["meta"]["trust_level"] = json!("system");
-    backend.set("skills_head:sys", &head, None).await.unwrap();
-
-    let md2 = "---\nname: sys\ndescription: sys v2\n---\n# v2\n";
-    store.update_skill("sys", md2).await.unwrap();
-    let head = backend.get("skills_head:sys").await.unwrap().unwrap();
-    assert_eq!(head["meta"]["creator"], "system", "update 保留 creator");
-    assert_eq!(head["meta"]["trust_level"], "system", "update 保留 trust");
-
-    store.rollback_skill("sys", "v1.0").await.unwrap();
-    let head = backend.get("skills_head:sys").await.unwrap().unwrap();
-    assert_eq!(head["meta"]["creator"], "system", "rollback 保留 creator");
-    // 镜像面（面板展示源）同步保留
-    let entries = store.list_entries().await.unwrap();
-    let meta = entries[0].meta.as_ref().unwrap();
-    assert_eq!(meta.creator, "system");
-    assert_eq!(meta.trust_level, SkillTrust::System);
-}
-
-#[tokio::test]
-async fn corrupt_head_active_falls_back_to_max_version_not_overwrite() {
-    // Code Review 建议测试 #2：头指针 active 不可解析时，update/rollback
-    // 回退到现存最高版本号而非 INITIAL（否则新版写入 v1.1 会覆写
-    // 既有记录，静默丢失版本链）
-    let dir = tempfile::tempdir().unwrap();
-    let backend = kv(&dir);
-    let store = KvSkillStore::new(Arc::clone(&backend));
-    store.create_skill("ch", SKILL_MD).await.unwrap(); // v1.0
-    let md2 = "---\nname: ch\ndescription: ch v2\n---\n# v2\n";
-    store.update_skill("ch", md2).await.unwrap(); // v1.1
-
-    // 损坏头指针（不可解析的版本号）
-    let mut head = backend.get("skills_head:ch").await.unwrap().unwrap();
-    head["active"] = json!("garbage");
-    backend.set("skills_head:ch", &head, None).await.unwrap();
-
-    let md3 = "---\nname: ch\ndescription: ch v3\n---\n# v3\n";
-    store.update_skill("ch", md3).await.unwrap();
-    let vers = store.list_versions("ch").await.unwrap();
-    let labels: Vec<_> = vers.iter().map(|(v, _)| v.label()).collect();
-    assert_eq!(labels, ["v1.0", "v1.1", "v1.2"], "不覆写既有 v1.1");
-    // v1.1 内容未被 v3 覆写，新内容落在 v1.2
-    let v11 = vers.iter().find(|(v, _)| v.label() == "v1.1").unwrap();
-    assert!(v11.1.content.contains("ch v2"), "v1.1 内容保持原样");
-    let v12 = vers.iter().find(|(v, _)| v.label() == "v1.2").unwrap();
-    assert!(v12.1.content.contains("ch v3"));
     assert_eq!(
-        store.active_version("ch").await.unwrap().as_deref(),
-        Some("v1.2"),
-        "头指针修复为新版本"
+        std::fs::read_to_string(dir.path().join("skills/release-check/SKILL.md")).unwrap(),
+        md("release-check", "Run release checks")
+    );
+    assert!(
+        kv.get("skills_index:release-check")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        kv.list_prefix("skills/").await.unwrap().is_empty(),
+        "KV must not contain SKILL.md or package files"
+    );
+    assert_eq!(
+        store
+            .load_raw_for_context("release-check", &context())
+            .await
+            .unwrap(),
+        md("release-check", "Run release checks")
+    );
+}
+
+#[tokio::test]
+async fn ains_platform_metadata_gates_discovery_and_contextual_loading() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let desktop_skill = "---\nname: platform-bound\ndescription: Desktop-only workflow\nmetadata:\n  ains.platforms: desktop\n---\n# Desktop\n";
+    store
+        .create_skill("platform-bound", desktop_skill)
+        .await
+        .unwrap();
+
+    let web = SkillContext {
+        platform: Platform::Web,
+        available_tools: vec!["skill".into()],
+    };
+    assert!(store.list(&web).await.unwrap().is_empty());
+    assert!(
+        store
+            .load_raw_for_context("platform-bound", &web)
+            .await
+            .is_err()
+    );
+
+    let desktop = context();
+    assert_eq!(store.list(&desktop).await.unwrap().len(), 1);
+    assert_eq!(
+        store
+            .load_raw_for_context("platform-bound", &desktop)
+            .await
+            .unwrap(),
+        desktop_skill
+    );
+
+    // An update must refresh both metadata and the compact discovery index;
+    // otherwise a stale platform gate can keep a valid new workflow hidden.
+    let web_skill = "---\nname: platform-bound\ndescription: Web-only workflow\nmetadata:\n  ains.platforms: web\n---\n# Web\n";
+    store
+        .update_skill("platform-bound", web_skill)
+        .await
+        .unwrap();
+    assert!(store.list(&desktop).await.unwrap().is_empty());
+    assert!(
+        store
+            .load_raw_for_context("platform-bound", &desktop)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_raw_for_context("platform-bound", &web)
+            .await
+            .unwrap(),
+        web_skill
+    );
+
+    let invalid = "---\nname: invalid-platform\ndescription: Invalid platform declaration\nmetadata:\n  ains.platforms: desktop toaster\n---\n# Invalid\n";
+    assert!(
+        store
+            .create_skill("invalid-platform", invalid)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn failed_create_rolls_back_the_package_so_the_same_name_can_be_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
+            .unwrap()
+            .table(TABLE_KV),
+    );
+    let failing: Arc<dyn KvStore> = Arc::new(FailFirstSetKv {
+        inner,
+        fail_next_set: AtomicBool::new(true),
+    });
+    let store = SkillStore::new(
+        failing,
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+    );
+
+    assert!(
+        store
+            .create_skill("retryable", &md("retryable", "Retry after failure"))
+            .await
+            .is_err()
+    );
+    assert!(store.list(&context()).await.unwrap().is_empty());
+
+    store
+        .create_skill("retryable", &md("retryable", "Retry after failure"))
+        .await
+        .unwrap();
+    assert_eq!(store.list(&context()).await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn failed_system_promotion_rolls_back_the_import_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
+            .unwrap()
+            .table(TABLE_KV),
+    );
+    let failing = Arc::new(FailSystemPromotionKv {
+        inner,
+        fail_next_system_promotion: AtomicBool::new(true),
+    });
+    let store = SkillStore::new(
+        failing,
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+    );
+    let package = SkillPackage {
+        name: "retry-system".into(),
+        files: BTreeMap::from([(
+            "SKILL.md".into(),
+            md("retry-system", "Host-provided workflow").into_bytes(),
+        )]),
+    };
+
+    assert!(store.install_system_package(package.clone()).await.is_err());
+    assert!(store.list_entries().await.unwrap().is_empty());
+    assert!(store.load_raw("retry-system").await.is_err());
+
+    // The injected failure is one-shot. A retry must not be rejected as a
+    // duplicate and must restore the System protection boundary.
+    store.install_system_package(package).await.unwrap();
+    let entry = store.list_entries().await.unwrap().pop().unwrap();
+    assert_eq!(entry.name, "retry-system");
+    assert_eq!(entry.meta.unwrap().trust_level, SkillTrust::System);
+    assert!(store.delete_skill("retry-system").await.is_err());
+}
+
+#[tokio::test]
+async fn failed_update_restores_the_active_body_and_version_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
+            .unwrap()
+            .table(TABLE_KV),
+    );
+    let failing = Arc::new(FailOneSetKv {
+        inner,
+        fail_on_set: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        set_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let store = SkillStore::new(
+        failing.clone(),
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+    );
+    let first = md("atomic-update", "original workflow");
+    let second = md("atomic-update", "replacement workflow");
+    store.create_skill("atomic-update", &first).await.unwrap();
+
+    // `update_skill` refreshes the index, writes v1.1, deprecates v1.0,
+    // replaces the active body/index/meta, then writes the head. Fail the
+    // final head write, after the visible SKILL.md has already been replaced.
+    let fail_head_write = failing.set_calls.load(Ordering::SeqCst) + 6;
+    failing.fail_on_set.store(fail_head_write, Ordering::SeqCst);
+    assert!(store.update_skill("atomic-update", &second).await.is_err());
+
+    assert_eq!(store.load_raw("atomic-update").await.unwrap(), first);
+    assert_eq!(
+        store.active_version("atomic-update").await.unwrap(),
+        Some("v1.0".into())
+    );
+    let versions = store.list_versions("atomic-update").await.unwrap();
+    assert_eq!(
+        versions
+            .into_iter()
+            .map(|(version, _)| version.label())
+            .collect::<Vec<_>>(),
+        ["v1.0"]
+    );
+    assert_eq!(
+        store.list(&context()).await.unwrap()[0].description,
+        "original workflow"
+    );
+
+    // The injected failure is one-shot. A retry starts from a coherent v1.0
+    // state and can publish the replacement normally.
+    store.update_skill("atomic-update", &second).await.unwrap();
+    assert_eq!(store.load_raw("atomic-update").await.unwrap(), second);
+    assert_eq!(
+        store.active_version("atomic-update").await.unwrap(),
+        Some("v1.1".into())
+    );
+}
+
+#[tokio::test]
+async fn startup_index_then_skill_then_resource_are_progressive() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("report", &md("report", "Build reports when requested"))
+        .await
+        .unwrap();
+    store
+        .put_file("report", "references/format.md", b"# Format")
+        .await
+        .unwrap();
+    assert_eq!(
+        store.list(&context()).await.unwrap()[0].description,
+        "Build reports when requested"
+    );
+    assert_eq!(
+        store.load("report").await.unwrap().body,
+        "# Workflow\n\n1. Do the work.\n"
+    );
+    assert_eq!(
+        store
+            .load_file("report", "references/format.md")
+            .await
+            .unwrap(),
+        b"# Format"
+    );
+}
+
+#[tokio::test]
+async fn exports_standard_directory_and_binary_asset() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("visual", &md("visual", "Create visual output"))
+        .await
+        .unwrap();
+    store
+        .put_file("visual", "assets/a.bin", &[0, 255, 1])
+        .await
+        .unwrap();
+    let package = store.export_package("visual").await.unwrap();
+    validate_agent_skill_package(&package).unwrap();
+    assert_eq!(package.files.get("assets/a.bin"), Some(&vec![0, 255, 1]));
+    let destination = tempfile::tempdir().unwrap();
+    let output = package.write_to_directory(destination.path()).unwrap();
+    assert_eq!(
+        std::fs::read(output.join("assets/a.bin")).unwrap(),
+        vec![0, 255, 1]
+    );
+    assert!(package.write_to_directory(destination.path()).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_directory_export_cleans_the_staging_directory_and_can_be_retried() {
+    let destination = tempfile::tempdir().unwrap();
+    // `valid_path` deliberately permits arbitrary user-facing resource names,
+    // so a segment longer than the platform filename limit fails only after
+    // the staging directory and SKILL.md have been created.
+    let oversized_path = "x".repeat(300);
+    let failing = SkillPackage {
+        name: "retry-export".into(),
+        files: BTreeMap::from([
+            (
+                "SKILL.md".into(),
+                md("retry-export", "Retry a failed export").into_bytes(),
+            ),
+            (oversized_path, b"will not be written".to_vec()),
+        ]),
+    };
+    assert!(failing.write_to_directory(destination.path()).is_err());
+    assert!(!destination.path().join("retry-export").exists());
+    assert!(
+        std::fs::read_dir(destination.path())
+            .unwrap()
+            .all(|entry| !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".retry-export.ains-export-")),
+        "a failed export must not leave a staging directory that prevents retry"
+    );
+
+    let retry = SkillPackage {
+        name: "retry-export".into(),
+        files: BTreeMap::from([(
+            "SKILL.md".into(),
+            md("retry-export", "Retry a failed export").into_bytes(),
+        )]),
+    };
+    assert!(retry.write_to_directory(destination.path()).is_ok());
+}
+
+#[tokio::test]
+async fn import_replaces_an_incomplete_package_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let stale = dir.path().join("skills/retry-import/references/stale.md");
+    std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
+    std::fs::write(&stale, "must not survive retry").unwrap();
+
+    store
+        .import_package(SkillPackage {
+            name: "retry-import".into(),
+            files: BTreeMap::from([(
+                "SKILL.md".into(),
+                md("retry-import", "Clean retry").into_bytes(),
+            )]),
+        })
+        .await
+        .unwrap();
+
+    let package = store.export_package("retry-import").await.unwrap();
+    assert!(!package.files.contains_key("references/stale.md"));
+}
+
+#[test]
+fn package_rejects_file_directory_path_conflicts() {
+    let package = SkillPackage {
+        name: "conflicting-paths".into(),
+        files: BTreeMap::from([
+            (
+                "SKILL.md".into(),
+                md("conflicting-paths", "Conflicting resources").into_bytes(),
+            ),
+            ("references".into(), b"not a directory".to_vec()),
+            ("references/guide.md".into(), b"# Guide".to_vec()),
+        ]),
+    };
+    assert!(validate_agent_skill_package(&package).is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn resource_loader_refuses_external_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("safe-resource", &md("safe-resource", "Safe resources"))
+        .await
+        .unwrap();
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, b"must not be exposed").unwrap();
+    let resource = dir
+        .path()
+        .join("skills/safe-resource/references/external.txt");
+    std::fs::create_dir_all(resource.parent().unwrap()).unwrap();
+    symlink(&secret, resource).unwrap();
+
+    assert!(
+        store
+            .load_file("safe-resource", "references/external.txt")
+            .await
+            .is_err()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_external_skill_does_not_hide_valid_skill_discovery() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("valid-skill", &md("valid-skill", "Usable skill"))
+        .await
+        .unwrap();
+    let unsafe_dir = dir.path().join("skills/unsafe-skill");
+    std::fs::create_dir_all(&unsafe_dir).unwrap();
+    symlink(
+        dir.path().join("skills/valid-skill/SKILL.md"),
+        unsafe_dir.join("SKILL.md"),
+    )
+    .unwrap();
+
+    let skills = store.list(&context()).await.unwrap();
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name, "valid-skill");
+}
+
+#[tokio::test]
+async fn package_and_resource_size_limits_reject_unbounded_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let oversized_body = format!(
+        "---\nname: too-large\ndescription: too large\n---\n{}",
+        "x".repeat(MAX_SKILL_MD_BYTES)
+    );
+    assert!(
+        store
+            .create_skill("too-large", &oversized_body)
+            .await
+            .is_err()
+    );
+
+    let oversized_resource = SkillPackage {
+        name: "large-resource".into(),
+        files: BTreeMap::from([
+            (
+                "SKILL.md".into(),
+                md("large-resource", "Large resource").into_bytes(),
+            ),
+            (
+                "references/data.bin".into(),
+                vec![0; MAX_SKILL_RESOURCE_BYTES + 1],
+            ),
+        ]),
+    };
+    assert!(store.import_package(oversized_resource).await.is_err());
+
+    store
+        .create_skill(
+            "bounded-resource",
+            &md("bounded-resource", "Bounded resource"),
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .put_file(
+                "bounded-resource",
+                "references/large.bin",
+                &vec![0; MAX_SKILL_RESOURCE_BYTES + 1],
+            )
+            .await
+            .is_err()
+    );
+
+    let too_many = SkillPackage {
+        name: "many-files".into(),
+        files: std::iter::once((
+            "SKILL.md".into(),
+            md("many-files", "Many files").into_bytes(),
+        ))
+        .chain(
+            (0..MAX_SKILL_PACKAGE_FILES).map(|index| (format!("references/{index}.txt"), vec![])),
+        )
+        .collect(),
+    };
+    assert!(store.import_package(too_many).await.is_err());
+
+    let too_large_total = SkillPackage {
+        name: "large-package".into(),
+        files: std::iter::once((
+            "SKILL.md".into(),
+            md("large-package", "Large package").into_bytes(),
+        ))
+        .chain((0..8).map(|index| {
+            (
+                format!("assets/{index}.bin"),
+                vec![0; MAX_SKILL_RESOURCE_BYTES],
+            )
+        }))
+        .collect(),
+    };
+    assert!(store.import_package(too_large_total).await.is_err());
+}
+
+#[tokio::test]
+async fn standard_import_and_system_packages_survive_clear_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let imported = SkillPackage {
+        name: "imported".into(),
+        files: BTreeMap::from([
+            (
+                "SKILL.md".into(),
+                md("imported", "Imported workflow").into_bytes(),
+            ),
+            ("references/guide.md".into(), b"# Guide".to_vec()),
+        ]),
+    };
+    store.import_package(imported).await.unwrap();
+    let duplicate = SkillPackage {
+        name: "imported".into(),
+        files: BTreeMap::from([
+            (
+                "SKILL.md".into(),
+                md("imported", "Replacement workflow").into_bytes(),
+            ),
+            ("references/guide.md".into(), b"# Replaced".to_vec()),
+        ]),
+    };
+    assert!(store.import_package(duplicate).await.is_err());
+    assert_eq!(
+        store
+            .load_reference("imported", "references/guide.md")
+            .await
+            .unwrap(),
+        "# Guide"
+    );
+    let system = SkillPackage {
+        name: "builtin".into(),
+        files: BTreeMap::from([(
+            "SKILL.md".into(),
+            md("builtin", "Built-in workflow").into_bytes(),
+        )]),
+    };
+    store.install_system_package(system).await.unwrap();
+    assert_eq!(
+        store
+            .load_reference("imported", "references/guide.md")
+            .await
+            .unwrap(),
+        "# Guide"
+    );
+    assert_eq!(store.clear_all_skills().await.unwrap(), 1);
+    assert!(store.load_raw("imported").await.is_err());
+    assert!(store.load_raw("builtin").await.is_ok());
+    assert_eq!(store.list_versions("builtin").await.unwrap().len(), 1);
+    assert!(store.delete_skill("builtin").await.is_err());
+    assert!(store.load_raw("builtin").await.is_ok());
+}
+
+#[tokio::test]
+async fn concurrent_creation_of_the_same_name_has_one_winner() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let root = dir.path().join("skills");
+    let first = SkillStore::new(
+        Arc::clone(&kv),
+        open_platform_skill_files(&root).await.unwrap(),
+    );
+    let second = SkillStore::new(kv, open_platform_skill_files(&root).await.unwrap());
+    let left_content = md("same", "first");
+    let right_content = md("same", "second");
+    let (left, right) = tokio::join!(
+        first.create_skill("same", &left_content),
+        second.create_skill("same", &right_content),
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+}
+
+#[tokio::test]
+async fn update_and_rollback_keep_bodies_in_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.1")
+    );
+    assert!(
+        dir.path()
+            .join("skills/.ains-runtime/versions/review/v1.0.md")
+            .exists()
+    );
+    store.rollback_skill("review", "v1.0").await.unwrap();
+    assert!(
+        store
+            .load_raw("review")
+            .await
+            .unwrap()
+            .contains("description: v1")
+    );
+}
+
+#[tokio::test]
+async fn update_on_corrupt_active_version_errors_instead_of_silent_reset() {
+    // 防御回归（review P4）：head.active 无法解析时，update_skill 不得静默
+    // 回退到初始版本（会把损坏状态"修复"成 v1.1，覆盖可能存在的更高版本），
+    // 必须显式报错让上层感知内部状态损坏。
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let store = SkillStore::new(
+        Arc::clone(&kv),
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+    );
+    store
+        .create_skill("corrupt-head", &md("corrupt-head", "v1"))
+        .await
+        .unwrap();
+
+    // 直接损坏 head.active（模拟外部写入 / 内部状态损坏）
+    let head_key = "skills_head:corrupt-head";
+    let mut head = kv.get(head_key).await.unwrap().unwrap();
+    assert_eq!(head["active"], "v1.0");
+    head["active"] = serde_json::Value::String("not-a-version".into());
+    kv.set(head_key, &head, None).await.unwrap();
+
+    let err = store
+        .update_skill("corrupt-head", &md("corrupt-head", "v2"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            &err,
+            rust_agent::error::SkillsError::InvalidFormat(msg)
+                if msg.contains("not parseable")
+        ),
+        "corrupt active must surface InvalidFormat, got {err:?}"
+    );
+    // 状态未被半途修改：版本文件未被创建，active 仍保持损坏值可被上层诊断
+    assert_eq!(
+        kv.get(head_key).await.unwrap().unwrap()["active"],
+        "not-a-version"
+    );
+}
+
+#[tokio::test]
+async fn command_store_has_no_skill_without_explicit_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    assert!(store.list_entries().await.unwrap().is_empty());
+    assert!(
+        std::fs::read_dir(dir.path().join("skills"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn standard_directory_is_discovered_and_loadable_without_private_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let injected = dir.path().join("skills/manual/SKILL.md");
+    std::fs::create_dir_all(injected.parent().unwrap()).unwrap();
+    std::fs::write(
+        &injected,
+        md("manual", "This was not created by the command"),
+    )
+    .unwrap();
+
+    assert_eq!(store.list(&context()).await.unwrap()[0].name, "manual");
+    assert_eq!(store.list_entries().await.unwrap()[0].name, "manual");
+    assert!(store.load_raw("manual").await.is_ok());
+
+    store.clear_all_skills().await.unwrap();
+    assert!(!injected.exists());
+}
+
+#[tokio::test]
+async fn clear_all_removes_orphaned_workflow_versions_and_runtime_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let root = dir.path().join("skills");
+    let store = SkillStore::new(
+        Arc::clone(&kv),
+        open_platform_skill_files(&root).await.unwrap(),
+    );
+    store
+        .create_skill("orphaned", &md("orphaned", "First version"))
+        .await
+        .unwrap();
+    store
+        .update_skill("orphaned", &md("orphaned", "Second version"))
+        .await
+        .unwrap();
+
+    // Simulate an interruption after the package directory was removed but
+    // before runtime snapshots and KV metadata could be cleaned up.
+    std::fs::remove_dir_all(root.join("orphaned")).unwrap();
+    assert!(
+        root.join(".ains-runtime/versions/orphaned/v1.0.md")
+            .exists()
+    );
+    assert!(
+        !kv.list_prefix("skills_ver:orphaned:")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    assert_eq!(store.clear_all_skills().await.unwrap(), 0);
+    assert!(!root.join(".ains-runtime/versions/orphaned").exists());
+    assert!(
+        kv.list_prefix("skills_ver:orphaned:")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(kv.get("skills_index:orphaned").await.unwrap().is_none());
+    assert!(kv.get("skills_runtime:orphaned").await.unwrap().is_none());
+    assert!(kv.get("skills_head:orphaned").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn discovery_does_not_read_invalid_package_content() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("report", &md("report", "Initial description"))
+        .await
+        .unwrap();
+    std::fs::write(dir.path().join("skills/report/SKILL.md"), "not a skill").unwrap();
+
+    // A standard directory is authoritative, so a malformed replacement is
+    // hidden rather than advertised from stale private metadata.
+    assert!(store.list(&context()).await.unwrap().is_empty());
+    assert!(store.load_raw("report").await.is_err());
+}
+
+#[tokio::test]
+async fn corrupted_package_is_surfaced_in_list_entries_and_still_deletable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("report", &md("report", "Build reports"))
+        .await
+        .unwrap();
+    // Overwrite SKILL.md with unparseable content: the directory is present
+    // (so the package exists on disk) but its frontmatter is invalid.
+    std::fs::write(
+        dir.path().join("skills/report/SKILL.md"),
+        "# no frontmatter\n\njust a heading\n",
+    )
+    .unwrap();
+
+    // The management listing must surface the degraded package so the user can
+    // act on it, even though discovery (`list`) hides it from agents.
+    let entries = store.list_entries().await.unwrap();
+    let report = entries.iter().find(|e| e.name == "report").unwrap();
+    assert!(report.corrupted, "corrupted package must be flagged");
+    assert!(store.list(&context()).await.unwrap().is_empty());
+
+    // It must also be deletable: previously `delete_skill` required a valid
+    // frontmatter and would reject a corrupted package, leaving it orphaned.
+    store.delete_skill("report").await.unwrap();
+    assert!(!dir.path().join("skills/report").exists());
+    assert!(store.list_entries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn creator_metadata_distinguishes_user_import_and_system_packages() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("by-hand", &md("by-hand", "Created inline"))
+        .await
+        .unwrap();
+    store
+        .import_package(SkillPackage {
+            name: "imported-one".into(),
+            files: BTreeMap::from([(
+                "SKILL.md".into(),
+                md("imported-one", "Imported from disk").into_bytes(),
+            )]),
+        })
+        .await
+        .unwrap();
+    store
+        .install_system_package(SkillPackage {
+            name: "builtin-one".into(),
+            files: BTreeMap::from([(
+                "SKILL.md".into(),
+                md("builtin-one", "Host-provided").into_bytes(),
+            )]),
+        })
+        .await
+        .unwrap();
+
+    let entries = store.list_entries().await.unwrap();
+    let meta_of = |name: &str| {
+        entries
+            .iter()
+            .find(|e| e.name == name)
+            .expect("entry exists")
+            .meta
+            .as_ref()
+            .expect("meta present")
+            .clone()
+    };
+    assert_eq!(meta_of("by-hand").creator, "user");
+    assert_eq!(meta_of("imported-one").creator, "imported");
+    let builtin = meta_of("builtin-one");
+    assert_eq!(builtin.creator, "system");
+    assert!(builtin.trust_level == SkillTrust::System);
+}
+
+#[tokio::test]
+async fn discovery_hides_a_registered_skill_when_its_required_file_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("report", &md("report", "Build reports"))
+        .await
+        .unwrap();
+    std::fs::remove_file(dir.path().join("skills/report/SKILL.md")).unwrap();
+
+    // The metadata index remains compact, but the directory invariant is
+    // checked without reading the body before it is exposed to an agent.
+    assert!(store.list(&context()).await.unwrap().is_empty());
+    assert!(store.list_entries().await.unwrap().is_empty());
+    assert!(store.load_raw("report").await.is_err());
+}
+
+#[tokio::test]
+async fn invalid_names_cannot_escape_the_skill_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "keep").unwrap();
+
+    assert!(store.delete_skill("../outside").await.is_err());
+    assert!(outside.join("keep").exists());
+}
+
+#[tokio::test]
+async fn pruning_and_clearing_remove_workflow_history_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
+            .unwrap()
+            .table(TABLE_KV),
+    );
+    let store = SkillStore::with_retention(
+        kv,
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+        1,
+    );
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v2"))
+        .await
+        .unwrap();
+    assert_eq!(SkillPruner.prune(&store, "review").await.unwrap(), 1);
+    assert!(
+        !dir.path()
+            .join("skills/.ains-runtime/versions/review/v1.0.md")
+            .exists()
+    );
+
+    store.clear_all_skills().await.unwrap();
+    assert!(
+        !dir.path()
+            .join("skills/.ains-runtime/versions/review/v1.1.md")
+            .exists()
     );
 }
 
 #[test]
-fn split_frontmatter_edge_cases() {
-    // 未闭合 frontmatter → 全文视为 body
-    let (fm, body) = split_frontmatter("---\nname: x\nno close");
-    assert!(fm.is_empty());
-    assert!(body.starts_with("---\n"));
-    // 行中出现 --- 不误判为关闭栏
-    let (fm, body) = split_frontmatter("---\nname: a --- b\n---\nbody");
-    assert_eq!(fm, "name: a --- b");
-    assert_eq!(body, "body");
-    // 关闭栏在文件末尾（无换行）
-    let (fm, body) = split_frontmatter("---\nname: x\n---");
-    assert_eq!(fm, "name: x");
-    assert!(body.is_empty());
+fn validator_enforces_the_agent_skills_frontmatter_contract() {
+    let valid = "---\nname: déploiement\ndescription: Deploy a service when a release is requested.\nlicense: Apache-2.0\ncompatibility: Requires git and network access\nmetadata:\n  author: example-org\n  version: \"1.0\"\nallowed-tools: Bash(git:*) Read\n---\n# Deploy\n";
+    let package = |content: &str| rust_agent::skills::SkillPackage {
+        name: "déploiement".into(),
+        files: BTreeMap::from([("SKILL.md".into(), content.as_bytes().to_vec())]),
+    };
+    validate_agent_skill_package(&package(valid)).unwrap();
+
+    // Package names become storage-directory names, so accepting a
+    // compatibility spelling would allow two NFKC-equivalent packages to be
+    // created side by side. The persisted name itself must already be NFKC.
+    let compatibility_name = rust_agent::skills::SkillPackage {
+        name: "ｄéploiement".into(),
+        files: BTreeMap::from([(
+            "SKILL.md".into(),
+            "---\nname: déploiement\ndescription: valid\n---\n"
+                .as_bytes()
+                .to_vec(),
+        )]),
+    };
+    assert!(validate_agent_skill_package(&compatibility_name).is_err());
+
+    // The reference format allows only its six frontmatter fields, requires a
+    // matching NFKC name and description, and defines allowed-tools as a
+    // space-separated scalar rather than a YAML list.
+    assert!(
+        validate_agent_skill_package(&package(
+            "---\nname: déploiement\ndescription: valid\nextra: no\n---\n"
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_agent_skill_package(&package(
+            "---\nname: déploiement\ndescription: valid\nallowed-tools:\n  - Read\n---\n"
+        ))
+        .is_err()
+    );
+    assert!(
+        validate_agent_skill_package(&package("---\nname: another\ndescription: valid\n---\n"))
+            .is_err()
+    );
+    for frontmatter in [
+        "license: null",
+        "compatibility: null",
+        "metadata: null",
+        "allowed-tools: null",
+        "license:\n  - Apache-2.0",
+        "compatibility: 1",
+        "metadata:\n  author: 1",
+    ] {
+        assert!(
+            validate_agent_skill_package(&package(&format!(
+                "---\nname: déploiement\ndescription: valid\n{frontmatter}\n---\n"
+            )))
+            .is_err(),
+            "frontmatter must reject {frontmatter:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn rollback_missing_target_is_atomic_noop() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    assert!(store.rollback_skill("review", "v9.9").await.is_err());
+    // A failed rollback must leave the active version, body, and version
+    // history untouched.
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.0")
+    );
+    assert!(
+        store
+            .load_raw("review")
+            .await
+            .unwrap()
+            .contains("description: v1")
+    );
+    assert_eq!(store.list_versions("review").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn rollback_then_clear_all_removes_the_rolled_back_skill() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v2"))
+        .await
+        .unwrap();
+    store.rollback_skill("review", "v1.0").await.unwrap();
+    assert!(store.load_raw("review").await.is_ok());
+    // The rollback writes a regular new version, so a subsequent clear_all
+    // observes the consistent, single skill and removes it entirely.
+    store.clear_all_skills().await.unwrap();
+    assert!(store.load_raw("review").await.is_err());
+    assert!(!dir.path().join("skills/review").exists());
+}
+
+#[tokio::test]
+async fn prune_keeps_the_active_version_loadable() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv: Arc<dyn KvStore> = Arc::new(
+        RedbBackend::open(dir.path().join("state.redb"))
+            .unwrap()
+            .table(TABLE_KV),
+    );
+    let store = SkillStore::with_retention(
+        kv,
+        open_platform_skill_files(dir.path().join("skills"))
+            .await
+            .unwrap(),
+        1,
+    );
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v2"))
+        .await
+        .unwrap();
+    assert_eq!(SkillPruner.prune(&store, "review").await.unwrap(), 1);
+    // The active version survives pruning and stays loadable.
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.1")
+    );
+    assert!(
+        store
+            .load_raw("review")
+            .await
+            .unwrap()
+            .contains("description: v2")
+    );
+}
+
+#[test]
+fn version_bump_at_u32_max_boundary_returns_none() {
+    // 回归防御（review）：minor/major 在 u32::MAX 时不得 panic（debug）或回绕（release）。
+    let max_minor = SkillVersion {
+        major: 1,
+        minor: u32::MAX,
+    };
+    assert!(max_minor.next_minor().is_none());
+    assert_eq!(max_minor.next_major().unwrap().label(), "v2.0");
+    let max_major = SkillVersion {
+        major: u32::MAX,
+        minor: 0,
+    };
+    assert!(max_major.next_major().is_none());
+    assert_eq!(max_major.next_minor().unwrap().label(), "v4294967295.1");
+    // 常规递增不受影响。
+    assert_eq!(SkillVersion::INITIAL.next_minor().unwrap().label(), "v1.1");
+}
+
+#[tokio::test]
+async fn rollback_writes_an_auditable_new_version() {
+    // rollback 是有意的 append-only 审计语义（git revert 而非 reset）：
+    // 回滚后 head.active 指向新 minor 版本（内容与目标版本一致），版本列表
+    // 单调增长且可观测；回滚候选列表受 max_retained 约束。
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&dir).await;
+    store
+        .create_skill("review", &md("review", "v1"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v2"))
+        .await
+        .unwrap();
+    store
+        .update_skill("review", &md("review", "v3"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.2")
+    );
+    // 回滚到 v1.0：head.active 前进到新版本 v1.3，内容等于 v1.0。
+    store.rollback_skill("review", "v1.0").await.unwrap();
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.3")
+    );
+    assert!(
+        store
+            .load_raw("review")
+            .await
+            .unwrap()
+            .contains("description: v1")
+    );
+    // 版本列表 append-only：v1.0..=v1.3 共 4 个，全部可观测。
+    let versions = store.list_versions("review").await.unwrap();
+    assert_eq!(versions.len(), 4);
+    assert_eq!(versions[0].0.label(), "v1.0");
+    assert_eq!(versions[3].0.label(), "v1.3");
+    // 再次回滚仍前进（v1.4），不会回退指针。
+    store.rollback_skill("review", "v1.1").await.unwrap();
+    assert_eq!(
+        store.active_version("review").await.unwrap().as_deref(),
+        Some("v1.4")
+    );
+    assert!(
+        store
+            .load_raw("review")
+            .await
+            .unwrap()
+            .contains("description: v2")
+    );
+}
+
+#[tokio::test]
+async fn concurrent_stores_interleaved_update_and_rollback_stay_consistent() {
+    // 两个 SkillStore 共享同一 KV 与目录，交错 update + rollback 时版本链
+    // 必须保持单一活跃版本、目录与 KV 一致（目录是权威，load_raw 以
+    // head.active 为准），且最终内容可加载。
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(RedbBackend::open(dir.path().join("state.redb")).unwrap());
+    let kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let root = dir.path().join("skills");
+    let first = SkillStore::new(
+        Arc::clone(&kv),
+        open_platform_skill_files(&root).await.unwrap(),
+    );
+    let second = SkillStore::new(kv, open_platform_skill_files(&root).await.unwrap());
+    first
+        .create_skill("inter", &md("inter", "v1"))
+        .await
+        .unwrap();
+    let v2_content = md("inter", "v2");
+    let (a, b) = tokio::join!(
+        first.update_skill("inter", &v2_content),
+        second.rollback_skill("inter", "v1.0"),
+    );
+    // 两个操作经共享 mutation gate + 跨 tab 锁串行化，任一顺序都必须成功：
+    // - update 先：v1.0 → v1.1，rollback(v1.0) → v1.2（内容=v1）
+    // - rollback 先：回滚 v1.0 → v1.1，update → v1.2（内容=v2）
+    // 无论顺序，最终 head.active 均为 v1.2、版本列表 [v1.0, v1.1, v1.2]。
+    assert!(a.is_ok() && b.is_ok());
+    let versions = first.list_versions("inter").await.unwrap();
+    assert_eq!(
+        versions.len(),
+        3,
+        "interleaved update+rollback must keep exactly 3 versions"
+    );
+    assert_eq!(
+        first.active_version("inter").await.unwrap().as_deref(),
+        Some("v1.2")
+    );
+    assert_eq!(
+        second.active_version("inter").await.unwrap().as_deref(),
+        Some("v1.2")
+    );
+    // 内容取决于串行化顺序（v1 或 v2），但都必须可加载且与 head 一致。
+    let raw = first.load_raw("inter").await.unwrap();
+    assert!(raw.contains("description: v1") || raw.contains("description: v2"));
+    assert!(second.load_raw("inter").await.is_ok());
+    // 与第三个 store 的只读视图保持一致。
+    let third_kv: Arc<dyn KvStore> = Arc::new(backend.table(TABLE_KV));
+    let third = SkillStore::new(third_kv, open_platform_skill_files(&root).await.unwrap());
+    assert_eq!(
+        third.active_version("inter").await.unwrap().as_deref(),
+        Some("v1.2")
+    );
+    assert_eq!(third.list_versions("inter").await.unwrap().len(), 3);
 }

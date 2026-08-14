@@ -50,6 +50,18 @@ mod tests {
         }
     }
 
+    /// 防止漏译：ZH 必须非空。EN 允许为空（如 `users_per_page_unit: "" => "条"`
+    /// 这类英文无单位的占位字段），但 ZH 漏填会直接导致页面显示空白。
+    #[test]
+    fn zh_values_not_empty() {
+        for (name, _en_val, zh_val) in ALL_TRANSLATION_FIELDS {
+            assert!(
+                !zh_val.is_empty(),
+                "ZH 翻译为空: {name} — 漏译会导致页面显示空白，请补齐翻译"
+            );
+        }
+    }
+
     /// as_str() 覆盖所有 Language 变体
     #[test]
     fn language_as_str_covers_all_variants() {
@@ -63,8 +75,8 @@ mod tests {
     fn all_translation_fields_count() {
         let count = ALL_TRANSLATION_FIELDS.len();
         assert_eq!(
-            count, 553,
-            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (553)。如果新增/删除了 translate! 字段，请同步更新此断言。"
+            count, 598,
+            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (598)。如果新增/删除了 translate! 字段，请同步更新此断言。"
         );
     }
 }

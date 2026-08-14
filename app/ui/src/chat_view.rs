@@ -461,7 +461,8 @@ pub fn ChatInput(
 }
 
 /// Slash 命令建议过滤（纯函数，供单测固化）：草稿以 `/` 起始时，
-/// 按首个空白分隔 token 前缀匹配命令名；仅 `/` 时展示全部。
+/// 尚未输入空白时按命令前缀匹配；开始填写参数后只保留精确命令。
+/// 仅 `/` 时展示全部。
 /// 注意：这里是宽松的输入辅助（`/skills` 不匹配 `/skill` 前缀则无
 /// 建议）；实际执行的严格 token 匹配在宿主 `on_send` 侧把关。
 fn filter_slash_suggestions(draft: &str, commands: &[SlashCommandView]) -> Vec<SlashCommandView> {
@@ -469,9 +470,19 @@ fn filter_slash_suggestions(draft: &str, commands: &[SlashCommandView]) -> Vec<S
         return Vec::new();
     }
     let token = draft.split_whitespace().next().unwrap_or("");
+    // `/skill` and `/skill-create` deliberately share a prefix.  Once the
+    // user has typed the command separator, offering the latter would replace
+    // an in-progress `/skill <name>` command when the suggestion is clicked.
+    let has_command_separator = draft[token.len()..].chars().any(char::is_whitespace);
     commands
         .iter()
-        .filter(|c| token == "/" || c.name.starts_with(token))
+        .filter(|c| {
+            if has_command_separator {
+                c.name == token
+            } else {
+                token == "/" || c.name.starts_with(token)
+            }
+        })
         .cloned()
         .collect()
 }
@@ -487,6 +498,10 @@ mod tests {
                 description: "run a skill".into(),
             },
             SlashCommandView {
+                name: "/skill-create".into(),
+                description: "create a skill".into(),
+            },
+            SlashCommandView {
                 name: "/help".into(),
                 description: "show help".into(),
             },
@@ -497,14 +512,20 @@ mod tests {
     fn slash_suggestions_filter_by_first_token_prefix() {
         let cmds = commands();
         // 仅 `/` → 全部命令
-        assert_eq!(filter_slash_suggestions("/", &cmds).len(), 2);
-        // 前缀匹配：`/sk` → /skill；`/he` → /help
+        assert_eq!(filter_slash_suggestions("/", &cmds).len(), 3);
+        // 前缀匹配：`/sk` → /skill、/skill-create；`/he` → /help
         let hits = filter_slash_suggestions("/sk", &cmds);
-        assert_eq!(hits.len(), 1);
+        assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].name, "/skill");
+        assert_eq!(hits[1].name, "/skill-create");
         assert_eq!(filter_slash_suggestions("/he", &cmds)[0].name, "/help");
-        // 完整命令后跟参数：仅按首 token 匹配，不受参数影响
-        assert_eq!(filter_slash_suggestions("/skill csv", &cmds).len(), 1);
+        // 输入参数（或仅输入分隔空格）后不能展示同前缀的另一条命令，
+        // 否则点选会覆写正在输入的 `/skill <name>`。
+        for draft in ["/skill ", "/skill csv"] {
+            let hits = filter_slash_suggestions(draft, &cmds);
+            assert_eq!(hits.len(), 1, "{draft}");
+            assert_eq!(hits[0].name, "/skill", "{draft}");
+        }
     }
 
     #[test]

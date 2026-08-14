@@ -1,6 +1,6 @@
 # Phase 3 对齐清单：Tool Runtime (Local + Remote)
 
-对齐基线：`OpenHarness/src/openharness/tools/`（`base.py` 与内置工具）、
+对齐基线：`Harness/src/harness/tools/`（`base.py` 与内置工具）、
 `permissions/`、`sandbox/`、`hooks/`、`mcp/`、`utils/network_guard.py`、
 `services/tool_outputs.py` + `engine/query.py::_execute_tool_call`
 （提交时仓库内版本）。
@@ -16,7 +16,7 @@ Sandbox 占位、Hook System、集成测试）。
 | 注册表 | `ToolRegistry`：dict 名字映射、`to_api_schema()` | `ToolRuntime`：注册序保持（Vec+index）、同名重注册**原位替换**（对齐 dict 覆盖语义）、`api_schemas()` | 对齐 |
 | 分发管线 | `query.py::_execute_tool_call`：pre_tool_use hook → 权限 evaluate（file_path/command 归一化）→ 确认回调 → 执行 → 输出预算外置 → post_tool_use hook；全部失败归一化为 is_error tool_result | `ToolRuntime::dispatch` 同序同语义；`file_path` 取 `file_path`/`path`/`root` 首个非空并以 cwd 锚定词法 resolve；post_tool_use 观察性执行不改写结果；`AgentKernel::new` 自动装配无确认回调的 default 权限引擎，写操作 fail-closed，完整宿主经 `with_runtime` 注入 UI 回调 | 对齐 + 安全默认 |
 | tool_use 批次完整性 | `tool_use_id` 是 tool_use/tool_result 唯一配对键，基线未提供整批 ID 前置守卫 | Kernel 在记录 assistant turn、发送 completion 事件或分发任一工具前，整批拒绝空/纯空白或重复 ID；以 recoverable error 丢弃畸形 turn，不执行任何副作用，也不留悬空 tool_use 历史 | 协议 + 安全加固 |
-| 输出预算 | inline 16000 / preview 3000 / microcompact 4000 字符（Unicode 码点），`OPENHARNESS_*` 环境变量覆盖（下限 256/128/256）；超限落盘 `tool_artifacts/` + `[Tool output truncated]` 标记 + 预览 | 同常量同下限，环境变量 `AINS_TOOL_OUTPUT_*`（仅 Native；WASM 取默认）；外置为 `ArtifactSink` 端口（Native `FsArtifactSink` 文件、文件名 `{unix_ms}-{safe}-{seq}.txt`），标记文案同结构；工件引用记入 tool_metadata 独立活跃工件列表（对齐 `_remember_active_artifact`）；包括 hook/权限提前拒绝在内的所有结果统一应用预算；截断诊断头、工具 ID、工件引用/失败原因与 preview 合成后再执行 inline hard cap，即使 preview 配置大于 inline，最终回填也不越界 | 对齐 + 资源加固（工件文件名时间戳格式为**偏差（有意）**：epoch ms 替代 `%Y%m%d-%H%M%S`，避免引入 chrono） |
+| 输出预算 | inline 16000 / preview 3000 / microcompact 4000 字符（Unicode 码点），`HARNESS_*` 环境变量覆盖（下限 256/128/256）；超限落盘 `tool_artifacts/` + `[Tool output truncated]` 标记 + 预览 | 同常量同下限，环境变量 `AINS_TOOL_OUTPUT_*`（仅 Native；WASM 取默认）；外置为 `ArtifactSink` 端口（Native `FsArtifactSink` 文件、文件名 `{unix_ms}-{safe}-{seq}.txt`），标记文案同结构；工件引用记入 tool_metadata 独立活跃工件列表（对齐 `_remember_active_artifact`）；包括 hook/权限提前拒绝在内的所有结果统一应用预算；截断诊断头、工具 ID、工件引用/失败原因与 preview 合成后再执行 inline hard cap，即使 preview 配置大于 inline，最终回填也不越界 | 对齐 + 资源加固（工件文件名时间戳格式为**偏差（有意）**：epoch ms 替代 `%Y%m%d-%H%M%S`，避免引入 chrono） |
 | 无外置存储 | 不存在该分支（桌面恒有文件系统） | Web 未注入 sink 时：全文丢弃、标记注明 "no artifact storage available"，仅留预览 | **偏差（平台限制）**：Web sink 可后续接 KvStore |
 | microcompact 判定 | `mcp__` 前缀恒可清理，其余按阈值 | `is_microcompactable_tool_result` 同语义（消费方随 Phase 5 compact 落地） | 对齐 |
 
@@ -82,7 +82,7 @@ format/minify/get 通过有界 writer 序列化，避免在共享输出预算介
 | 能力点 | 基线 | AINS | 结论 |
 |---|---|---|---|
 | 决策序 | 敏感路径 → denied_tools → allowed_tools → PathRule → denied_commands → full_auto → 只读 → plan → default 确认 | 敏感路径 → denied_tools → denied_commands → PathRule → allowed_tools/会话级"总是允许" → 模式门控 | **有意修正基线缺陷**：命令/路径 deny 均不可被工具白名单、AlwaysAllow 或路径 allow 覆盖 |
-| 敏感路径黑名单 | .ssh/.aws×2/gcloud/.azure/.gnupg/.docker/.kube + openharness 自有凭据×2；fnmatch；`_policy_match_paths` 目录根加尾 `/`；不可被任何模式/规则覆盖 | 同列表；openharness 两项替换为 `*/.ains/credentials.json`；目标/最近存在父目录先解析 symlink；Windows `\\` 统一为 `/` 后匹配；同双形态匹配 | 对齐 + 加固（自有凭据路径改名为**偏差（有意）**） |
+| 敏感路径黑名单 | .ssh/.aws×2/gcloud/.azure/.gnupg/.docker/.kube + harness 自有凭据×2；fnmatch；`_policy_match_paths` 目录根加尾 `/`；不可被任何模式/规则覆盖 | 同列表；harness 两项替换为 `*/.ains/credentials.json`；目标/最近存在父目录先解析 symlink；Windows `\\` 统一为 `/` 后匹配；同双形态匹配 | 对齐 + 加固（自有凭据路径改名为**偏差（有意）**） |
 | PathRule | allow 分支为死代码（仅 deny 生效） | **完整 allow/deny 语义**：按序首个命中生效，allow 命中跳过模式门控（计划明确要求） | AINS 扩展（计划注记） |
 | PermissionMode | default/plan/full_auto | 同三枚举；`RwLock` 共享句柄支持 enter/exit_plan_mode 即时切换；plan 下 `exit_plan_mode` 进入确认分支而非被写操作规则永久拦截；会话级 AlwaysAllow 放行集在 plan 模式下挂起、退出后恢复（配置级 allowed_tools 仍按基线序先于模式门控，review 十二轮） | 对齐 + 修正 |
 | 确认回调 | `permission_prompt(tool_name, reason) → bool`；询问前发 notification hook | `PermissionPrompt::confirm → Allow/AlwaysAllow/Deny`（6.11 三答复）；请求携带结构化输入、规范化路径和命令供 UI 知情确认；同 notification hook 时点；AlwaysAllow 写会话放行集 | 对齐 + AINS 扩展 |
@@ -105,7 +105,7 @@ format/minify/get 通过有界 writer 序列化，避免在共享输出预算介
 | 触发点 | 10 个（session_start/end、pre/post_compact、pre/post_tool_use、user_prompt_submit、notification、stop、subagent_stop） | `HookEvent` 同 10 枚举同蛇形命名 | 对齐 |
 | 定义类型 | command/prompt/http/agent 四类 | command/prompt 先行（计划 3.9 明确 http/agent 后置）；serde `type` 判别式；默认值同基线（timeout 30、prompt 默认 block_on_failure=true） | 对齐（http/agent 后置） |
 | matcher/priority | fnmatch 对 payload `tool_name→prompt→event`；priority 降序、同级注册序 | 同；`sort_by_key(Reverse)` 稳定排序 | 对齐 |
-| command hook | shell 执行、`$ARGUMENTS` shlex 转义注入、`OPENHARNESS_HOOK_EVENT/PAYLOAD` 环境变量、超时 kill、stdout+stderr 拼接、退出码 metadata | 同（环境变量前缀 AINS_；`shell_quote` 等价 shlex.quote），Native 强制经注入的 `Sandbox`，默认 Noop fail-closed；WASM 报 "not supported on the web platform"（blocked 依 block_on_failure） | 对齐 + 加固（env 前缀改名；WASM 降级注记） |
+| command hook | shell 执行、`$ARGUMENTS` shlex 转义注入、`HARNESS_HOOK_EVENT/PAYLOAD` 环境变量、超时 kill、stdout+stderr 拼接、退出码 metadata | 同（环境变量前缀 AINS_；`shell_quote` 等价 shlex.quote），Native 强制经注入的 `Sandbox`，默认 Noop fail-closed；WASM 报 "not supported on the web platform"（blocked 依 block_on_failure） | 对齐 + 加固（env 前缀改名；WASM 降级注记） |
 | prompt hook | 模型校验，严格 JSON `{ok, reason}` + 宽松回退（ok/true/yes）；固定 system 前缀 | 同（前缀品牌换 AINS；ModelClient 未注入报失败）；hook 级模型覆盖 default_model；请求/响应各 256 KiB 硬上限 | 对齐 + 资源加固 |
 | 聚合 | `AggregatedHookResult`：任一 blocked 即阻断；reason 回落 output | 同 | 对齐 |
 | Kernel 触发 | 生命周期与工具循环触发对应事件 | 已接线 session_start/end、pre/post_compact、pre/post_tool_use、user_prompt_submit、notification、stop；subagent_stop 随 subagent 生命周期落地 | 对齐（subagent 尚无运行时触发源） |

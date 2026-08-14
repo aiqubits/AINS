@@ -49,6 +49,7 @@ fn to_category_view(name: &str, category: ToolCategory) -> ToolCategoryView {
 
 #[component]
 pub fn Tools() -> Element {
+    let client = use_context::<client_api::Client>();
     let i18n = use_context::<I18nContext>();
     let t = i18n.t();
     let mut tools = use_signal(Vec::<ToolCardView>::new);
@@ -66,10 +67,12 @@ pub fn Tools() -> Element {
 
     // 异步初始化：从本地存储恢复活跃状态，再合并运行时工具清单。
     // 仅构造 ToolRuntime 读 schema + 分类，不装配 Kernel/会话。
+    let load_client = client.clone();
     use_future(move || {
         let mut tools = tools;
+        let client = load_client.clone();
         async move {
-            if let Err(e) = service::load_tool_states().await {
+            if let Err(e) = service::load_tool_states(&client).await {
                 // 读取失败 ≠ 无记录：升级为 error 并展示横幅，明确当前
                 // 全部工具为活跃状态（fail-open 回退：禁用清单无法恢复，
                 // 工具默认全活跃，必须显式告知用户）。
@@ -147,6 +150,9 @@ pub fn Tools() -> Element {
         if prev != Ok(PERSIST_IDLE) {
             return;
         }
+        // 捕获任务启动时的 owner scope。若用户在任务运行期间切换账户，panic
+        // 恢复 marker 只能写回旧 scope，绝不能污染新账户的失败横幅。
+        let persist_scope = service::active_tool_state_scope();
         // 挂 root scope 的后台任务（review H1）：dioxus `spawn` 的任务随
         // Tools 组件卸载即取消——切换后立刻导航离开（如去会话视图验证
         // 停用效果）会丢弃在途落盘任务，而 PERSIST_STATE 停在 RUNNING/
@@ -215,7 +221,11 @@ pub fn Tools() -> Element {
                     // 轮即静默不落盘。有界：仅当重试未耗尽（panic_retries <
                     // 2），此轮再 panic 则直接退出，PENDING 由 marker 提示
                     // 兜底（方向安全，宁多提示）。
-                    if service::recover_persist_panic("persist task panicked").await
+                    if service::recover_persist_panic(
+                        persist_scope.as_deref(),
+                        "persist task panicked",
+                    )
+                    .await
                         && panic_retries < 2
                     {
                         panic_retries += 1;

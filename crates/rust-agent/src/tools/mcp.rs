@@ -1,4 +1,4 @@
-//! MCP Client Runtime + McpTool 桥接（对齐 OpenHarness `mcp/` + `mcp_tool.py`）。
+//! MCP Client Runtime + McpTool 桥接（对齐 Harness `mcp/` + `mcp_tool.py`）。
 //!
 //! - 传输：stdio（仅 Native，子进程 + newline-delimited JSON-RPC）/
 //!   streamable-http（双端，POST JSON-RPC，响应支持 application/json 与

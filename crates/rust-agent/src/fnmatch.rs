@@ -1,7 +1,7 @@
 //! Python `fnmatch.fnmatch` 语义的纯 Rust 实现（双 target，无依赖）。
 //!
 //! 供权限引擎 PathRule / 敏感路径黑名单与 Hook matcher 使用，与
-//! OpenHarness `permissions/checker.py` + `hooks/executor.py` 的 fnmatch
+//! Harness `permissions/checker.py` + `hooks/executor.py` 的 fnmatch
 //! 口径逐字对齐：
 //! - `*` 匹配任意字符序列（**包括 `/`**，非路径感知——与 glob 不同）；
 //! - `?` 匹配任意单字符；

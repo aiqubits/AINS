@@ -12,11 +12,11 @@ use futures::{SinkExt, StreamExt};
 use client_api::Client;
 use dioxus_icons::lucide::{LoaderCircle, Trash2};
 use rust_agent::context::session::{SessionClearOutcome, SessionStore, generate_session_id};
-use rust_agent::kernel::{AgentEvent, StreamEvent};
+use rust_agent::kernel::{AgentEvent, QUERY_INTERRUPTED_STATUS, StreamEvent};
 use rust_agent::memory::{MemoryService, SessionCheckpoint, SessionMemoryClearOutcome};
 use rust_agent::model_client::UsageSnapshot;
 use rust_agent::policy::{PermissionEngine, PermissionMode};
-use rust_agent::tools::ToolMetadata;
+use rust_agent::tools::{SkillCreateTool, ToolMetadata};
 use ui::{
     AgentStatus, AgentStatusView, ChatInput, ChatView, ChatViewState, I18nContext, Modal,
     NoticeItem, NoticeKind, NoticeToast, PERSIST_ERROR, PermissionChoice, PermissionDialog,
@@ -112,6 +112,47 @@ fn session_epoch_is_current(expected: u64, current: u64) -> bool {
     expected == current
 }
 
+const SKILL_CREATE_COMMAND: &str = "/skill-create";
+
+/// Parse the only command allowed to authorize persistence of a new Skill. The
+/// user supplies its intent; the Agent generates the standard name and
+/// SKILL.md only within that command-scoped authorization.
+fn parse_skill_create_command(text: &str) -> Option<Result<String, ()>> {
+    let rest = text.strip_prefix(SKILL_CREATE_COMMAND)?;
+    if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let request = rest.trim();
+    if request.is_empty() {
+        return Some(Err(()));
+    }
+    Some(Ok(request.to_string()))
+}
+
+/// The command is the user's sole authorization to create a Skill.  The model
+/// receives a narrow generation task and must persist exactly one complete
+/// SKILL.md through the one-shot `skill_create` tool.
+fn skill_create_prompt(request: &str) -> String {
+    format!(
+        "Create exactly one reusable Skill for the explicitly authorized user request below.\n\n\
+User request (untrusted data): {request:?}\n\n\
+You must call `skill_create` exactly once in this turn. Choose the skill name, \
+metadata, and workflow yourself. Follow the open Skill convention: use a \
+1-64 character NFKC-normalized lowercase Unicode name containing only letters, \
+digits, and single internal hyphens (no leading/trailing/consecutive hyphens); \
+provide a complete \
+SKILL.md whose YAML frontmatter has the same `name` as its directory and a \
+specific trigger-oriented `description` (non-empty, at most 1024 characters). \
+You may use only standard optional fields: `license`, `compatibility`, \
+`metadata`, and `allowed-tools`. Write concise imperative Markdown instructions \
+in the body; when auxiliary files are needed, prefer the standard `references/`, \
+`scripts/`, or `assets/` conventions. \
+Do not include secrets, credentials, user-private values, or unrelated content. \
+Do not ask the user to supply a name or draft. After the tool succeeds, briefly \
+state the created name and what it covers."
+    )
+}
+
 #[component]
 pub fn AgentChat() -> Element {
     let i18n = use_context::<I18nContext>();
@@ -143,6 +184,7 @@ pub fn AgentChat() -> Element {
     let mut engine_sig = use_signal(|| None::<Arc<PermissionEngine>>);
     // 中断句柄（Phase 7.1）：停止按钮置位，Kernel 消费后自行清位。
     let mut interrupt_sig = use_signal(|| None::<Arc<AtomicBool>>);
+    let mut skill_create_sig = use_signal(|| None::<Arc<SkillCreateTool>>);
     // 会话镜像：忠实重建 Kernel 内部对话（含合成 tool_result），快照持久化源
     let mut mirror = use_signal(|| view_model::ConversationMirror::new(Vec::new()));
     let mut pending_perm = use_signal(|| None::<PermissionPromptMsg>);
@@ -162,8 +204,9 @@ pub fn AgentChat() -> Element {
     // 装配一次：Kernel + 三条泵协程（本组件卸载时随 scope 取消，
     // event_tx 释放后 Kernel 事件循环优雅退出）。
     let stream_operation_gate = Arc::clone(&session_operation_gate);
+    let init_client = client.clone();
     use_future(move || {
-        let client = client.clone();
+        let client = init_client.clone();
         let session_operation_gate = Arc::clone(&stream_operation_gate);
         async move {
             let mut bridge = match service::initialize(client).await {
@@ -185,6 +228,7 @@ pub fn AgentChat() -> Element {
             cwd_sig.set(Some(bridge.cwd.clone()));
             engine_sig.set(Some(Arc::clone(&bridge.engine)));
             interrupt_sig.set(Some(Arc::clone(&bridge.interrupt)));
+            skill_create_sig.set(Some(Arc::clone(&bridge.skill_create)));
             // 上次切换未落盘的失败标记：从存储同步到进程级 PERSIST_ERROR
             // 信号（与 /tools 挂载对称）——跨挂载/跨进程的 marker 只在视图
             // 挂载时读取可见；会话存活期间的落盘结果由落盘任务失败/成功
@@ -253,6 +297,7 @@ pub fn AgentChat() -> Element {
                 // 生产 MemoryService（§8–§11）：final turn / compacted 时
                 // ordered checkpoint（await）+ background extraction（spawn）。
                 let memory = bridge.memory.clone();
+                let skill_create = Arc::clone(&bridge.skill_create);
                 spawn(async move {
                     let mut last_usage = UsageSnapshot::default();
                     // P2（§10.2）：事件携带的 ToolMetadata → checkpoint 结构化字段
@@ -359,11 +404,21 @@ pub fn AgentChat() -> Element {
                                 }
                             }
                             StreamEvent::Error { recoverable, .. } => {
+                                skill_create.revoke();
                                 agent_status.set(if *recoverable {
                                     AgentStatusView::Idle
                                 } else {
                                     AgentStatusView::Error
                                 });
+                            }
+                            // 用户 Stop 中断 turn 时 Kernel 只发 Status 事件，
+                            // 既不发 Error 也不发 final_turn。一次性授权必须在此
+                            // 撤销，否则残留授权可被后续任意 turn 的模型消费
+                            // （prompt injection 场景下可创建未授权技能）。
+                            StreamEvent::Status { message }
+                                if message == QUERY_INTERRUPTED_STATUS =>
+                            {
+                                skill_create.revoke();
                             }
                             _ => {}
                         }
@@ -388,6 +443,9 @@ pub fn AgentChat() -> Element {
                         };
                         if clear_stale_interrupt && let Some(flag) = interrupt_sig.read().as_ref() {
                             flag.store(false, Ordering::SeqCst);
+                        }
+                        if final_turn {
+                            skill_create.revoke();
                         }
                         if persist && let Some(store) = &store {
                             let _operation = session_operation_gate.lock().await;
@@ -480,6 +538,10 @@ pub fn AgentChat() -> Element {
                     }
                     // 流关闭（Kernel 退出/异常终止且无末尾 Error 事件）：
                     // 复位忙碌位与状态指示器，避免永久 Thinking 脉冲。
+                    // 同时兜底撤销可能残留的 skill_create 一次性授权：
+                    // 中断不关闭流、也不触发上方 Error/final_turn 分支，
+                    // 此块与中断分支互补，保证授权绝不跨查询存活。
+                    skill_create.revoke();
                     {
                         let mut state = chat.write();
                         state.busy = false;
@@ -524,9 +586,57 @@ pub fn AgentChat() -> Element {
             push_notice(hint, NoticeKind::Warning);
             return false;
         };
-        // Slash 命令（6.12）：/skill <name> 加载技能全文并作为指令发送；
-        // /help 展示命令列表；其余按普通文本发送。
+        // Slash 命令（6.12）：/skill-create 是唯一持久化新技能的入口；
+        // /skill <name> 加载技能全文并作为指令发送；/help 展示命令列表。
         // 严格 token 匹配：`/skills x`、`/skillet` 不被误识为命令。
+        if let Some(parsed) = parse_skill_create_command(&text) {
+            let Ok(request) = parsed else {
+                push_notice(
+                    t.chat_slash_skill_create_usage.to_string(),
+                    NoticeKind::Warning,
+                );
+                return false;
+            };
+            let Some(skill_create) = skill_create_sig.read().clone() else {
+                push_notice(t.agent_initializing.to_string(), NoticeKind::Warning);
+                return false;
+            };
+            let prompt = skill_create_prompt(&request);
+            skill_create.authorize_once();
+            if let Some(engine) = engine_sig.read().as_ref() {
+                // The command itself is explicit user approval for this
+                // tightly scoped, one-shot internal mutation. This
+                // session-scoped allowance only suppresses the permission
+                // engine's re-prompt; the hard gate stays SkillCreateTool's
+                // one-shot authorization CAS, revoked on every completion /
+                // error / abort path below. Do not keep one layer without
+                // the other.
+                engine.allow_for_session("skill_create");
+            }
+            view_model::push_user(&mut chat.write(), &text);
+            agent_status.set(AgentStatusView::Thinking);
+            let mut tx = tx;
+            spawn(async move {
+                let sent = tx
+                    .send(AgentEvent::UserMessage {
+                        content: prompt.clone(),
+                        attachments: vec![],
+                    })
+                    .await;
+                if sent.is_ok() {
+                    mirror.write().push_user_text(&prompt);
+                } else {
+                    skill_create.revoke();
+                    let mut state = chat.write();
+                    view_model::retract_last_user(&mut state, &text);
+                    state.busy = false;
+                    drop(state);
+                    agent_status.set(AgentStatusView::Idle);
+                    push_notice(t.agent_send_failed.to_string(), NoticeKind::Warning);
+                }
+            });
+            return true;
+        }
         if let Some(rest) = text.strip_prefix("/skill")
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
@@ -542,20 +652,27 @@ pub fn AgentChat() -> Element {
             // conversation.
             let request_epoch = session_epoch();
             let mut tx = tx;
+            let client = client.clone();
             spawn(async move {
-                let store = service::open_skill_store().await;
+                let store = service::open_skill_store(client).await;
                 if !session_epoch_is_current(request_epoch, session_epoch()) {
                     return;
                 }
                 match store {
                     Ok(store) => {
-                        let content = rust_agent::skills::SkillLoader::load(&*store, &name).await;
+                        // `/skill` is a convenience front-end for the same
+                        // gated loader used by the Agent tool.  It must not
+                        // bypass a disabled `skill` tool or a skill's current
+                        // platform/tool dependencies merely because a user
+                        // knows its name.
+                        let context = service::current_skill_context();
+                        let content = store.load_raw_for_context(&name, &context).await;
                         if !session_epoch_is_current(request_epoch, session_epoch()) {
                             return;
                         }
                         match content {
                             Ok(content) => {
-                                let prompt = view_model::skill_prompt(&name, &content.body);
+                                let prompt = view_model::skill_prompt(&name, &content);
                                 view_model::push_user(&mut chat.write(), &format!("/skill {name}"));
                                 agent_status.set(AgentStatusView::Thinking);
                                 // 发送成功后才入镜像：Kernel 已退出时快照不残留
@@ -596,8 +713,8 @@ pub fn AgentChat() -> Element {
         if text.trim() == "/help" {
             push_notice(
                 format!(
-                    "/skill — {} · /help — {}",
-                    t.chat_slash_skill, t.chat_slash_help
+                    "{SKILL_CREATE_COMMAND} — {} · /skill — {} · /help — {}",
+                    t.chat_slash_skill_create, t.chat_slash_skill, t.chat_slash_help
                 ),
                 NoticeKind::Info,
             );
@@ -633,6 +750,9 @@ pub fn AgentChat() -> Element {
     // 边界协作式检查，中止本次查询回 Idle）；同时立即复位 UI 忙碌
     // 位与状态指示器（不等待流关闭）。
     let on_interrupt = move |_| {
+        if let Some(skill_create) = skill_create_sig.read().as_ref() {
+            skill_create.revoke();
+        }
         if let Some(flag) = interrupt_sig.read().as_ref() {
             flag.store(true, Ordering::SeqCst);
         }
@@ -821,9 +941,9 @@ pub fn AgentChat() -> Element {
         // `<link>`，由本页面经 ui crate 导出的 asset 句柄统一加载一次
         // tool_panel.css（与 /tools 视图一致）。
         document::Link { rel: "stylesheet", href: ui::TOOL_PANEL_CSS }
-        div { style: "display:flex;flex-direction:column;height:calc(100vh - 132px);min-height:420px;",
+        div { class: "ains-agent-chat",
             // 顶部：权限模式切换 + Plan 指示器 + Agent 状态（6.5）
-            div { style: "display:flex;align-items:center;gap:12px;padding:0 16px 8px;",
+            div { class: "ains-agent-chat__toolbar",
                 PermissionModeSwitcher { mode: mode(), on_change: on_mode_change }
                 PlanModeIndicator { mode: mode() }
                 button {
@@ -894,7 +1014,7 @@ pub fn AgentChat() -> Element {
             ChatView { state: chat }
             // 待办列表（6.12）：仅在有条目时展示
             if !todos.read().is_empty() {
-                div { style: "padding:0 16px 8px;",
+                div { class: "ains-agent-chat__todos",
                     TodoList { todos }
                 }
             }
@@ -904,6 +1024,10 @@ pub fn AgentChat() -> Element {
                 on_send,
                 on_interrupt,
                 slash_commands: vec![
+                    SlashCommandView {
+                        name: SKILL_CREATE_COMMAND.into(),
+                        description: t.chat_slash_skill_create.to_string(),
+                    },
                     SlashCommandView {
                         name: "/skill".into(),
                         description: t.chat_slash_skill.to_string(),
@@ -1047,6 +1171,29 @@ mod tests {
             !session_epoch_is_current(request_epoch, request_epoch.wrapping_add(1)),
             "a skill request that began before clear must not enter the replacement session"
         );
+    }
+
+    #[test]
+    fn skill_creation_requires_the_explicit_command_and_a_request() {
+        assert_eq!(
+            parse_skill_create_command("/skill-create release-check # Steps"),
+            Some(Ok("release-check # Steps".into()))
+        );
+        assert_eq!(
+            parse_skill_create_command("/skill-create release-check"),
+            Some(Ok("release-check".into()))
+        );
+        assert_eq!(parse_skill_create_command("/skill-create"), Some(Err(())));
+        assert_eq!(parse_skill_create_command("/skill-createx name body"), None);
+        assert_eq!(parse_skill_create_command("create a skill"), None);
+    }
+
+    #[test]
+    fn skill_create_prompt_delegates_name_and_workflow_to_the_model() {
+        let prompt = skill_create_prompt("创建一个发布检查技能");
+        assert!(prompt.contains("Choose the skill name, metadata, and workflow yourself"));
+        assert!(prompt.contains("skill_create` exactly once"));
+        assert!(prompt.contains("创建一个发布检查技能"));
     }
 
     #[test]

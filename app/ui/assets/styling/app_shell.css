@@ -27,3 +27,10 @@
   flex-direction: column;
   gap: 24px;
 }
+
+/* 对话页只有消息列表承担纵向滚动。限制内容容器的溢出，避免页面滚动条与
+   消息列表滚动条同时出现；实际滚动由 .ains-chat__scroll 提供。 */
+.ains-app-shell__content--chat {
+  min-height: 0;
+  overflow: hidden;
+}

@@ -1,4 +1,4 @@
-//! 会话持久化（Phase 5.4，对齐 OpenHarness `services/session_storage.py`）。
+//! 会话持久化（Phase 5.4，对齐 Harness `services/session_storage.py`）。
 //!
 //! 快照存储走 `KvStore`（Native = redb / Web = IndexedDB，双端一致），而非
 //! 基线的文件系统。对齐要点：

@@ -1,4 +1,4 @@
-//! Hook System（对齐 OpenHarness `hooks/`：events / types / schemas / executor）。
+//! Hook System（对齐 Harness `hooks/`：events / types / schemas / executor）。
 //!
 //! Phase 3 范围：10 个触发点 + command / prompt 两类定义先行（http / agent
 //! 后置，schema 变体已预留判别式但不注册执行器）；matcher（fnmatch）、

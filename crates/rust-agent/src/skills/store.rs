@@ -1,1037 +1,1612 @@
-//! KvStore 后端的 Skills 存储（AINS_PLAN 第六章 6.1 存储节，Phase 6.4 最小子集）。
-//!
-//! key 空间：
-//! - `skills:{name}`      → SKILL.md 原始文本（YAML frontmatter + Markdown body）
-//! - `skills_meta:{name}` → [`SkillMeta`]（JSON 载荷；KvStore 信封本身已 bincode 落盘，
-//!   与计划"bincode(SkillMeta)"的偏差记录见 Phase 6 对齐清单）
-//!
-//! 本阶段仅实现管理面板所需的 `list` / `load` / `delete_skill` 与内容
-//! checksum 校验；`create/update/rollback_skill`、Level 2 引用文件与完整
-//! 门控随 Phase 6.8/6.9 落地（调用返回显式错误，不静默成功）。
+//! Agent Skills storage: package files are the source of truth; KV contains
+//! only the progressive-discovery index and AINS runtime metadata.
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 use crate::error::{MemoryError, SkillsError};
 use crate::memory::{KvStore, now_ms};
 use crate::platform::Platform;
+use crate::skills::files::SkillFiles;
 use crate::skills::{SkillContent, SkillContext, SkillLoader, SkillManage, SkillSummary};
 
-/// SKILL.md 原文的 key 前缀。
-pub const SKILL_KEY_PREFIX: &str = "skills:";
-/// 元数据的 key 前缀（与 `skills:` 无前缀包含关系，list_prefix 不互扰）。
-pub const SKILL_META_KEY_PREFIX: &str = "skills_meta:";
-/// 单个 SKILL.md 原文的字节上限（防超大条目撞爆面板/上下文）。
-pub const MAX_SKILL_CONTENT_BYTES: usize = 256 * 1024;
-
-/// 版本记录 key 前缀：`skills_ver:{name}:{version}`。
+pub const SKILL_INDEX_KEY_PREFIX: &str = "skills_index:";
+pub const SKILL_RUNTIME_KEY_PREFIX: &str = "skills_runtime:";
+pub const SKILL_META_KEY_PREFIX: &str = SKILL_RUNTIME_KEY_PREFIX;
+pub const SKILL_SYSTEM_KEY_PREFIX: &str = "skills_system:";
 pub const SKILL_VER_KEY_PREFIX: &str = "skills_ver:";
-/// 技能头（活跃版本指针 + 元数据）key 前缀：`skills_head:{name}`。
 pub const SKILL_HEAD_KEY_PREFIX: &str = "skills_head:";
-/// Level 2 引用文件 key 前缀：`skills_ref:{name}:{path}`。
-pub const SKILL_REF_KEY_PREFIX: &str = "skills_ref:";
-/// 默认保留最近版本数（第六章清理策略：最近 3 + 1 Golden）。
+pub const SKILL_MD_FILE: &str = "SKILL.md";
+pub const MAX_SKILL_NAME_CHARS: usize = 64;
+/// Limits apply equally to browser directory imports and native stores. They
+/// bound untrusted package transfer before resource text is ever injected into
+/// an Agent tool result.
+pub const MAX_SKILL_MD_BYTES: usize = 256 * 1024;
+pub const MAX_SKILL_RESOURCE_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_SKILL_PACKAGE_FILES: usize = 256;
+pub const MAX_SKILL_PACKAGE_BYTES: usize = 16 * 1024 * 1024;
 pub const DEFAULT_MAX_RETAINED_VERSIONS: usize = 3;
-/// 自动回滚阈值：当前版本连续失败次数（第六章回滚条件）。
 pub const AUTO_ROLLBACK_CONSECUTIVE_FAILURES: u32 = 5;
 
-/// Skill 生命周期状态（第六章 Skill Lifecycle）。
+/// Serializes package creation across all store handles in this runtime. The
+/// directory and KV index are a compound commit; without this gate two views
+/// can both observe a missing name and overwrite one another.
+///
+/// Scope note (deliberate non-goal): this gate is process-local on native
+/// builds. Sharing one skills directory across *multiple OS processes* is not
+/// synchronized — currently `SkillStore` is only instantiated in the wasm web
+/// app (where `with_cross_tab_mutation_lock` additionally takes an origin-wide
+/// browser lease) and in-process tests. A desktop/server multi-process
+/// deployment must add an OS-level file lock before sharing a directory.
+static SKILL_MUTATION_GATE: OnceLock<Arc<futures::lock::Mutex<()>>> = OnceLock::new();
+
+fn skill_mutation_gate() -> Arc<futures::lock::Mutex<()>> {
+    Arc::clone(SKILL_MUTATION_GATE.get_or_init(|| Arc::new(futures::lock::Mutex::new(()))))
+}
+
+/// Browser tabs do not share Rust's process-local gate. Every package mutation
+/// therefore also takes this origin-wide lease on Web, including imports and
+/// clear/delete operations initiated directly from the management UI.
+#[cfg(target_arch = "wasm32")]
+mod browser_mutation_lock {
+    use futures::channel::oneshot;
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen_futures::JsFuture;
+
+    use crate::error::SkillsError;
+
+    #[wasm_bindgen(
+        inline_js = "export function requestAinsSkillMutationLock(callback){if(!navigator.locks)throw new Error('Web Locks unavailable');return navigator.locks.request('ains-skill-mutation-v1',callback)}"
+    )]
+    extern "C" {
+        // The JS export in the inline_js snippet is `requestAinsSkillMutationLock`
+        // (camelCase). wasm-bindgen uses the Rust identifier verbatim as the JS
+        // import binding — with no case conversion — so we must pin js_name to
+        // the camelCase export. Otherwise wasm-bindgen emits
+        // `import { request_ains_skill_mutation_lock }`, which does not exist in
+        // the snippet, esbuild fails, and dx falls back to a copy that omits the
+        // snippets dir → runtime 404 / white screen.
+        #[wasm_bindgen(catch, js_name = "requestAinsSkillMutationLock")]
+        fn request_ains_skill_mutation_lock(
+            callback: &js_sys::Function,
+        ) -> Result<js_sys::Promise, JsValue>;
+    }
+
+    pub async fn with_lock<T>(
+        operation: impl std::future::Future<Output = Result<T, SkillsError>>,
+    ) -> Result<T, SkillsError> {
+        use wasm_bindgen::{JsCast, closure::Closure};
+        use wasm_bindgen_futures::future_to_promise;
+
+        let (acquired_tx, acquired_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let callback = Closure::once_into_js(move |_lock: JsValue| -> js_sys::Promise {
+            let _ = acquired_tx.send(());
+            future_to_promise(async move {
+                let _ = release_rx.await;
+                Ok(JsValue::UNDEFINED)
+            })
+        })
+        .dyn_into::<js_sys::Function>()
+        .map_err(|_| SkillsError::Storage("skill mutation lock callback unavailable".into()))?;
+        let request = request_ains_skill_mutation_lock(&callback)
+            .map_err(|error| SkillsError::Storage(format!("skill mutation lock: {error:?}")))?;
+        acquired_rx
+            .await
+            .map_err(|_| SkillsError::Storage("skill mutation lock acquisition failed".into()))?;
+        let result = operation.await;
+        let _ = release_tx.send(());
+        if JsFuture::from(request).await.is_err() && result.is_ok() {
+            return Err(SkillsError::Storage(
+                "skill mutation lock release failed".into(),
+            ));
+        }
+        result
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillStatus {
-    /// 活跃可用。
     Active,
-    /// 已弃用（被新版本或回滚取代）。
     Deprecated,
-    /// 已过期。
     Expired,
-    /// 被撤销。
     Revoked,
 }
-
-/// Skill 版本评分（第六章回滚/清理依据）。
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct SkillScore {
     pub successes: u32,
     pub failures: u32,
-    /// 连续失败次数（成功则归零），驱动自动回滚。
     pub consecutive_failures: u32,
 }
-
 impl SkillScore {
-    /// 成功率（无样本时为 0）。
     pub fn success_rate(&self) -> f32 {
-        let total = self.successes + self.failures;
-        if total == 0 {
-            0.0
+        let n = self.successes + self.failures;
+        if n == 0 {
+            0.
         } else {
-            self.successes as f32 / total as f32
+            self.successes as f32 / n as f32
         }
     }
-
-    /// 记录一次执行结果。
     pub fn record(&mut self, ok: bool) {
         if ok {
             self.successes += 1;
-            self.consecutive_failures = 0;
+            self.consecutive_failures = 0
         } else {
             self.failures += 1;
-            self.consecutive_failures += 1;
+            self.consecutive_failures += 1
         }
     }
 }
-
-/// 版本号 `v{major}.{minor}`（排序用：先比 major 再比 minor）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SkillVersion {
     pub major: u32,
     pub minor: u32,
 }
-
 impl SkillVersion {
     pub const INITIAL: Self = Self { major: 1, minor: 0 };
-
     pub fn parse(s: &str) -> Option<Self> {
-        let body = s.strip_prefix('v')?;
-        let (major, minor) = body.split_once('.')?;
+        let (a, b) = s.strip_prefix('v')?.split_once('.')?;
         Some(Self {
-            major: major.parse().ok()?,
-            minor: minor.parse().ok()?,
+            major: a.parse().ok()?,
+            minor: b.parse().ok()?,
         })
     }
-
-    pub fn label(&self) -> String {
+    pub fn label(self) -> String {
         format!("v{}.{}", self.major, self.minor)
     }
-
-    /// 小版本递增（流程微调）。
-    pub fn next_minor(&self) -> Self {
-        Self {
+    /// Next minor version, or `None` when `minor == u32::MAX` (overflow guard).
+    pub fn next_minor(self) -> Option<Self> {
+        Some(Self {
             major: self.major,
-            minor: self.minor + 1,
-        }
+            minor: self.minor.checked_add(1)?,
+        })
     }
-
-    /// 大版本递增（流程重构/回滚）。
-    pub fn next_major(&self) -> Self {
-        Self {
-            major: self.major + 1,
+    /// Next major version, or `None` when `major == u32::MAX` (overflow guard).
+    pub fn next_major(self) -> Option<Self> {
+        Some(Self {
+            major: self.major.checked_add(1)?,
             minor: 0,
-        }
+        })
     }
 }
-
-/// 单个版本记录（内容 + 状态 + 评分）。
+/// KV version metadata deliberately excludes the workflow body; the body is
+/// in `.ains-runtime/versions/<name>/<version>.md` in the same package FS.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VersionRecord {
-    pub content: String,
     pub checksum: String,
     pub status: SkillStatus,
     pub score: SkillScore,
     pub created_at: i64,
 }
-
-/// 技能头：活跃版本指针 + 技能级元数据。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillHead {
-    /// 当前活跃版本号（如 `v2.0`）。
     pub active: String,
     pub meta: SkillMeta,
 }
-
-/// Skill 信任级别（第六章 6.1；只有 Agent/系统来源，无用户导入）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillTrust {
-    /// 系统内置 Skill，无限制执行。
     System,
-    /// 经验证的信任 Skill，自动执行。
     Trusted,
-    /// Agent 生成的 Skill，默认隔离。
     Generated,
-    /// 临时 Skill，单次任务有效。
     Temporary,
 }
-
-/// Skill 元数据（第六章 6.1 定义 + `description` 冗余字段：
-/// 列表渲染免于逐条解析 SKILL.md 全文）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SkillMeta {
     pub description: String,
     pub category: String,
     pub requires_tools: Vec<String>,
-    /// 适用平台；空表示全平台。
     pub platforms: Vec<Platform>,
     pub trust_level: SkillTrust,
-    /// 创建者标识（"agent" | "system"）。
     pub creator: String,
-    /// Unix 毫秒。
     pub created_at: i64,
-    /// 权限声明列表。
     pub permissions: Vec<String>,
-    /// SKILL.md 原文的 sha256（hex），list 时校验完整性。
     pub checksum: String,
 }
-
-/// 面板列表条目：元数据可用性与损坏标记（损坏条目标记而非静默跳过，
-/// 面板仅允许删除）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct SkillEntry {
     pub name: String,
-    /// 元数据缺失/反序列化失败/checksum 不匹配时为 `None`。
+    pub description: Option<String>,
     pub meta: Option<SkillMeta>,
     pub corrupted: bool,
 }
-
-/// 计算 SKILL.md 原文的 sha256 hex。
-pub fn skill_checksum(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    let digest = hasher.finalize();
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillIndex {
+    pub name: String,
+    pub description: String,
+    /// Optional AINS runtime platform gate. An empty list means every
+    /// platform. It is derived from the portable `metadata.ains.platforms`
+    /// frontmatter extension, so discovery does not need to reread every
+    /// SKILL.md body on each prompt turn.
+    #[serde(default)]
+    pub platforms: Vec<Platform>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillPackage {
+    pub name: String,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+impl SkillPackage {
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn write_to_directory(
+        &self,
+        root: &std::path::Path,
+    ) -> Result<std::path::PathBuf, SkillsError> {
+        validate_agent_skill_package(self)?;
+        let d = root.join(&self.name);
+        match std::fs::symlink_metadata(&d) {
+            Ok(_) => {
+                return Err(SkillsError::InvalidFormat(format!(
+                    "export destination already contains {}",
+                    d.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io(error)),
+        }
+        // Build in a sibling staging directory and publish with one rename.
+        // A full package export can fail after writing a few files (for
+        // example disk-full); writing directly to `d` would then leave a
+        // destination that the next export correctly refuses to overwrite.
+        static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let staging = (0..8)
+            .find_map(|_| {
+                let candidate = root.join(format!(
+                    ".{}.ains-export-{}-{}",
+                    self.name,
+                    std::process::id(),
+                    EXPORT_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&candidate) {
+                    Ok(()) => Some(Ok(candidate)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                    Err(error) => Some(Err(io(error))),
+                }
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                SkillsError::Storage("create unique skill export staging directory".into())
+            })?;
+        let write_result = (|| {
+            for (p, b) in &self.files {
+                let f = staging.join(p);
+                std::fs::create_dir_all(f.parent().expect("validated resource has a parent"))
+                    .map_err(io)?;
+                std::fs::write(f, b).map_err(io)?;
+            }
+            publish_staged_directory_without_replacing(&staging, &d)
+        })();
+        if let Err(error) = write_result {
+            // Only the private staging path is removed; never delete `d`,
+            // which may have been created concurrently by another exporter.
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+        Ok(d)
     }
-    out
 }
 
-/// 拆分 SKILL.md 为（YAML frontmatter 原文，body）。无 frontmatter 时
-/// frontmatter 为空串、body 为全文。
+/// Publish a completed directory without ever replacing a destination that
+/// appeared after the initial absence check.  `std::fs::rename` replaces an
+/// existing empty directory on Unix, so it cannot implement the export API's
+/// no-overwrite promise by itself.
+#[cfg(not(target_arch = "wasm32"))]
+fn publish_staged_directory_without_replacing(
+    staging: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), SkillsError> {
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
+    ))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+
+        renameat_with(CWD, staging, CWD, destination, RenameFlags::NOREPLACE).map_err(|error| {
+            if error == Errno::EXIST {
+                SkillsError::InvalidFormat(format!(
+                    "export destination already contains {}",
+                    destination.display()
+                ))
+            } else {
+                SkillsError::Storage(format!(
+                    "publish skill export without replacing destination: {error}"
+                ))
+            }
+        })
+    }
+
+    // Windows `std::fs::rename` fails when the destination exists, unlike its
+    // Unix counterpart.  On unsupported Unix targets, fail closed rather than
+    // silently falling back to a replace-capable rename.
+    #[cfg(target_os = "windows")]
+    {
+        return std::fs::rename(staging, destination).map_err(io);
+    }
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "android",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "visionos",
+            target_os = "watchos",
+            target_os = "redox",
+        ))
+    ))]
+    {
+        let _ = (staging, destination);
+        Err(SkillsError::Storage(
+            "atomic no-replace directory export is unsupported on this platform".into(),
+        ))
+    }
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Frontmatter {
+    name: String,
+    description: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    compatibility: Option<String>,
+    #[serde(default)]
+    metadata: Option<BTreeMap<String, String>>,
+    #[serde(default, rename = "allowed-tools")]
+    allowed_tools: Option<String>,
+}
+
+/// AINS-owned metadata namespace for a portable, machine-readable platform
+/// gate. Agent Skills `compatibility` remains free-form prose and must not be
+/// guessed at runtime. Values are a comma- or whitespace-separated subset of
+/// `web`, `desktop`, and `mobile`; omitting the key means all platforms.
+const AINS_PLATFORM_METADATA_KEY: &str = "ains.platforms";
+
+#[cfg(not(target_arch = "wasm32"))]
+fn io(e: std::io::Error) -> SkillsError {
+    SkillsError::Storage(e.to_string())
+}
+fn serr(e: MemoryError) -> SkillsError {
+    SkillsError::Storage(e.to_string())
+}
+pub fn skill_checksum(content: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(content.as_bytes());
+    format!("{:x}", h.finalize())
+}
 pub fn split_frontmatter(raw: &str) -> (String, String) {
     let Some(rest) = raw
         .strip_prefix("---\n")
         .or_else(|| raw.strip_prefix("---\r\n"))
     else {
-        return (String::new(), raw.to_string());
+        return (String::new(), raw.into());
     };
-    // 关闭栏必须独占一行（"\n---\n" / "\n---" 结尾）
-    for (idx, _) in rest.match_indices("---") {
-        let line_start = idx == 0 || rest.as_bytes().get(idx.wrapping_sub(1)) == Some(&b'\n');
-        if !line_start {
+    for (i, _) in rest.match_indices("---") {
+        let after = &rest[i + 3..];
+        if (i == 0 || rest.as_bytes().get(i - 1) == Some(&b'\n'))
+            && (after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n"))
+        {
+            return (
+                rest[..i].trim_end().into(),
+                after.trim_start_matches(['\r', '\n']).into(),
+            );
+        }
+    }
+    (String::new(), raw.into())
+}
+fn normalize(name: &str) -> String {
+    name.nfkc().collect()
+}
+fn valid_name(name: &str) -> bool {
+    let n = normalize(name);
+    // Persisted package names are directory names and KV key components. Do
+    // not merely validate their NFKC form: accepting a compatibility spelling
+    // would allow it to coexist with its normalized equivalent as a second
+    // package that users and frontmatter comparisons cannot distinguish.
+    name == n
+        && !n.is_empty()
+        && n.chars().count() <= 64
+        && n == n.to_lowercase()
+        && !n.starts_with('-')
+        && !n.ends_with('-')
+        && !n.contains("--")
+        && n.chars().all(|c| c.is_alphanumeric() || c == '-')
+}
+fn require_valid_name(name: &str) -> Result<(), SkillsError> {
+    if valid_name(name) {
+        Ok(())
+    } else {
+        Err(SkillsError::InvalidFormat("invalid skill name".into()))
+    }
+}
+fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && path != SKILL_MD_FILE
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path
+            .split('/')
+            .any(|x| x.is_empty() || x == "." || x == "..")
+        && !path.chars().any(char::is_control)
+}
+fn frontmatter_string<'a>(
+    mapping: &'a serde_yaml::Mapping,
+    field: &str,
+    required: bool,
+) -> Result<Option<&'a str>, SkillsError> {
+    let key = serde_yaml::Value::String(field.into());
+    match mapping.get(&key) {
+        Some(serde_yaml::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(SkillsError::InvalidFormat(format!(
+            "frontmatter {field} must be a string"
+        ))),
+        None if required => Err(SkillsError::InvalidFormat(format!(
+            "frontmatter {field} is required"
+        ))),
+        None => Ok(None),
+    }
+}
+/// Enforce the Agent Skills frontmatter value types before deserializing it.
+/// In particular, serde otherwise treats an explicit YAML `null` for an
+/// optional field as if that field had been omitted.
+fn validate_frontmatter_shape(document: &serde_yaml::Value) -> Result<(), SkillsError> {
+    let mapping = document
+        .as_mapping()
+        .ok_or_else(|| SkillsError::InvalidFormat("frontmatter must be a mapping".into()))?;
+    for field in ["name", "description"] {
+        frontmatter_string(mapping, field, true)?;
+    }
+    for field in ["license", "compatibility", "allowed-tools"] {
+        frontmatter_string(mapping, field, false)?;
+    }
+    if let Some(value) = mapping.get(serde_yaml::Value::String("metadata".into())) {
+        let metadata = value.as_mapping().ok_or_else(|| {
+            SkillsError::InvalidFormat("frontmatter metadata must be a string map".into())
+        })?;
+        for (key, value) in metadata {
+            if !matches!(key, serde_yaml::Value::String(_))
+                || !matches!(value, serde_yaml::Value::String(_))
+            {
+                return Err(SkillsError::InvalidFormat(
+                    "frontmatter metadata must be a string map".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+/// 供 `SkillCreateTool` 在消耗一次性授权之前做与 `create_skill` 同源的完整
+/// 输入预检（name 格式、frontmatter 一致性、体积上限）。与 `validate_content`
+/// 的区别是这里不暴露内部 `Frontmatter` 解析产物。
+pub(crate) fn validate_skill_create_input(name: &str, raw: &str) -> Result<(), SkillsError> {
+    validate_content(name, raw).map(|_| ())
+}
+
+fn validate_content(name: &str, raw: &str) -> Result<Frontmatter, SkillsError> {
+    if !valid_name(name) {
+        return Err(SkillsError::InvalidFormat("invalid skill name".into()));
+    }
+    if raw.len() > MAX_SKILL_MD_BYTES {
+        return Err(SkillsError::InvalidFormat(format!(
+            "SKILL.md exceeds {MAX_SKILL_MD_BYTES} bytes"
+        )));
+    }
+    let (fm, _) = split_frontmatter(raw);
+    if fm.is_empty() {
+        return Err(SkillsError::InvalidFormat(
+            "SKILL.md requires YAML frontmatter".into(),
+        ));
+    }
+    let document: serde_yaml::Value = serde_yaml::from_str(&fm)
+        .map_err(|e| SkillsError::InvalidFormat(format!("frontmatter: {e}")))?;
+    validate_frontmatter_shape(&document)?;
+    let fm: Frontmatter = serde_yaml::from_value(document)
+        .map_err(|e| SkillsError::InvalidFormat(format!("frontmatter: {e}")))?;
+    if normalize(&fm.name) != normalize(name) || !valid_name(&fm.name) {
+        return Err(SkillsError::InvalidFormat(
+            "frontmatter name must match directory".into(),
+        ));
+    }
+    if fm.description.trim().is_empty() || fm.description.chars().count() > 1024 {
+        return Err(SkillsError::InvalidFormat(
+            "description must be 1-1024 characters".into(),
+        ));
+    }
+    if fm
+        .compatibility
+        .as_ref()
+        .is_some_and(|x| x.is_empty() || x.chars().count() > 500)
+    {
+        return Err(SkillsError::InvalidFormat(
+            "compatibility must be 1-500 characters".into(),
+        ));
+    }
+    let _ = (&fm.license, &fm.allowed_tools);
+    platforms_from_frontmatter(&fm)?;
+    Ok(fm)
+}
+
+fn platforms_from_frontmatter(frontmatter: &Frontmatter) -> Result<Vec<Platform>, SkillsError> {
+    let Some(value) = frontmatter
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(AINS_PLATFORM_METADATA_KEY))
+    else {
+        return Ok(vec![]);
+    };
+
+    let mut platforms = Vec::new();
+    for name in value.split(|character: char| character == ',' || character.is_ascii_whitespace()) {
+        if name.is_empty() {
             continue;
         }
-        let after = &rest[idx + 3..];
-        if after.is_empty() || after.starts_with('\n') || after.starts_with("\r\n") {
-            let frontmatter = rest[..idx].trim_end().to_string();
-            let body = after.trim_start_matches(['\r', '\n']).to_string();
-            return (frontmatter, body);
+        let platform = match name {
+            "web" => Platform::Web,
+            "desktop" => Platform::Desktop,
+            "mobile" => Platform::Mobile,
+            _ => {
+                return Err(SkillsError::InvalidFormat(format!(
+                    "metadata.{AINS_PLATFORM_METADATA_KEY} contains an unknown platform: {name}"
+                )));
+            }
+        };
+        if !platforms.contains(&platform) {
+            platforms.push(platform);
         }
     }
-    // 未闭合：视为无 frontmatter
-    (String::new(), raw.to_string())
+    if platforms.is_empty() {
+        return Err(SkillsError::InvalidFormat(format!(
+            "metadata.{AINS_PLATFORM_METADATA_KEY} must name at least one platform"
+        )));
+    }
+    Ok(platforms)
 }
 
-/// KvStore 后端的 Skill 存储（Native redb / Web IndexedDB 复用同一实现）。
-pub struct KvSkillStore {
+fn index_from_frontmatter(
+    name: &str,
+    frontmatter: &Frontmatter,
+) -> Result<SkillIndex, SkillsError> {
+    Ok(SkillIndex {
+        name: name.into(),
+        description: frontmatter.description.clone(),
+        platforms: platforms_from_frontmatter(frontmatter)?,
+    })
+}
+
+fn index_matches_context(index: &SkillIndex, context: &SkillContext) -> bool {
+    index.platforms.is_empty() || index.platforms.contains(&context.platform)
+}
+pub fn validate_agent_skill_package(p: &SkillPackage) -> Result<(), SkillsError> {
+    if p.files.len() > MAX_SKILL_PACKAGE_FILES {
+        return Err(SkillsError::InvalidFormat(format!(
+            "skill package exceeds {MAX_SKILL_PACKAGE_FILES} files"
+        )));
+    }
+    let package_bytes = p.files.values().try_fold(0usize, |total, file| {
+        total
+            .checked_add(file.len())
+            .ok_or_else(|| SkillsError::InvalidFormat("skill package is too large".into()))
+    })?;
+    if package_bytes > MAX_SKILL_PACKAGE_BYTES {
+        return Err(SkillsError::InvalidFormat(format!(
+            "skill package exceeds {MAX_SKILL_PACKAGE_BYTES} bytes"
+        )));
+    }
+    let raw = std::str::from_utf8(
+        p.files
+            .get(SKILL_MD_FILE)
+            .ok_or_else(|| SkillsError::InvalidFormat("missing SKILL.md".into()))?,
+    )
+    .map_err(|_| SkillsError::InvalidFormat("SKILL.md must be UTF-8".into()))?;
+    validate_content(&p.name, raw)?;
+    if p.files.keys().any(|x| x != SKILL_MD_FILE && !valid_path(x)) {
+        return Err(SkillsError::InvalidFormat(
+            "invalid package resource path".into(),
+        ));
+    }
+    for path in p.files.keys().filter(|path| path.as_str() != SKILL_MD_FILE) {
+        let mut ancestor = path.as_str();
+        while let Some((parent, _)) = ancestor.rsplit_once('/') {
+            if p.files.contains_key(parent) {
+                return Err(SkillsError::InvalidFormat(format!(
+                    "skill package file conflicts with resource directory: {parent}"
+                )));
+            }
+            ancestor = parent;
+        }
+    }
+    if p.files
+        .iter()
+        .any(|(path, bytes)| path != SKILL_MD_FILE && bytes.len() > MAX_SKILL_RESOURCE_BYTES)
+    {
+        return Err(SkillsError::InvalidFormat(format!(
+            "skill resource exceeds {MAX_SKILL_RESOURCE_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// File-backed standard package store. `kv` is intentionally metadata-only.
+pub struct SkillStore {
     kv: Arc<dyn KvStore>,
-    /// 版本保留窗口（最近 N）：回滚候选与 [`SkillPruner`] 清理共用
-    /// 同一权威值，避免“清理保留但回滚拒用”的窗口不一致。
-    max_retained_versions: usize,
+    files: Arc<dyn SkillFiles>,
+    scope: Option<String>,
+    max_retained: usize,
+    mutation_gate: Arc<futures::lock::Mutex<()>>,
+    /// Compact, process-local discovery metadata. Package directories remain
+    /// authoritative; this cache prevents every prompt turn from rereading
+    /// every SKILL.md body after the initial discovery pass.
+    discovery: Arc<RwLock<BTreeMap<String, (SkillIndex, String)>>>,
 }
 
-impl KvSkillStore {
-    pub fn new(kv: Arc<dyn KvStore>) -> Self {
+struct UpdateRollbackState {
+    content: String,
+    index: Option<SkillIndex>,
+    meta: Option<SkillMeta>,
+    head: Option<SkillHead>,
+    old_version: (String, Option<String>, Option<VersionRecord>),
+    new_version: (String, Option<String>, Option<VersionRecord>),
+}
+
+impl SkillStore {
+    pub fn new(kv: Arc<dyn KvStore>, files: Arc<dyn SkillFiles>) -> Self {
         Self {
             kv,
-            max_retained_versions: DEFAULT_MAX_RETAINED_VERSIONS,
+            files,
+            scope: None,
+            max_retained: 3,
+            mutation_gate: skill_mutation_gate(),
+            discovery: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
-
-    /// 自定义保留窗口（至少 1；回滚与清理共用）。
-    pub fn with_retention(kv: Arc<dyn KvStore>, max_retained_versions: usize) -> Self {
+    pub fn new_scoped(
+        kv: Arc<dyn KvStore>,
+        files: Arc<dyn SkillFiles>,
+        scope: impl Into<String>,
+    ) -> Self {
         Self {
             kv,
-            max_retained_versions: max_retained_versions.max(1),
+            files,
+            scope: Some(scope.into()),
+            max_retained: 3,
+            mutation_gate: skill_mutation_gate(),
+            discovery: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
-
-    fn content_key(name: &str) -> String {
-        format!("{SKILL_KEY_PREFIX}{name}")
-    }
-
-    fn meta_key(name: &str) -> String {
-        format!("{SKILL_META_KEY_PREFIX}{name}")
-    }
-
-    /// 校验 skill 名称：非空、无路径分隔符/控制字符（key 注入防护）。
-    fn validate_name(name: &str) -> Result<(), SkillsError> {
-        let trimmed = name.trim();
-        if trimmed.is_empty() || trimmed != name {
-            return Err(SkillsError::InvalidFormat(
-                "skill name must be non-empty without surrounding whitespace".into(),
-            ));
+    pub fn with_retention(kv: Arc<dyn KvStore>, files: Arc<dyn SkillFiles>, n: usize) -> Self {
+        Self {
+            kv,
+            files,
+            scope: None,
+            max_retained: n.max(1),
+            mutation_gate: skill_mutation_gate(),
+            discovery: Arc::new(RwLock::new(BTreeMap::new())),
         }
-        if name
-            .chars()
-            .any(|c| c.is_control() || matches!(c, '/' | '\\' | ':'))
+    }
+    fn key(&self, p: &str, n: &str) -> String {
+        match &self.scope {
+            Some(s) => format!("owner/{s}/{p}{n}"),
+            None => format!("{p}{n}"),
+        }
+    }
+    async fn with_cross_tab_mutation_lock<T>(
+        &self,
+        operation: impl std::future::Future<Output = Result<T, SkillsError>>,
+    ) -> Result<T, SkillsError> {
+        #[cfg(target_arch = "wasm32")]
         {
-            return Err(SkillsError::InvalidFormat(format!(
-                "skill name contains forbidden characters: {name}"
-            )));
+            browser_mutation_lock::with_lock(operation).await
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            operation.await
+        }
+    }
+    fn index(&self, n: &str) -> String {
+        self.key(SKILL_INDEX_KEY_PREFIX, n)
+    }
+    fn meta(&self, n: &str) -> String {
+        self.key(SKILL_RUNTIME_KEY_PREFIX, n)
+    }
+    fn head(&self, n: &str) -> String {
+        self.key(SKILL_HEAD_KEY_PREFIX, n)
+    }
+    fn ver(&self, n: &str, v: &str) -> String {
+        self.key(SKILL_VER_KEY_PREFIX, &format!("{n}:{v}"))
+    }
+    fn ver_prefix(&self, n: &str) -> String {
+        self.key(SKILL_VER_KEY_PREFIX, &format!("{n}:"))
+    }
+    /// Remove all runtime metadata that is not attached to a protected system
+    /// package.  Package directories are not the sole source for this sweep:
+    /// a crash or external deletion can leave versions/index records behind
+    /// after the package itself has gone away.
+    async fn clear_runtime_metadata_except(&self, protected: &[String]) -> Result<(), SkillsError> {
+        let families = [
+            (self.key(SKILL_INDEX_KEY_PREFIX, ""), false),
+            (self.key(SKILL_RUNTIME_KEY_PREFIX, ""), false),
+            (self.key(SKILL_HEAD_KEY_PREFIX, ""), false),
+            (self.key(SKILL_VER_KEY_PREFIX, ""), true),
+        ];
+        for (prefix, versioned) in families {
+            for key in self.kv.list_prefix(&prefix).await.map_err(serr)? {
+                let Some(suffix) = key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                let name = if versioned {
+                    suffix
+                        .split_once(':')
+                        .map(|(name, _)| name)
+                        .unwrap_or(suffix)
+                } else {
+                    suffix
+                };
+                if protected
+                    .iter()
+                    .any(|protected_name| protected_name == name)
+                {
+                    continue;
+                }
+                self.kv.delete(&key).await.map_err(serr)?;
+            }
         }
         Ok(())
     }
-
-    /// 低层写入：原文 + 元数据双 key。checksum 由本方法计算（调用方给出的
-    /// meta.checksum 被覆盖），供测试注入与 Phase 6.8 `create_skill` 复用。
-    pub async fn put_skill(
-        &self,
-        name: &str,
-        content: &str,
-        mut meta: SkillMeta,
-    ) -> Result<(), SkillsError> {
-        Self::validate_name(name)?;
-        if content.len() > MAX_SKILL_CONTENT_BYTES {
-            return Err(SkillsError::InvalidFormat(format!(
-                "skill content exceeds {MAX_SKILL_CONTENT_BYTES} bytes"
-            )));
-        }
-        meta.checksum = skill_checksum(content);
-        let meta_value = serde_json::to_value(&meta)
-            .map_err(|e| SkillsError::Storage(format!("meta serialization: {e}")))?;
+    async fn put_json<T: Serialize>(&self, k: &str, v: &T) -> Result<(), SkillsError> {
         self.kv
             .set(
-                &Self::content_key(name),
-                &Value::String(content.into()),
+                k,
+                &serde_json::to_value(v).map_err(|e| SkillsError::Storage(e.to_string()))?,
                 None,
             )
             .await
-            .map_err(storage_err)?;
-        self.kv
-            .set(&Self::meta_key(name), &meta_value, None)
-            .await
-            .map_err(storage_err)?;
-        Ok(())
+            .map_err(serr)
     }
-
-    async fn raw_content(&self, name: &str) -> Result<Option<String>, SkillsError> {
-        match self
-            .kv
-            .get(&Self::content_key(name))
-            .await
-            .map_err(storage_err)?
-        {
-            Some(Value::String(text)) => Ok(Some(text)),
-            Some(_) => Err(SkillsError::Storage(format!(
-                "skill content for `{name}` has non-string payload"
-            ))),
+    async fn get_json<T: for<'a> Deserialize<'a>>(
+        &self,
+        k: &str,
+    ) -> Result<Option<T>, SkillsError> {
+        match self.kv.get(k).await.map_err(serr)? {
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(|e| SkillsError::Storage(e.to_string())),
             None => Ok(None),
         }
     }
-
-    // ── 版本化存储（Phase 6.8/6.9） ─────────────────────────────────────
-
-    fn head_key(name: &str) -> String {
-        format!("{SKILL_HEAD_KEY_PREFIX}{name}")
-    }
-
-    fn ver_prefix(name: &str) -> String {
-        format!("{SKILL_VER_KEY_PREFIX}{name}:")
-    }
-
-    fn version_key(name: &str, version: &str) -> String {
-        format!("{SKILL_VER_KEY_PREFIX}{name}:{version}")
-    }
-
-    fn ref_prefix(name: &str) -> String {
-        format!("{SKILL_REF_KEY_PREFIX}{name}:")
-    }
-
-    fn ref_key(name: &str, path: &str) -> String {
-        format!("{SKILL_REF_KEY_PREFIX}{name}:{path}")
-    }
-
-    /// 从 SKILL.md frontmatter 提取元数据（Agent 创建时自描述）。
-    /// 缺失字段用默认值；trust 固定 Generated、creator=agent。
-    fn meta_from_content(content: &str, now: i64) -> SkillMeta {
-        #[derive(Deserialize, Default)]
-        struct Fm {
-            #[serde(default)]
-            description: Option<String>,
-            #[serde(default)]
-            category: Option<String>,
-            #[serde(default)]
-            requires_tools: Option<Vec<String>>,
-            #[serde(default, rename = "allowed-tools", alias = "allowed_tools")]
-            allowed_tools: Option<Vec<String>>,
-            #[serde(default)]
-            platforms: Option<Vec<Platform>>,
-            #[serde(default)]
-            permissions: Option<Vec<String>>,
+    async fn raw(&self, n: &str) -> Result<Option<String>, SkillsError> {
+        require_valid_name(n)?;
+        match self.files.read_file(n, SKILL_MD_FILE).await? {
+            Some(v) => String::from_utf8(v)
+                .map(Some)
+                .map_err(|_| SkillsError::InvalidFormat("SKILL.md must be UTF-8".into())),
+            None => Ok(None),
         }
-        let (fm_raw, _body) = split_frontmatter(content);
-        let fm: Fm = if fm_raw.is_empty() {
-            Fm::default()
-        } else {
-            serde_yaml::from_str(&fm_raw).unwrap_or_default()
+    }
+    async fn write_active(&self, n: &str, c: &str, meta: SkillMeta) -> Result<(), SkillsError> {
+        self.files
+            .write_file(n, SKILL_MD_FILE, c.as_bytes())
+            .await?;
+        let index = SkillIndex {
+            name: n.into(),
+            description: meta.description.clone(),
+            platforms: meta.platforms.clone(),
         };
-        SkillMeta {
-            description: fm.description.unwrap_or_default(),
-            category: fm.category.unwrap_or_else(|| "general".into()),
-            requires_tools: fm.requires_tools.or(fm.allowed_tools).unwrap_or_default(),
-            platforms: fm.platforms.unwrap_or_default(),
-            trust_level: SkillTrust::Generated,
-            creator: "agent".into(),
-            created_at: now,
-            permissions: fm.permissions.unwrap_or_default(),
-            checksum: skill_checksum(content),
-        }
+        self.put_json(&self.index(n), &index).await?;
+        self.cache_index(index).await;
+        self.put_json(&self.meta(n), &meta).await
     }
-
-    async fn read_head(&self, name: &str) -> Result<Option<SkillHead>, SkillsError> {
-        match self
-            .kv
-            .get(&Self::head_key(name))
+    async fn cache_index(&self, index: SkillIndex) {
+        let revision = self
+            .files
+            .file_revision(&index.name, SKILL_MD_FILE)
             .await
-            .map_err(storage_err)?
-        {
-            Some(value) => serde_json::from_value(value)
-                .map(Some)
-                .map_err(|e| SkillsError::Storage(format!("head deser: {e}"))),
-            None => Ok(None),
-        }
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        self.discovery
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .insert(index.name.clone(), (index, revision));
     }
-
-    async fn write_head(&self, name: &str, head: &SkillHead) -> Result<(), SkillsError> {
-        let value = serde_json::to_value(head)
-            .map_err(|e| SkillsError::Storage(format!("head ser: {e}")))?;
-        self.kv
-            .set(&Self::head_key(name), &value, None)
-            .await
-            .map_err(storage_err)
+    fn remove_cached_index(&self, name: &str) {
+        self.discovery
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .remove(name);
     }
-
-    async fn read_version(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<VersionRecord>, SkillsError> {
-        match self
-            .kv
-            .get(&Self::version_key(name, version))
-            .await
-            .map_err(storage_err)?
-        {
-            Some(value) => serde_json::from_value(value)
-                .map(Some)
-                .map_err(|e| SkillsError::Storage(format!("version deser: {e}"))),
-            None => Ok(None),
-        }
+    /// A valid standard package is discoverable directly from its directory.
+    /// The KV index is only a cache/runtime aid, never an authority boundary.
+    async fn registered_index(&self, n: &str) -> Result<SkillIndex, SkillsError> {
+        require_valid_name(n)?;
+        let content = self
+            .raw(n)
+            .await?
+            .ok_or_else(|| SkillsError::NotFound(n.into()))?;
+        let frontmatter = validate_content(n, &content)?;
+        let index = index_from_frontmatter(n, &frontmatter)?;
+        // Best-effort cache refresh. A read-only/imported package must remain
+        // usable even when runtime metadata storage is unavailable.
+        let _ = self.put_json(&self.index(n), &index).await;
+        self.cache_index(index.clone()).await;
+        Ok(index)
     }
-
-    async fn write_version(
-        &self,
-        name: &str,
-        version: &str,
-        record: &VersionRecord,
-    ) -> Result<(), SkillsError> {
-        let value = serde_json::to_value(record)
-            .map_err(|e| SkillsError::Storage(format!("version ser: {e}")))?;
-        self.kv
-            .set(&Self::version_key(name, version), &value, None)
-            .await
-            .map_err(storage_err)
-    }
-
-    /// 列出技能全部版本（按版本号升序；无法解析的版本号跳过）。
-    pub async fn list_versions(
-        &self,
-        name: &str,
-    ) -> Result<Vec<(SkillVersion, VersionRecord)>, SkillsError> {
-        let prefix = Self::ver_prefix(name);
-        let keys = self.kv.list_prefix(&prefix).await.map_err(storage_err)?;
-        let mut out = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(ver_str) = key.strip_prefix(&prefix) else {
-                continue;
+    async fn registered_indexes(&self) -> Result<Vec<SkillIndex>, SkillsError> {
+        let names = self.files.list_packages().await?;
+        let names: Vec<_> = names.into_iter().filter(|name| valid_name(name)).collect();
+        let known = self
+            .discovery
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .clone();
+        let mut indexes = Vec::new();
+        for name in &names {
+            // A manually added malformed or unsafe package must not make the
+            // whole library undiscoverable. `SKILL.md` is untrusted until its
+            // path and frontmatter have both passed validation.
+            let revision = match self.files.file_revision(name, SKILL_MD_FILE).await {
+                Ok(revision) => revision,
+                Err(_) => continue,
             };
-            let Some(ver) = SkillVersion::parse(ver_str) else {
-                continue;
-            };
-            if let Some(rec) = self.read_version(name, ver_str).await? {
-                out.push((ver, rec));
+            if let (Some((index, cached_revision)), Some(revision)) = (known.get(name), revision)
+                && cached_revision == &revision
+            {
+                indexes.push(index.clone());
+            } else if let Ok(index) = self.registered_index(name).await {
+                indexes.push(index);
             }
         }
-        out.sort_by_key(|(ver, _)| *ver);
+        self.discovery
+            .write()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .retain(|name, _| names.iter().any(|current| current == name));
+        indexes.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(indexes)
+    }
+    /// `SKILL.md` remains the authoritative content.  Once a package is
+    /// registered, a successful activation refreshes only its compact KV
+    /// discovery summary; it cannot register a new on-disk directory.
+    async fn refresh_registered_index(
+        &self,
+        n: &str,
+        content: &str,
+    ) -> Result<SkillIndex, SkillsError> {
+        let frontmatter = validate_content(n, content)?;
+        let index = index_from_frontmatter(n, &frontmatter)?;
+        let current = self
+            .discovery
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(n)
+            .map(|(index, _)| index.clone());
+        if current.as_ref() != Some(&index) {
+            self.put_json(&self.index(n), &index).await?;
+        }
+        self.cache_index(index.clone()).await;
+        Ok(index)
+    }
+    async fn summary(&self, n: &str) -> Result<SkillSummary, SkillsError> {
+        let content = self
+            .raw(n)
+            .await?
+            .ok_or_else(|| SkillsError::NotFound(n.into()))?;
+        let i = self.refresh_registered_index(n, &content).await?;
+        Ok(SkillSummary {
+            name: i.name,
+            description: i.description,
+            category: "general".into(),
+            requires_tools: vec![],
+        })
+    }
+    /// Best-effort rollback for a package that was never successfully
+    /// committed.  Creation is a file + KV compound operation; leaving its
+    /// `SKILL.md` behind after a metadata failure makes the incomplete package
+    /// discoverable and prevents the user from retrying the same import.
+    async fn discard_uncommitted_package(&self, n: &str) {
+        let _ = self.files.remove_package(n).await;
+        let _ = self.files.remove_versions(n).await;
+        for key in [self.index(n), self.meta(n), self.head(n)] {
+            let _ = self.kv.delete(&key).await;
+        }
+        let _ = self.kv.delete_prefix(&self.ver_prefix(n)).await;
+        self.remove_cached_index(n);
+    }
+    async fn restore_version_state(
+        &self,
+        n: &str,
+        version: &str,
+        body: Option<String>,
+        record: Option<VersionRecord>,
+    ) {
+        match body {
+            Some(body) => {
+                let _ = self.files.write_version(n, version, &body).await;
+            }
+            None => {
+                let _ = self.files.remove_version(n, version).await;
+            }
+        }
+        match record {
+            Some(record) => {
+                let _ = self.put_json(&self.ver(n, version), &record).await;
+            }
+            None => {
+                let _ = self.kv.delete(&self.ver(n, version)).await;
+            }
+        }
+    }
+
+    /// Restore the source-of-truth workflow and runtime records after an
+    /// existing package update fails part way through. Updating a package is a
+    /// file + several KV writes; without this rollback, a failed head write can
+    /// leave the new `SKILL.md` visible while `active_version` identifies the
+    /// old snapshot.
+    async fn restore_failed_update(&self, n: &str, state: &UpdateRollbackState) {
+        let _ = self
+            .files
+            .write_file(n, SKILL_MD_FILE, state.content.as_bytes())
+            .await;
+        self.restore_version_state(
+            n,
+            &state.old_version.0,
+            state.old_version.1.clone(),
+            state.old_version.2.clone(),
+        )
+        .await;
+        self.restore_version_state(
+            n,
+            &state.new_version.0,
+            state.new_version.1.clone(),
+            state.new_version.2.clone(),
+        )
+        .await;
+
+        match state.index.clone() {
+            Some(index) => {
+                let _ = self.put_json(&self.index(n), &index).await;
+                self.cache_index(index).await;
+            }
+            None => {
+                let _ = self.kv.delete(&self.index(n)).await;
+                self.remove_cached_index(n);
+            }
+        }
+        match state.meta.clone() {
+            Some(meta) => {
+                let _ = self.put_json(&self.meta(n), &meta).await;
+            }
+            None => {
+                let _ = self.kv.delete(&self.meta(n)).await;
+            }
+        }
+        match state.head.clone() {
+            Some(head) => {
+                let _ = self.put_json(&self.head(n), &head).await;
+            }
+            None => {
+                let _ = self.kv.delete(&self.head(n)).await;
+            }
+        }
+    }
+    /// Caller holds `mutation_gate`. Keeping the package body, references and
+    /// metadata in one transaction prevents a concurrent clear/import from
+    /// observing a half-imported directory.
+    async fn create_skill_unlocked(
+        &self,
+        n: &str,
+        c: &str,
+        creator: &str,
+    ) -> Result<SkillSummary, SkillsError> {
+        let fm = validate_content(n, c)?;
+        let platforms = platforms_from_frontmatter(&fm)?;
+        if self.get_json::<SkillIndex>(&self.index(n)).await?.is_some()
+            || self.raw(n).await?.is_some()
+        {
+            return Err(SkillsError::InvalidFormat("skill already exists".into()));
+        }
+        let meta = SkillMeta {
+            description: fm.description,
+            category: "general".into(),
+            requires_tools: vec![],
+            platforms,
+            trust_level: SkillTrust::Trusted,
+            creator: creator.into(),
+            created_at: now_ms(),
+            permissions: vec![],
+            checksum: skill_checksum(c),
+        };
+        let result = async {
+            self.files
+                .write_file(n, SKILL_MD_FILE, c.as_bytes())
+                .await?;
+            self.create_version(n, SkillVersion::INITIAL, c, SkillStatus::Active)
+                .await?;
+            self.put_json(&self.meta(n), &meta).await?;
+            self.put_json(
+                &self.head(n),
+                &SkillHead {
+                    active: SkillVersion::INITIAL.label(),
+                    meta: meta.clone(),
+                },
+            )
+            .await?;
+            self.put_json(
+                &self.index(n),
+                &SkillIndex {
+                    name: n.into(),
+                    description: meta.description.clone(),
+                    platforms: meta.platforms.clone(),
+                },
+            )
+            .await?;
+            self.summary(n).await
+        }
+        .await;
+        if result.is_err() {
+            self.discard_uncommitted_package(n).await;
+        }
+        result
+    }
+    pub async fn export_package(&self, n: &str) -> Result<SkillPackage, SkillsError> {
+        self.registered_index(n).await?;
+        let mut files = BTreeMap::new();
+        for p in self.files.list_files(n).await? {
+            if let Some(b) = self.files.read_file(n, &p).await? {
+                files.insert(p, b);
+            }
+        }
+        let p = SkillPackage {
+            name: n.into(),
+            files,
+        };
+        validate_agent_skill_package(&p)?;
+        Ok(p)
+    }
+    /// Import a portable Agent Skills directory package. A package needs no
+    /// AINS-specific index; only its standard `SKILL.md` is authoritative.
+    /// Caller holds `mutation_gate`.
+    async fn import_package_unlocked(
+        &self,
+        package: SkillPackage,
+    ) -> Result<SkillSummary, SkillsError> {
+        validate_agent_skill_package(&package)?;
+        let name = package.name.clone();
+        if self
+            .get_json::<SkillIndex>(&self.index(&name))
+            .await?
+            .is_some()
+            || self.raw(&name).await?.is_some()
+        {
+            return Err(SkillsError::InvalidFormat("skill already exists".into()));
+        }
+        let content = String::from_utf8(
+            package
+                .files
+                .get(SKILL_MD_FILE)
+                .cloned()
+                .expect("validated package has SKILL.md"),
+        )
+        .map_err(|_| SkillsError::InvalidFormat("SKILL.md must be UTF-8".into()))?;
+        // A prior interrupted import can leave resources without a SKILL.md.
+        // They are not a package yet, so remove them before starting instead
+        // of allowing a retry to inherit files absent from the new package.
+        self.files.remove_package(&name).await?;
+        // Resources are written before the final SKILL.md visibility commit.
+        // A failed transfer therefore leaves, at most, an undiscoverable
+        // directory instead of advertising a partially imported skill.
+        let result = async {
+            for (path, bytes) in package.files {
+                if path != SKILL_MD_FILE {
+                    self.files.write_file(&name, &path, &bytes).await?;
+                }
+            }
+            self.create_skill_unlocked(&name, &content, "imported")
+                .await
+        }
+        .await;
+        if result.is_err() {
+            self.discard_uncommitted_package(&name).await;
+        }
+        result
+    }
+    pub async fn import_package(&self, package: SkillPackage) -> Result<SkillSummary, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            self.import_package_unlocked(package).await
+        })
+        .await
+    }
+
+    /// Register a host-provided built-in package. It remains a normal standard
+    /// directory package, while AINS runtime metadata prevents user clear/delete
+    /// controls from removing it.
+    pub async fn install_system_package(
+        &self,
+        package: SkillPackage,
+    ) -> Result<SkillSummary, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            let summary = self.import_package_unlocked(package).await?;
+            // Import first writes a regular package, then promotes its runtime
+            // metadata to System. Those are separate stores, so a failed
+            // promotion must not leave a successfully imported but deletable
+            // package behind: retries would otherwise reject the duplicate and
+            // the host's built-in could be removed by user clear/delete paths.
+            let promotion = async {
+                let mut meta = self
+                    .get_json::<SkillMeta>(&self.meta(&summary.name))
+                    .await?
+                    .ok_or_else(|| SkillsError::NotFound(summary.name.clone()))?;
+                meta.trust_level = SkillTrust::System;
+                meta.creator = "system".into();
+                self.put_json(&self.meta(&summary.name), &meta).await?;
+                if let Some(mut head) = self
+                    .get_json::<SkillHead>(&self.head(&summary.name))
+                    .await?
+                {
+                    head.meta = meta;
+                    self.put_json(&self.head(&summary.name), &head).await?;
+                }
+                Ok(())
+            }
+            .await;
+            if promotion.is_err() {
+                self.discard_uncommitted_package(&summary.name).await;
+            }
+            promotion.map(|()| summary)
+        })
+        .await
+    }
+    pub async fn load_raw_for_context(
+        &self,
+        n: &str,
+        ctx: &SkillContext,
+    ) -> Result<String, SkillsError> {
+        if !ctx.available_tools.iter().any(|x| x == "skill") {
+            return Err(SkillsError::InvalidFormat("skill unavailable".into()));
+        }
+        let index = self.registered_index(n).await?;
+        if !index_matches_context(&index, ctx) {
+            return Err(SkillsError::InvalidFormat(
+                "skill is unavailable on this platform".into(),
+            ));
+        }
+        self.load_raw(n).await
+    }
+    pub async fn load_raw(&self, n: &str) -> Result<String, SkillsError> {
+        let c = self
+            .raw(n)
+            .await?
+            .ok_or_else(|| SkillsError::NotFound(n.into()))?;
+        self.refresh_registered_index(n, &c).await?;
+        Ok(c)
+    }
+    pub async fn load_file(&self, n: &str, p: &str) -> Result<Vec<u8>, SkillsError> {
+        require_valid_name(n)?;
+        if !valid_path(p) {
+            return Err(SkillsError::InvalidFormat("invalid resource path".into()));
+        }
+        self.load_raw(n).await?;
+        let file = self
+            .files
+            .read_file(n, p)
+            .await?
+            .ok_or_else(|| SkillsError::NotFound(format!("{n}/{p}")))?;
+        if file.len() > MAX_SKILL_RESOURCE_BYTES {
+            return Err(SkillsError::InvalidFormat(format!(
+                "skill resource exceeds {MAX_SKILL_RESOURCE_BYTES} bytes"
+            )));
+        }
+        Ok(file)
+    }
+    pub async fn put_file(&self, n: &str, p: &str, b: &[u8]) -> Result<(), SkillsError> {
+        require_valid_name(n)?;
+        if !valid_path(p) {
+            return Err(SkillsError::InvalidFormat("invalid resource path".into()));
+        }
+        if b.len() > MAX_SKILL_RESOURCE_BYTES {
+            return Err(SkillsError::InvalidFormat(format!(
+                "skill resource exceeds {MAX_SKILL_RESOURCE_BYTES} bytes"
+            )));
+        }
+        self.load_raw(n).await?;
+        self.files.write_file(n, p, b).await
+    }
+    pub async fn put_reference(&self, n: &str, p: &str, c: &str) -> Result<(), SkillsError> {
+        self.put_file(n, p, c.as_bytes()).await
+    }
+    pub async fn list_entries(&self) -> Result<Vec<SkillEntry>, SkillsError> {
+        let mut out = Vec::new();
+        // Iterate the on-disk packages directly so that a package with a valid
+        // name but a corrupted `SKILL.md` (present yet unparseable) is still
+        // surfaced (marked `corrupted`) and thus remains manageable through the
+        // management UI. Invalid-named directories are never surfaced, and a
+        // package whose `SKILL.md` is missing stays hidden (it is still
+        // deletable via `delete_skill`). Both degraded cases are surfaced by
+        // `delete_skill`'s name-only gate.
+        for n in self.files.list_packages().await? {
+            if !valid_name(&n) {
+                continue;
+            }
+            let raw = self.raw(&n).await?;
+            let Some(content) = raw.as_deref() else {
+                continue;
+            };
+            let index = self.refresh_registered_index(&n, content).await.ok();
+            let meta = self
+                .get_json::<SkillMeta>(&self.meta(&n))
+                .await
+                .ok()
+                .flatten();
+            let corrupted = validate_content(&n, content).is_err() || index.is_none();
+            out.push(SkillEntry {
+                name: n,
+                description: index.map(|x| x.description),
+                meta,
+                corrupted,
+            });
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(out)
     }
-
-    /// 保留集：最近 N 个版本（窗口见 `max_retained_versions`）+ 1 个
-    /// Golden（success_rate 最高）。回滚候选与 [`SkillPruner`] 清理共用
-    /// [`retained_versions`]，Golden 恒纳入两侧口径一致。
-    async fn retention_set(&self, name: &str) -> Result<Vec<SkillVersion>, SkillsError> {
-        let versions = self.list_versions(name).await?;
-        Ok(retained_versions(&versions, self.max_retained_versions))
-    }
-
-    /// Agent 可回滚版本列表（仅返回保留范围内的版本号，升序）。
-    pub async fn rollback_candidates(&self, name: &str) -> Result<Vec<String>, SkillsError> {
-        let mut set = self.retention_set(name).await?;
-        set.sort();
-        Ok(set.iter().map(SkillVersion::label).collect())
-    }
-
-    /// 当前活跃版本号（头指针为唯一权威源：promote 容忍的瞬态双
-    /// Active 记录不影响本值）。未版本化的旧数据返回 `None`。
-    pub async fn active_version(&self, name: &str) -> Result<Option<String>, SkillsError> {
-        Self::validate_name(name)?;
-        Ok(self.read_head(name).await?.map(|head| head.active))
-    }
-
-    /// 写活跃版本镜像（skills:/skills_meta:）供面板/Loader 读取。
-    async fn set_active_mirror(
+    pub async fn list_versions(
         &self,
-        name: &str,
-        content: &str,
-        meta: SkillMeta,
-    ) -> Result<(), SkillsError> {
-        self.put_skill(name, content, meta).await
-    }
-
-    /// 内部：将 `content` 写为 `name` 的新活跃版本 `new_ver`，旧活跃版降为
-    /// Deprecated，更新头与镜像。返回新版的 SkillSummary。
-    ///
-    /// 写入顺序按“失败危害最小”排列（KvStore 无多 key 事务）：
-    /// 新版本→镜像→头→旧版降级。任意前缀失败都不会留下
-    /// “无 Active 版本”或“头指向 Deprecated”的状态；最坏情况是
-    /// 短暂存在两个 Active 版本记录（头仍唯一指定生效版）。
-    /// 清理由会话结束后的 [`SkillPruner`] 单独触发。
-    async fn promote_version(
-        &self,
-        name: &str,
-        mut head: SkillHead,
-        new_ver: SkillVersion,
-        content: String,
-        now: i64,
-    ) -> Result<SkillSummary, SkillsError> {
-        let prev_active = head.active.clone();
-        // 1) 新版本记录先落盘（失败则一切未变）
-        let record = VersionRecord {
-            checksum: skill_checksum(&content),
-            content: content.clone(),
-            status: SkillStatus::Active,
-            score: SkillScore::default(),
-            created_at: now,
-        };
-        self.write_version(name, &new_ver.label(), &record).await?;
-        // 2) 镜像（skills:/skills_meta:，面板/Loader 读取面）。信任级与
-        //    创建者沿用头元数据（meta_from_content 固定 Generated/agent，
-        //    不得因 update/rollback 改写 system 来源标识）
-        let mut meta = Self::meta_from_content(&content, head.meta.created_at);
-        meta.trust_level = head.meta.trust_level;
-        meta.creator = head.meta.creator.clone();
-        self.set_active_mirror(name, &content, meta.clone()).await?;
-        // 3) 头指针切换
-        head.active = new_ver.label();
-        head.meta = meta.clone();
-        self.write_head(name, &head).await?;
-        // 4) 旧活跃版降级（最后；失败仅留双 Active 记录，头仍正确）
-        if prev_active != head.active
-            && let Some(mut prev) = self.read_version(name, &prev_active).await?
+        n: &str,
+    ) -> Result<Vec<(SkillVersion, VersionRecord)>, SkillsError> {
+        self.registered_index(n).await?;
+        let mut out = vec![];
+        for k in self
+            .kv
+            .list_prefix(&self.ver_prefix(n))
+            .await
+            .map_err(serr)?
         {
-            prev.status = SkillStatus::Deprecated;
-            self.write_version(name, &prev_active, &prev).await?;
+            let Some(v) = k
+                .strip_prefix(&self.ver_prefix(n))
+                .and_then(SkillVersion::parse)
+            else {
+                continue;
+            };
+            if let Some(r) = self.get_json(&k).await? {
+                out.push((v, r));
+            }
         }
-        Ok(SkillSummary {
-            name: name.to_string(),
-            description: meta.description,
-            category: meta.category,
-            requires_tools: meta.requires_tools,
-        })
+        out.sort_by_key(|x| x.0);
+        Ok(out)
+    }
+    pub async fn active_version(&self, n: &str) -> Result<Option<String>, SkillsError> {
+        self.registered_index(n).await?;
+        Ok(self
+            .get_json::<SkillHead>(&self.head(n))
+            .await?
+            .map(|x| x.active))
+    }
+    pub async fn rollback_candidates(&self, n: &str) -> Result<Vec<String>, SkillsError> {
+        Ok(self
+            .list_versions(n)
+            .await?
+            .into_iter()
+            .rev()
+            .take(self.max_retained)
+            .map(|x| x.0.label())
+            .collect())
+    }
+    async fn create_version(
+        &self,
+        n: &str,
+        v: SkillVersion,
+        c: &str,
+        status: SkillStatus,
+    ) -> Result<(), SkillsError> {
+        require_valid_name(n)?;
+        self.files.write_version(n, &v.label(), c).await?;
+        self.put_json(
+            &self.ver(n, &v.label()),
+            &VersionRecord {
+                checksum: skill_checksum(c),
+                status,
+                score: SkillScore::default(),
+                created_at: now_ms(),
+            },
+        )
+        .await
     }
 
-    /// 解析头指针的活跃版本号；损坏（不可解析）时回退到现存最高
-    /// 版本号，保证后续新版本号严格高于全部现存记录（若回退
-    /// INITIAL 会覆写既有 v1.1 等版本，静默丢失版本链）；无任何
-    /// 版本记录时回退 INITIAL。
-    async fn active_or_max_version(
-        &self,
-        name: &str,
-        head_active: &str,
-    ) -> Result<SkillVersion, SkillsError> {
-        if let Some(ver) = SkillVersion::parse(head_active) {
-            return Ok(ver);
+    /// Write a new version with the cross-tab mutation lock and the in-process
+    /// mutation gate already held. `update_skill` and `rollback_skill` share
+    /// this so a rollback's version read and write form one atomic mutation.
+    async fn update_skill_locked(&self, n: &str, c: &str) -> Result<SkillSummary, SkillsError> {
+        {
+            self.registered_index(n).await?;
+            let old_content = self
+                .raw(n)
+                .await?
+                .ok_or_else(|| SkillsError::NotFound(n.into()))?;
+            let old_index = self.get_json::<SkillIndex>(&self.index(n)).await?;
+            let old_meta = self.get_json::<SkillMeta>(&self.meta(n)).await?;
+            let mut head = self
+                .get_json::<SkillHead>(&self.head(n))
+                .await?
+                .ok_or_else(|| SkillsError::NotFound(n.into()))?;
+            let old_head = head.clone();
+            let fm = validate_content(n, c)?;
+            let platforms = platforms_from_frontmatter(&fm)?;
+            // 防御内部状态损坏：head.active 无法解析时不再静默回退到初始
+            // 版本（会把损坏状态"修复"成 v1.1 覆盖可能存在的更高版本），
+            // 而是显式报错，让上层感知并处理（review P4）。
+            let old = SkillVersion::parse(&head.active).ok_or_else(|| {
+                SkillsError::InvalidFormat(format!(
+                    "skill {n} active version {:?} is not parseable",
+                    head.active
+                ))
+            })?;
+            // 版本号溢出（u32::MAX）理论上不可达，但绝不 panic 或回绕：显式报错。
+            let next = old.next_minor().ok_or_else(|| {
+                SkillsError::InvalidFormat(format!("skill {n} version overflow at {}", old.label()))
+            })?;
+            let old_label = old.label();
+            let next_label = next.label();
+            let old_version_body = self.files.read_version(n, &old_label).await?;
+            let old_version_record = self
+                .get_json::<VersionRecord>(&self.ver(n, &old_label))
+                .await?;
+            let next_version_body = self.files.read_version(n, &next_label).await?;
+            let next_version_record = self
+                .get_json::<VersionRecord>(&self.ver(n, &next_label))
+                .await?;
+            let rollback_state = UpdateRollbackState {
+                content: old_content,
+                index: old_index,
+                meta: old_meta,
+                head: Some(old_head),
+                old_version: (old_label.clone(), old_version_body, old_version_record),
+                new_version: (next_label.clone(), next_version_body, next_version_record),
+            };
+
+            let result = async {
+                self.create_version(n, next, c, SkillStatus::Active).await?;
+                if let Some(mut record) = self
+                    .get_json::<VersionRecord>(&self.ver(n, &old_label))
+                    .await?
+                {
+                    record.status = SkillStatus::Deprecated;
+                    self.put_json(&self.ver(n, &old_label), &record).await?
+                }
+                head.active = next_label.clone();
+                head.meta.description = fm.description;
+                head.meta.platforms = platforms;
+                head.meta.checksum = skill_checksum(c);
+                self.write_active(n, c, head.meta.clone()).await?;
+                self.put_json(&self.head(n), &head).await?;
+                self.summary(n).await
+            }
+            .await;
+            if result.is_err() {
+                self.restore_failed_update(n, &rollback_state).await;
+            }
+            result
+        }
+    }
+}
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+#[cfg_attr(target_arch="wasm32",async_trait::async_trait(?Send))]
+impl SkillLoader for SkillStore {
+    async fn list(&self, ctx: &SkillContext) -> Result<Vec<SkillSummary>, SkillsError> {
+        if !ctx.available_tools.iter().any(|x| x == "skill") {
+            return Ok(vec![]);
         }
         Ok(self
-            .list_versions(name)
+            .registered_indexes()
             .await?
-            .last()
-            .map(|(ver, _)| *ver)
-            .unwrap_or(SkillVersion::INITIAL))
-    }
-
-    /// 记录一次技能执行结果；若当前版本连续失败达阈值且保留范围内存在
-    /// success_rate 更高的版本，则自动回滚到该版本。返回是否发生自动回滚。
-    ///
-    /// 并发语义：评分更新为读-改-写（KvStore 无跨 key 事务），并发调用
-    /// 可能丢失计数。当前仅由测试调用（运行时接线随 Phase 7+ 技能执行
-    /// 回路，见对齐清单）；接线时需按技能名串行化调用（单飞行队列或
-    /// per-name 锁），避免丢计数与重复触发自动回滚。
-    pub async fn record_outcome(&self, name: &str, ok: bool) -> Result<bool, SkillsError> {
-        Self::validate_name(name)?;
-        let Some(head) = self.read_head(name).await? else {
-            return Err(SkillsError::NotFound(name.to_string()));
-        };
-        let Some(mut active) = self.read_version(name, &head.active).await? else {
-            return Err(SkillsError::NotFound(format!("{name}:{}", head.active)));
-        };
-        active.score.record(ok);
-        self.write_version(name, &head.active, &active).await?;
-        if ok || active.score.consecutive_failures < AUTO_ROLLBACK_CONSECUTIVE_FAILURES {
-            return Ok(false);
-        }
-        // 自动回滚：保留范围内成功率严格高于当前的最佳版本
-        let active_rate = active.score.success_rate();
-        let retention = self.retention_set(name).await?;
-        let versions = self.list_versions(name).await?;
-        let active_ver = SkillVersion::parse(&head.active);
-        let mut best: Option<(SkillVersion, f32)> = None;
-        for (ver, rec) in &versions {
-            if Some(*ver) == active_ver || !retention.contains(ver) {
-                continue;
-            }
-            let rate = rec.score.success_rate();
-            if rate > active_rate && best.map(|(_, r)| rate > r).unwrap_or(true) {
-                best = Some((*ver, rate));
-            }
-        }
-        if let Some((target, _)) = best {
-            let target_rec = versions.iter().find(|(v, _)| *v == target);
-            // 防抖动：候选内容与当前活跃版字节相同时回滚无意义
-            //（新版评分归零后再度连续失败会无限重升同一内容），跳过。
-            if target_rec
-                .map(|(_, r)| r.checksum == active.checksum)
-                .unwrap_or(true)
-            {
-                return Ok(false);
-            }
-            let content = target_rec
-                .map(|(_, r)| r.content.clone())
-                .unwrap_or_default();
-            let new_ver = active_ver.unwrap_or(SkillVersion::INITIAL).next_major();
-            self.promote_version(name, head, new_ver, content, now_ms())
-                .await?;
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    /// 面板列表：全部条目（含损坏标记）。损坏判定：meta 缺失/反序列化失败、
-    /// 原文缺失、checksum 不匹配。
-    pub async fn list_entries(&self) -> Result<Vec<SkillEntry>, SkillsError> {
-        let keys = self
-            .kv
-            .list_prefix(SKILL_KEY_PREFIX)
-            .await
-            .map_err(storage_err)?;
-        let mut entries = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(name) = key.strip_prefix(SKILL_KEY_PREFIX) else {
-                continue;
-            };
-            entries.push(self.entry_for(name).await?);
-        }
-        // 只有 meta 的孤儿条目（原文丢失）也要暴露为损坏，供面板删除
-        let meta_keys = self
-            .kv
-            .list_prefix(SKILL_META_KEY_PREFIX)
-            .await
-            .map_err(storage_err)?;
-        for key in meta_keys {
-            let Some(name) = key.strip_prefix(SKILL_META_KEY_PREFIX) else {
-                continue;
-            };
-            if entries.iter().any(|e| e.name == name) {
-                continue;
-            }
-            entries.push(SkillEntry {
-                name: name.to_string(),
-                meta: None,
-                corrupted: true,
-            });
-        }
-        // 头孤儿（create 部分写入中断：有 head/版本但无镜像）同样暴露，
-        // 避免残留条目对面板不可见且无法删除
-        let head_keys = self
-            .kv
-            .list_prefix(SKILL_HEAD_KEY_PREFIX)
-            .await
-            .map_err(storage_err)?;
-        for key in head_keys {
-            let Some(name) = key.strip_prefix(SKILL_HEAD_KEY_PREFIX) else {
-                continue;
-            };
-            if entries.iter().any(|e| e.name == name) {
-                continue;
-            }
-            entries.push(SkillEntry {
-                name: name.to_string(),
-                meta: None,
-                corrupted: true,
-            });
-        }
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(entries)
-    }
-
-    async fn entry_for(&self, name: &str) -> Result<SkillEntry, SkillsError> {
-        // 存储错误上报（? 传播），仅内容缺失/非字符串才视为损坏，
-        // 避免瞬时读错误把健康 skill 误标为可删除的损坏条目。
-        let raw = match self.raw_content(name).await {
-            Ok(raw) => raw,
-            // 非字符串载荷（内容本身损坏）归为损坏；其余存储错误上报
-            Err(SkillsError::Storage(msg)) if msg.contains("non-string payload") => None,
-            Err(err) => return Err(err),
-        };
-        let meta = match self
-            .kv
-            .get(&Self::meta_key(name))
-            .await
-            .map_err(storage_err)?
-        {
-            Some(value) => serde_json::from_value::<SkillMeta>(value).ok(),
-            None => None,
-        };
-        let corrupted = match (&raw, &meta) {
-            (Some(content), Some(meta)) => skill_checksum(content) != meta.checksum,
-            _ => true,
-        };
-        Ok(SkillEntry {
-            name: name.to_string(),
-            meta,
-            corrupted,
-        })
-    }
-}
-
-fn storage_err(err: MemoryError) -> SkillsError {
-    SkillsError::Storage(err.to_string())
-}
-
-fn gate_matches(meta: &SkillMeta, ctx: &SkillContext) -> bool {
-    let platform_ok = meta.platforms.is_empty() || meta.platforms.contains(&ctx.platform);
-    let tools_ok = meta
-        .requires_tools
-        .iter()
-        .all(|tool| ctx.available_tools.iter().any(|t| t == tool));
-    platform_ok && tools_ok
-}
-
-#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-impl SkillLoader for KvSkillStore {
-    /// Level 0：门控过滤后的摘要列表；损坏条目不进入模型可见面
-    /// （面板经 [`KvSkillStore::list_entries`] 仍可见并删除）。
-    async fn list(&self, ctx: &SkillContext) -> Result<Vec<SkillSummary>, SkillsError> {
-        let entries = self.list_entries().await?;
-        Ok(entries
             .into_iter()
-            .filter(|entry| !entry.corrupted)
-            .filter_map(|entry| {
-                let meta = entry.meta?;
-                gate_matches(&meta, ctx).then_some(SkillSummary {
-                    name: entry.name,
-                    description: meta.description,
-                    category: meta.category,
-                    requires_tools: meta.requires_tools,
-                })
+            .filter(|index| index_matches_context(index, ctx))
+            .map(|i| SkillSummary {
+                name: i.name,
+                description: i.description,
+                category: "general".into(),
+                requires_tools: vec![],
             })
             .collect())
     }
-
-    /// Level 1：完整 SKILL.md（frontmatter 解析失败按 InvalidFormat 上报）。
-    /// 完整性门控：无 meta 或 checksum 不匹配的条目不可注入模型上下文
-    /// （与 list 同口径，防止经名称旁路加载已篡改内容）。
-    async fn load(&self, name: &str) -> Result<SkillContent, SkillsError> {
-        Self::validate_name(name)?;
-        let raw = self
-            .raw_content(name)
-            .await?
-            .ok_or_else(|| SkillsError::NotFound(name.to_string()))?;
-        let meta = match self
-            .kv
-            .get(&Self::meta_key(name))
-            .await
-            .map_err(storage_err)?
-        {
-            Some(value) => serde_json::from_value::<SkillMeta>(value).ok(),
-            None => None,
-        };
-        match meta {
-            Some(meta) if skill_checksum(&raw) == meta.checksum => {}
-            _ => {
-                return Err(SkillsError::InvalidFormat(format!(
-                    "skill `{name}` failed integrity verification"
-                )));
-            }
-        }
-        let (frontmatter_raw, body) = split_frontmatter(&raw);
-        let frontmatter = if frontmatter_raw.is_empty() {
-            serde_yaml::Value::Null
-        } else {
-            serde_yaml::from_str(&frontmatter_raw)
-                .map_err(|e| SkillsError::InvalidFormat(format!("frontmatter: {e}")))?
-        };
-        Ok(SkillContent { frontmatter, body })
-    }
-
-    /// Level 2：加载技能引用文件（references/ 、templates/ 等）。
-    /// 存于 `skills_ref:{name}:{path}`；Agent 可经 `put_reference` 写入。
-    /// 完整性门控与 `load` 同口径：checksum 缺失/不匹配的引用不可
-    /// 注入模型上下文（防止经引用路径旁路注入已篡改内容）。
-    async fn load_reference(&self, name: &str, path: &str) -> Result<String, SkillsError> {
-        Self::validate_name(name)?;
-        let Some(value) = self
-            .kv
-            .get(&Self::ref_key(name, path))
-            .await
-            .map_err(storage_err)?
-        else {
-            return Err(SkillsError::NotFound(format!("{name}/{path}")));
-        };
-        let verified = value.as_object().and_then(|obj| {
-            let content = obj.get("content")?.as_str()?;
-            let checksum = obj.get("checksum")?.as_str()?;
-            (skill_checksum(content) == checksum).then(|| content.to_string())
-        });
-        verified.ok_or_else(|| {
-            SkillsError::InvalidFormat(format!(
-                "skill reference `{name}/{path}` failed integrity verification"
-            ))
+    async fn load(&self, n: &str) -> Result<SkillContent, SkillsError> {
+        let raw = self.load_raw(n).await?;
+        let (f, b) = split_frontmatter(&raw);
+        Ok(SkillContent {
+            frontmatter: serde_yaml::from_str(&f)
+                .map_err(|e| SkillsError::InvalidFormat(e.to_string()))?,
+            body: b,
         })
     }
+    async fn load_reference(&self, n: &str, p: &str) -> Result<String, SkillsError> {
+        String::from_utf8(self.load_file(n, p).await?)
+            .map_err(|_| SkillsError::InvalidFormat("resource is not UTF-8".into()))
+    }
 }
-
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
-impl SkillManage for KvSkillStore {
-    /// Agent 自主创建：初始版本 v1.0（Active）。已存在则报错（改用 update）。
-    async fn create_skill(&self, name: &str, content: &str) -> Result<SkillSummary, SkillsError> {
-        Self::validate_name(name)?;
-        if content.len() > MAX_SKILL_CONTENT_BYTES {
-            return Err(SkillsError::InvalidFormat(format!(
-                "skill content exceeds {MAX_SKILL_CONTENT_BYTES} bytes"
-            )));
-        }
-        if self.read_head(name).await?.is_some() {
-            return Err(SkillsError::InvalidFormat(format!(
-                "skill `{name}` already exists; use update_skill"
-            )));
-        }
-        let now = now_ms();
-        let meta = Self::meta_from_content(content, now);
-        let ver = SkillVersion::INITIAL;
-        let record = VersionRecord {
-            checksum: skill_checksum(content),
-            content: content.to_string(),
-            status: SkillStatus::Active,
-            score: SkillScore::default(),
-            created_at: now,
-        };
-        self.write_version(name, &ver.label(), &record).await?;
-        // 镜像先于头：中途失败时条目对面板可见可删；头孤儿另由
-        // list_entries 兜底暴露
-        self.set_active_mirror(name, content, meta.clone()).await?;
-        self.write_head(
-            name,
-            &SkillHead {
-                active: ver.label(),
-                meta: meta.clone(),
-            },
-        )
-        .await?;
-        Ok(SkillSummary {
-            name: name.to_string(),
-            description: meta.description,
-            category: meta.category,
-            requires_tools: meta.requires_tools,
+#[cfg_attr(target_arch="wasm32",async_trait::async_trait(?Send))]
+impl SkillManage for SkillStore {
+    async fn create_skill(&self, n: &str, c: &str) -> Result<SkillSummary, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            self.create_skill_unlocked(n, c, "user").await
         })
+        .await
     }
-
-    /// 更新：小版本递增（流程微调），新版 Active、旧活跃版降为 Deprecated。
-    async fn update_skill(&self, name: &str, content: &str) -> Result<SkillSummary, SkillsError> {
-        Self::validate_name(name)?;
-        if content.len() > MAX_SKILL_CONTENT_BYTES {
-            return Err(SkillsError::InvalidFormat(format!(
-                "skill content exceeds {MAX_SKILL_CONTENT_BYTES} bytes"
-            )));
-        }
-        let Some(head) = self.read_head(name).await? else {
-            return Err(SkillsError::NotFound(name.to_string()));
-        };
-        let active_ver = self.active_or_max_version(name, &head.active).await?;
-        let new_ver = active_ver.next_minor();
-        self.promote_version(name, head, new_ver, content.to_string(), now_ms())
-            .await
+    async fn update_skill(&self, n: &str, c: &str) -> Result<SkillSummary, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            self.update_skill_locked(n, c).await
+        })
+        .await
     }
-
-    /// 回滚：目标版本内容提升为新大版本（版本链只增不删）。
-    /// 目标必须在保留范围内（最近 3 + Golden）。
-    async fn rollback_skill(
-        &self,
-        name: &str,
-        target_version: &str,
-    ) -> Result<SkillSummary, SkillsError> {
-        Self::validate_name(name)?;
-        let Some(head) = self.read_head(name).await? else {
-            return Err(SkillsError::NotFound(name.to_string()));
-        };
-        let Some(target) = SkillVersion::parse(target_version) else {
-            return Err(SkillsError::InvalidFormat(format!(
-                "invalid version: {target_version}"
-            )));
-        };
-        if !self.retention_set(name).await?.contains(&target) {
-            return Err(SkillsError::InvalidFormat(format!(
-                "rollback target {target_version} is outside the retained range"
-            )));
-        }
-        let content = self
-            .read_version(name, target_version)
-            .await?
-            .ok_or_else(|| SkillsError::NotFound(format!("{name}:{target_version}")))?
-            .content;
-        let active_ver = self.active_or_max_version(name, &head.active).await?;
-        let new_ver = active_ver.next_major();
-        self.promote_version(name, head, new_ver, content, now_ms())
-            .await
-    }
-
-    /// 删除：清除全部版本/引用/头 + 活跃版镜像；均不存在报 NotFound。
+    /// Rolls back to a historical version.
     ///
-    /// 前缀删除先于 NotFound 判定无条件执行（幂等）：create 中断可能只
-    /// 残留 `skills_ver:` 记录，否则既不可见也无法回收（存储泄漏）。
-    async fn delete_skill(&self, name: &str) -> Result<(), SkillsError> {
-        Self::validate_name(name)?;
-        let content_key = Self::content_key(name);
-        let meta_key = Self::meta_key(name);
-        let head_key = Self::head_key(name);
-        let had_any = self
-            .kv
-            .get(&content_key)
-            .await
-            .map_err(storage_err)?
-            .is_some()
-            || self.kv.get(&meta_key).await.map_err(storage_err)?.is_some()
-            || self.kv.get(&head_key).await.map_err(storage_err)?.is_some();
-        let removed_orphans = self
-            .kv
-            .delete_prefix(&Self::ver_prefix(name))
-            .await
-            .map_err(storage_err)?
-            + self
-                .kv
-                .delete_prefix(&Self::ref_prefix(name))
+    /// Audit semantics: a rollback does **not** rewind `head.active` to the
+    /// target label; instead it writes a regular new minor version whose body
+    /// equals the target's (like `git revert`, not `git reset`). Every mutation
+    /// therefore stays append-only and observable via `list_versions`; the
+    /// version list is bounded by `max_retained` + `SkillPruner`. Callers
+    /// picking targets from `rollback_candidates` are unaffected because a
+    /// rolled-back snapshot and its source share identical content.
+    async fn rollback_skill(&self, n: &str, target: &str) -> Result<SkillSummary, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            self.registered_index(n).await?;
+            if SkillVersion::parse(target).is_none() {
+                return Err(SkillsError::InvalidFormat("invalid skill version".into()));
+            }
+            let c = self
+                .files
+                .read_version(n, target)
+                .await?
+                .ok_or_else(|| SkillsError::NotFound(format!("{n}:{target}")))?;
+            self.update_skill_locked(n, &c).await
+        })
+        .await
+    }
+    async fn delete_skill(&self, n: &str) -> Result<(), SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            // A corrupt `SKILL.md` must still be deletable: gate on the name
+            // alone (unsafe names are rejected) rather than requiring a valid
+            // frontmatter.
+            require_valid_name(n)?;
+            if self
+                .get_json::<SkillMeta>(&self.meta(n))
+                .await?
+                .is_some_and(|meta| meta.trust_level == SkillTrust::System)
+            {
+                return Err(SkillsError::InvalidFormat(
+                    "system skills cannot be deleted".into(),
+                ));
+            }
+            self.files.remove_package(n).await?;
+            self.files.remove_versions(n).await?;
+            let keys = [self.index(n), self.meta(n), self.head(n)];
+            for k in keys {
+                self.kv.delete(&k).await.map_err(serr)?
+            }
+            self.kv
+                .delete_prefix(&self.ver_prefix(n))
                 .await
-                .map_err(storage_err)?;
-        if !had_any && removed_orphans == 0 {
-            return Err(SkillsError::NotFound(name.to_string()));
-        }
-        self.kv.delete(&content_key).await.map_err(storage_err)?;
-        self.kv.delete(&meta_key).await.map_err(storage_err)?;
-        self.kv.delete(&head_key).await.map_err(storage_err)?;
-        Ok(())
+                .map_err(serr)?;
+            self.remove_cached_index(n);
+            Ok(())
+        })
+        .await
+    }
+    async fn clear_all_skills(&self) -> Result<u64, SkillsError> {
+        self.with_cross_tab_mutation_lock(async {
+            let _gate = self.mutation_gate.lock().await;
+            let packages = self.files.list_packages().await?;
+            let mut protected = Vec::new();
+            for name in &packages {
+                if self
+                    .get_json::<SkillMeta>(&self.meta(name))
+                    .await?
+                    .is_some_and(|meta| meta.trust_level == SkillTrust::System)
+                {
+                    protected.push(name.clone());
+                }
+            }
+            let mut removed = 0;
+            for name in packages {
+                if protected.contains(&name) {
+                    continue;
+                }
+                if self.files.remove_package(&name).await? {
+                    removed += 1;
+                }
+                self.remove_cached_index(&name);
+            }
+            self.files.clear_versions_except(&protected).await?;
+            self.clear_runtime_metadata_except(&protected).await?;
+            self.discovery
+                .write()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .retain(|name, _| protected.contains(name));
+            Ok(removed)
+        })
+        .await
     }
 }
-
-impl KvSkillStore {
-    /// 写入 Level 2 引用文件（references/ 、templates/ 等）。
-    /// 与 SKILL.md 同样携带 checksum（content + sha256 同 key 落盘），
-    /// `load_reference` 读时验证。
-    pub async fn put_reference(
-        &self,
-        name: &str,
-        path: &str,
-        content: &str,
-    ) -> Result<(), SkillsError> {
-        Self::validate_name(name)?;
-        if path.trim().is_empty() || path.contains(':') {
-            return Err(SkillsError::InvalidFormat(format!(
-                "invalid reference path: {path}"
-            )));
-        }
-        if content.len() > MAX_SKILL_CONTENT_BYTES {
-            return Err(SkillsError::InvalidFormat("reference too large".into()));
-        }
-        let payload = serde_json::json!({
-            "content": content,
-            "checksum": skill_checksum(content),
-        });
-        self.kv
-            .set(&Self::ref_key(name, path), &payload, None)
-            .await
-            .map_err(storage_err)
-    }
-}
-
-/// 从版本列表计算保留集（回滚候选与清理共用的单一权威逻辑）：
-/// 最近 `max_retained` 个版本 + 1 个 Golden（success_rate 最高，并列
-/// 取版本号更高者）。活跃版恒为最高版本号 → 必在最近 N 内，
-/// 无需单独兵底。
-fn retained_versions(
-    versions: &[(SkillVersion, VersionRecord)],
-    max_retained: usize,
-) -> Vec<SkillVersion> {
-    let mut retained: Vec<SkillVersion> = versions
-        .iter()
-        .rev()
-        .take(max_retained)
-        .map(|(v, _)| *v)
-        .collect();
-    if let Some((golden, _)) = versions.iter().max_by(|a, b| {
-        a.1.score
-            .success_rate()
-            .partial_cmp(&b.1.score.success_rate())
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.0.cmp(&b.0))
-    }) && !retained.contains(golden)
-    {
-        retained.push(*golden);
-    }
-    retained
-}
-
-/// Skill 清理器（会话结束后触发）：保留最近 N 版本 + Golden，其余按
-/// success_rate 升序淘汰（第六章清理策略）。保留集与回滚候选完全
-/// 共用 [`retained_versions`]（窗口 N 以目标 [`KvSkillStore`] 配置为准），
-/// 因此不会出现“清理保留的版本回滚却拒用”。
-#[derive(Default)]
 pub struct SkillPruner;
-
 impl SkillPruner {
-    /// 对指定 Skill 执行清理：保留最近 N 版本 + Golden，其余按评分升序
-    /// 逐个删除（活跃版恒在保留集内，不会被删）。返回本次删除的版本数。
-    pub async fn prune(&self, store: &KvSkillStore, name: &str) -> Result<usize, SkillsError> {
-        let versions = store.list_versions(name).await?;
-        if versions.len() <= store.max_retained_versions {
-            return Ok(0);
-        }
-        // 与回滚候选同口径的保留集（最近 N + Golden）
-        let retained = retained_versions(&versions, store.max_retained_versions);
-        // 淘汰集按 success_rate 升序
-        let mut evict: Vec<&(SkillVersion, VersionRecord)> = versions
-            .iter()
-            .filter(|(v, _)| !retained.contains(v))
-            .collect();
-        evict.sort_by(|a, b| {
-            a.1.score
-                .success_rate()
-                .partial_cmp(&b.1.score.success_rate())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        let mut removed = 0;
-        for (ver, _) in evict {
-            store
-                .kv
-                .delete(&KvSkillStore::version_key(name, &ver.label()))
-                .await
-                .map_err(storage_err)?;
-            removed += 1;
-        }
-        Ok(removed)
+    pub async fn prune(&self, store: &SkillStore, name: &str) -> Result<usize, SkillsError> {
+        // 版本裁剪与 rollback/update/delete 同为包级变更，必须持有
+        // 跨 tab 锁 + 进程内门闩，否则并发更新可能裁剪掉正在提升的版本。
+        store
+            .with_cross_tab_mutation_lock(async {
+                let _gate = store.mutation_gate.lock().await;
+                let versions = store.list_versions(name).await?;
+                let keep = store.max_retained;
+                let mut n = 0;
+                for (v, _) in versions.into_iter().rev().skip(keep) {
+                    store.files.remove_version(name, &v.label()).await?;
+                    store
+                        .kv
+                        .delete(&store.ver(name, &v.label()))
+                        .await
+                        .map_err(serr)?;
+                    n += 1;
+                }
+                Ok(n)
+            })
+            .await
+    }
+}
+
+#[cfg(all(
+    test,
+    not(target_arch = "wasm32"),
+    any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "tvos",
+        target_os = "visionos",
+        target_os = "watchos",
+        target_os = "redox",
+    )
+))]
+mod export_publish_tests {
+    use super::publish_staged_directory_without_replacing;
+
+    #[test]
+    fn publish_refuses_a_destination_created_after_staging() {
+        let root = tempfile::tempdir().expect("temporary export root");
+        let staging = root.path().join(".skill.ains-export-staging");
+        let destination = root.path().join("skill");
+        std::fs::create_dir(&staging).expect("create staging directory");
+        std::fs::write(staging.join("SKILL.md"), "staged package").expect("write staging file");
+
+        // This models a second exporter creating the final name after the
+        // first exporter completed staging but before it tried to publish.
+        std::fs::create_dir(&destination).expect("concurrent destination");
+        assert!(publish_staged_directory_without_replacing(&staging, &destination).is_err());
+        assert!(
+            destination.is_dir(),
+            "the concurrent destination must survive"
+        );
+        assert!(
+            staging.is_dir(),
+            "a failed publish must leave staging for caller cleanup"
+        );
     }
 }

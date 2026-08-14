@@ -27,10 +27,5 @@ app/*/dist/
 
 # Node (if used by frontend tooling)
 node_modules/
-OpenHarness/
+Harness/
 AINS_PLAN.md
-AINS_CLIENT_PLAN.md
-AINS_SERVER_PLAN.md
-# Phase 6 dev-serve transient artifacts
-dx_serve.log
-.devtmp/

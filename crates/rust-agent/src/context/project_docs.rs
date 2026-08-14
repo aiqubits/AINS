@@ -1,4 +1,4 @@
-//! 项目指令文件段（Phase 5.3，对齐 OpenHarness `prompts/claudemd.py`；
+//! 项目指令文件段（Phase 5.3，对齐 Harness `prompts/claudemd.py`；
 //! AINS 使用 `AGENTS.md` 而非 `CLAUDE.md`）。
 //!
 //! 从 cwd 逐级向上发现指令文件，拼接为单个 `# Project Instructions` 段，

@@ -208,7 +208,8 @@ impl EmbeddingContract {
 /// MemoryService 配置（§8 / §18）。
 #[derive(Debug, Clone)]
 pub struct MemoryServiceConfig {
-    pub enabled: bool,
+    /// Automatic extraction is enabled by default. The user-facing setting is
+    /// persisted per owner and is checked immediately before every extraction.
     pub auto_extract: bool,
     /// 单次抽取最多保存的记录数（默认 3）。
     pub auto_extract_max_records: usize,
@@ -229,7 +230,6 @@ pub struct MemoryServiceConfig {
 impl Default for MemoryServiceConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             auto_extract: true,
             auto_extract_max_records: MAX_EXTRACT_RECORDS,
             top_k_inject: 5,
@@ -270,7 +270,6 @@ impl MemoryServiceConfig {
 
     /// 从环境变量装配（§18 配置契约的本地落地；native 可用 env 覆盖默认值，
     /// web 无进程环境返回默认值）。变量名与设计配置项一一对应：
-    /// `AINS_MEMORY_ENABLED` / `AINS_MEMORY_AUTO_EXTRACT` /
     /// `AINS_MEMORY_MAX_RECORDS` / `AINS_MEMORY_TOP_K_INJECT` /
     /// `AINS_MEMORY_OVERFETCH_FACTOR` / `AINS_MEMORY_MIN_SCORE` /
     /// `AINS_MEMORY_RETRY_BACKOFF_MS` / `AINS_EMBEDDING_PROFILE` /
@@ -279,8 +278,7 @@ impl MemoryServiceConfig {
     pub fn from_env() -> Self {
         let defaults = Self::default();
         Self {
-            enabled: env_flag("AINS_MEMORY_ENABLED", defaults.enabled),
-            auto_extract: env_flag("AINS_MEMORY_AUTO_EXTRACT", defaults.auto_extract),
+            auto_extract: env_bool("AINS_MEMORY_AUTO_EXTRACT", defaults.auto_extract),
             auto_extract_max_records: env_parse(
                 "AINS_MEMORY_MAX_RECORDS",
                 defaults.auto_extract_max_records,
@@ -296,7 +294,7 @@ impl MemoryServiceConfig {
                 defaults.extract_retry_backoff_ms,
             ),
             embedding_profile: env_string("AINS_EMBEDDING_PROFILE", defaults.embedding_profile),
-            index_project_docs: env_flag(
+            index_project_docs: env_bool(
                 "AINS_MEMORY_INDEX_PROJECT_DOCS",
                 defaults.index_project_docs,
             ),
@@ -311,11 +309,10 @@ impl MemoryServiceConfig {
     }
 }
 
-/// 读取布尔环境变量（`1`/`true`/`yes`/`on` 为真）；未设置或空串用默认值，
-/// 未知非空值 warn 回退默认（与 `env_parse` 行为对称，避免拼写错误静默
-/// 禁用整个 memory 子系统）。
+/// 读取非核心功能的布尔环境变量。长期记忆与自动提取不走此路径：二者是
+/// 系统内建能力，不能由外部配置关闭。
 #[cfg(not(target_arch = "wasm32"))]
-fn env_flag(name: &str, default: bool) -> bool {
+fn env_bool(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) => match v.to_ascii_lowercase().as_str() {
             "1" | "true" | "yes" | "on" => true,
@@ -374,6 +371,9 @@ pub struct ExtractionState {
 /// 召回结果（只暴露模型可见字段；不暴露 project_key/team_id/dedupe key）。
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
+    /// Durable memory id. Management controls must pass this back through a
+    /// scope-checked deletion API; an id alone is never authorization.
+    pub id: String,
     pub title: String,
     pub content: String,
     pub memory_type: MemoryType,
@@ -463,6 +463,7 @@ pub struct MemoryService {
     /// 跨 session 串行化 P3 source-hash 去重与 membership 更新。
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     document_index_gate: Arc<futures::lock::Mutex<()>>,
+    durable_mutation_gate: Arc<futures::lock::Mutex<()>>,
 
     last_error: RwLock<Option<String>>,
 }
@@ -495,6 +496,7 @@ impl MemoryService {
             revision: Arc::clone(&stores.revision),
             embedding_contract_gate: Arc::clone(&stores.embedding_contract_gate),
             document_index_gate: Arc::clone(&stores.document_index_gate),
+            durable_mutation_gate: Arc::clone(&stores.durable_mutation_gate),
             last_error: RwLock::new(None),
         };
         // P3：与 MemoryService 共享 engine 的文档存储（懒初始化）。
@@ -937,6 +939,104 @@ impl MemoryService {
         Ok(outcome)
     }
 
+    /// 清空当前上下文可见的全部 durable memories（Private / 当前 Project /
+    /// 当前 Team）。用于记忆库的“清空全部”；先按可见性筛选再进入 engine
+    /// 删除，绝不凭 id 或前缀越过 owner/project/team 边界。
+    ///
+    /// 返回成功删除的数量。若底层删除失败则立即返回错误，调用方必须将其
+    /// 视为可能的部分完成而不是报告为完整成功。
+    pub async fn clear_visible_memories(&self) -> Result<usize, MemoryError> {
+        let ctx = self.ctx().clone();
+        let namespace = MemoryNamespace::Personal;
+        let prefix = namespace.storage_prefix();
+        let ids = collect_clearable_ids_where(
+            self.memories.as_ref(),
+            &prefix,
+            &ctx,
+            is_visible,
+            "skipping corrupt memory row during clear",
+        )
+        .await?;
+        self.forget_collected(namespace, ids).await
+    }
+
+    /// 清空记忆库中当前账户可管理的全部 durable memories。Private / Project
+    /// 记录按 owner 跨项目清理；Team 记录仍只限当前 team。该选择与记忆库
+    /// 的账户分区 memdir 一致，同时不会触及其他团队的共享记录。
+    pub async fn clear_library_memories(&self) -> Result<usize, MemoryError> {
+        let ctx = self.ctx().clone();
+        let namespace = MemoryNamespace::Personal;
+        let prefix = namespace.storage_prefix();
+        let ids = collect_clearable_ids_where(
+            self.memories.as_ref(),
+            &prefix,
+            &ctx,
+            is_library_visible,
+            "skipping corrupt memory row during library clear",
+        )
+        .await?;
+        self.forget_collected(namespace, ids).await
+    }
+
+    /// 批量删除已收集的 durable memory id。先筛选后持锁删除：与
+    /// [`Self::clear_visible_memories`] / [`Self::clear_library_memories`]
+    /// 共用删除循环，避免两处重复。
+    async fn forget_collected(
+        &self,
+        namespace: MemoryNamespace,
+        ids: Vec<String>,
+    ) -> Result<usize, MemoryError> {
+        let mut engine = self.engine.lock().await;
+        let mut removed = 0;
+        for id in ids {
+            engine.forget(namespace, &id).await?;
+            removed += 1;
+        }
+        if removed > 0 {
+            self.revision.fetch_add(1, Ordering::AcqRel);
+        }
+        Ok(removed)
+    }
+
+    /// 删除一条当前上下文可见的 durable memory。每次均重新校验 metadata，
+    /// 所以从页面拿到的 id 不能跨 owner / project / team 越权使用。
+    pub async fn delete_visible_memory(&self, id: &str) -> Result<bool, MemoryError> {
+        self.delete_memory_if(id, is_visible).await
+    }
+
+    /// 删除一条记忆库中当前账户可管理的 durable memory。Private / Project
+    /// 记录按 owner 跨项目校验，Team 记录仍只限当前 team；与账户级 manifest
+    /// 和“清空全部”使用同一授权范围。
+    pub async fn delete_library_memory(&self, id: &str) -> Result<bool, MemoryError> {
+        self.delete_memory_if(id, is_library_visible).await
+    }
+
+    async fn delete_memory_if(
+        &self,
+        id: &str,
+        visible: fn(&DurableMemoryMetadata, &MemoryContext) -> bool,
+    ) -> Result<bool, MemoryError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        let namespace = MemoryNamespace::Personal;
+        let Some(raw) = self.memories.get(&namespace.storage_key(id)).await? else {
+            return Ok(false);
+        };
+        let entry: MemoryEntry = serde_json::from_value(raw)
+            .map_err(|error| MemoryError::Serialization(error.to_string()))?;
+        let metadata: DurableMemoryMetadata = serde_json::from_value(entry.metadata)
+            .map_err(|error| MemoryError::Serialization(error.to_string()))?;
+        if !visible(&metadata, &self.ctx()) {
+            return Ok(false);
+        }
+        let mut engine = self.engine.lock().await;
+        engine.forget(namespace, id).await?;
+        self.revision.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+
     // ── 写入方 1：Final Turn / Compaction Durable Extraction（§9 / §11）──
 
     /// 后台 durable extraction。gate 串行化整个抽取（含 LLM await）；
@@ -977,12 +1077,6 @@ impl MemoryService {
             return Ok(skipped_for_cleared_session());
         }
         let _ = reason;
-        if !self.config.auto_extract {
-            return Ok(ExtractionOutcome {
-                saved: Vec::new(),
-                skipped: Some("auto_extract disabled".to_string()),
-            });
-        }
         if messages.len() < 2 {
             return Ok(ExtractionOutcome {
                 saved: Vec::new(),
@@ -1004,6 +1098,15 @@ impl MemoryService {
             || self.session_was_cleared().await?
         {
             return Ok(skipped_for_cleared_session());
+        }
+        // Check after acquiring the per-session gate. A toggle that completes
+        // while a prior extraction is queued must prevent that queued work
+        // from starting a new LLM request.
+        if !self.auto_extract_enabled().await? {
+            return Ok(ExtractionOutcome {
+                saved: Vec::new(),
+                skipped: Some("automatic extraction disabled".to_string()),
+            });
         }
         let mut state = self.load_extraction_state().await?;
         if state.last_success_digest.as_deref() == Some(&digest) {
@@ -1156,6 +1259,35 @@ impl MemoryService {
         result
     }
 
+    /// Process-wide (per [`MemoryStores`]) gate for operations that mutate
+    /// durable memories across session boundaries. Hosts use it around a full
+    /// extraction or management deletion; exposing the handle avoids holding a
+    /// lock across callers that only need ordinary scoped reads.
+    pub fn durable_mutation_gate(&self) -> Arc<futures::lock::Mutex<()>> {
+        Arc::clone(&self.durable_mutation_gate)
+    }
+
+    /// The memory-library switch is deliberately durable and owner-scoped, so
+    /// an already-running session observes a change before its next extraction.
+    pub async fn auto_extract_enabled(&self) -> Result<bool, MemoryError> {
+        let key = format!("memory_auto_extract:{}", self.ctx().owner_key);
+        Ok(self
+            .kv
+            .get(&key)
+            .await?
+            .and_then(|value| value.as_bool())
+            .unwrap_or(self.config.auto_extract))
+    }
+
+    pub async fn set_auto_extract_enabled(&self, enabled: bool) -> Result<(), MemoryError> {
+        let key = format!("memory_auto_extract:{}", self.ctx().owner_key);
+        // Management views construct short-lived services. Reuse the shared
+        // durable mutation gate so concurrent preference writes from two live
+        // views cannot interleave with a durable extraction boundary.
+        let _gate = self.durable_mutation_gate.lock().await;
+        self.kv.set(&key, &Value::Bool(enabled), None).await
+    }
+
     async fn write_memory_inner(&self, record: NewMemoryEntry) -> Result<String, MemoryError> {
         if self.session_was_cleared().await? {
             return Err(MemoryError::Storage(
@@ -1273,7 +1405,7 @@ impl MemoryService {
     }
 
     async fn search_inner(&self, query: &str, top_k: usize) -> Result<Vec<MemoryHit>, MemoryError> {
-        if !self.config.enabled || top_k == 0 {
+        if top_k == 0 {
             return Ok(Vec::new());
         }
         let vector = self
@@ -1317,6 +1449,7 @@ impl MemoryService {
                     continue;
                 }
                 visible.push(MemoryHit {
+                    id: entry.id,
                     title: meta.title,
                     content: entry.content,
                     memory_type: meta.memory_type,
@@ -1818,10 +1951,27 @@ fn memory_record_is_safe(record: &NewMemoryEntry) -> bool {
 /// MemoryService 实例的场景复用）。`list_prefix("personal/")` → decode →
 /// visibility → TTL → 按有效新鲜度 DESC → take ≤ 80。损坏行/非生产 schema
 /// 跳过不毒化清单。
-pub async fn build_durable_manifest(
+pub async fn build_durable_manifest_items(
     memories: &dyn KvStore,
     context: &MemoryContext,
-) -> Result<Vec<String>, MemoryError> {
+) -> Result<Vec<DurableMemoryManifestItem>, MemoryError> {
+    build_durable_manifest_items_where(memories, context, is_visible).await
+}
+
+/// 构建记忆管理页的账户级清单。Private / Project 条目按 owner 跨项目展示，
+/// Team 条目仍只展示当前 team；这与“清空全部记忆”的清理范围保持一致。
+pub async fn build_durable_library_manifest_items(
+    memories: &dyn KvStore,
+    context: &MemoryContext,
+) -> Result<Vec<DurableMemoryManifestItem>, MemoryError> {
+    build_durable_manifest_items_where(memories, context, is_library_visible).await
+}
+
+async fn build_durable_manifest_items_where(
+    memories: &dyn KvStore,
+    context: &MemoryContext,
+    visible: fn(&DurableMemoryMetadata, &MemoryContext) -> bool,
+) -> Result<Vec<DurableMemoryManifestItem>, MemoryError> {
     let now = now_ms();
     let mut items = Vec::new();
     for key in memories.list_prefix("personal/").await? {
@@ -1854,7 +2004,7 @@ pub async fn build_durable_manifest(
             // 非生产 schema（legacy / 文档 chunk）不进入 manifest
             continue;
         };
-        if !is_visible(&meta, context) {
+        if !visible(&meta, context) {
             continue;
         }
         if meta
@@ -1866,18 +2016,92 @@ pub async fn build_durable_manifest(
         let recency = effective_recency_ms(&entry.metadata, entry.created_at);
         items.push((
             recency,
-            format!(
-                "[{}] {} ({}) - {}",
-                meta.memory_type.as_str(),
-                meta.title,
-                format_age(recency, now),
-                meta.description
-            ),
+            DurableMemoryManifestItem {
+                id: entry.id,
+                title: meta.title,
+                description: meta.description,
+                memory_type: meta.memory_type,
+                age: format_age(recency, now),
+            },
         ));
     }
     items.sort_by_key(|(recency, _)| std::cmp::Reverse(*recency));
     items.truncate(MANIFEST_MAX_ITEMS);
-    Ok(items.into_iter().map(|(_, line)| line).collect())
+    Ok(items.into_iter().map(|(_, item)| item).collect())
+}
+
+/// 收集命名空间前缀下所有满足可见性谓词的 durable memory id（清空用）。
+/// 与 manifest 遍历同口径：损坏 / 不可解密 / 非生产 schema 行跳过不毒化
+/// 清理——坏行无法建立可见性，fail-closed 跳过，绝不让它阻断健康行的删除。
+async fn collect_clearable_ids_where(
+    memories: &dyn KvStore,
+    prefix: &str,
+    context: &MemoryContext,
+    visible: fn(&DurableMemoryMetadata, &MemoryContext) -> bool,
+    skip_log: &str,
+) -> Result<Vec<String>, MemoryError> {
+    let mut ids = Vec::new();
+    for key in memories.list_prefix(prefix).await? {
+        let Some(id) = key.strip_prefix(prefix) else {
+            continue;
+        };
+        let raw = match memories.get(&key).await {
+            Ok(Some(raw)) => raw,
+            Ok(None) => continue,
+            Err(MemoryError::Serialization(error)) => {
+                tracing::warn!(key, error = %error, "{skip_log}");
+                continue;
+            }
+            Err(MemoryError::Encryption(error)) => {
+                tracing::warn!(key, error = %error, "skipping undecryptable memory row during clear");
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let Ok(entry) = serde_json::from_value::<MemoryEntry>(raw) else {
+            continue;
+        };
+        let Ok(metadata) = serde_json::from_value::<DurableMemoryMetadata>(entry.metadata) else {
+            continue;
+        };
+        if visible(&metadata, context) {
+            ids.push(id.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+/// A visible durable-memory row for management UIs.  Unlike the textual
+/// manifest used in extraction prompts, it retains the canonical id so a UI
+/// can delete the exact record without requiring an embedding search first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DurableMemoryManifestItem {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub memory_type: MemoryType,
+    pub age: String,
+}
+
+/// Text manifest consumed by the extraction prompt.  Keep this compatibility
+/// wrapper so prompt callers do not need management-only identifiers.
+pub async fn build_durable_manifest(
+    memories: &dyn KvStore,
+    context: &MemoryContext,
+) -> Result<Vec<String>, MemoryError> {
+    Ok(build_durable_manifest_items(memories, context)
+        .await?
+        .into_iter()
+        .map(|item| {
+            format!(
+                "[{}] {} ({}) - {}",
+                item.memory_type.as_str(),
+                item.title,
+                item.age,
+                item.description
+            )
+        })
+        .collect())
 }
 
 /// scope 可见性（§3.2）：Project/Team 缺 identity → fail closed，不召回。
@@ -1888,6 +2112,17 @@ pub fn is_visible(meta: &DurableMemoryMetadata, ctx: &MemoryContext) -> bool {
             meta.owner_key == ctx.owner_key
                 && meta.project_key.as_deref() == Some(ctx.project_key.as_str())
         }
+        MemoryScope::Team => {
+            ctx.team_id.is_some() && meta.team_id.as_deref() == ctx.team_id.as_deref()
+        }
+    }
+}
+
+/// 管理页“我的记忆库”的可见范围。与运行时 recall 不同，个人和项目记录
+/// 在记忆库中按 owner 跨项目集中管理；团队记录只保留当前 team 的协作范围。
+fn is_library_visible(meta: &DurableMemoryMetadata, ctx: &MemoryContext) -> bool {
+    match meta.scope {
+        MemoryScope::Private | MemoryScope::Project => meta.owner_key == ctx.owner_key,
         MemoryScope::Team => {
             ctx.team_id.is_some() && meta.team_id.as_deref() == ctx.team_id.as_deref()
         }
@@ -1911,9 +2146,13 @@ pub fn format_age(updated_ms: i64, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, sync::Mutex, time::Duration};
+
     use super::{
-        DurableMemoryMetadata, MAX_AUTO_EXTRACT_RECORDS, MAX_RECALL_OVERFETCH_FACTOR,
-        MAX_TOP_K_INJECT, MemoryScope, MemoryServiceConfig, MemoryType, is_expired_at,
+        DurableMemoryMetadata, KvStore, MAX_AUTO_EXTRACT_RECORDS, MAX_RECALL_OVERFETCH_FACTOR,
+        MAX_TOP_K_INJECT, MemoryContext, MemoryEntry, MemoryError, MemoryNamespace, MemoryScope,
+        MemoryServiceConfig, MemoryType, Value, build_durable_library_manifest_items,
+        is_expired_at, is_library_visible, now_ms,
     };
 
     fn metadata(expires_at_ms: Option<i64>) -> DurableMemoryMetadata {
@@ -1979,5 +2218,186 @@ mod tests {
             MemoryServiceConfig::default().min_recall_score
         );
         assert_eq!(config.extract_retry_backoff_ms, i64::MAX as u64);
+    }
+
+    /// 进程内 KV，用于在纯内存中驱动 manifest 构建路径。
+    struct TestKv(Mutex<HashMap<String, Value>>);
+
+    impl TestKv {
+        fn new() -> Self {
+            Self(Mutex::new(HashMap::new()))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl KvStore for TestKv {
+        async fn get(&self, key: &str) -> Result<Option<Value>, MemoryError> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        async fn set(
+            &self,
+            key: &str,
+            value: &Value,
+            _ttl: Option<Duration>,
+        ) -> Result<(), MemoryError> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), value.clone());
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), MemoryError> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> Result<Vec<String>, MemoryError> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn meta_for(
+        scope: MemoryScope,
+        owner_key: &str,
+        project: Option<&str>,
+        team: Option<&str>,
+    ) -> DurableMemoryMetadata {
+        let mut meta = metadata(None);
+        meta.scope = scope;
+        meta.owner_key = owner_key.into();
+        meta.project_key = project.map(str::to_owned);
+        meta.team_id = team.map(str::to_owned);
+        meta
+    }
+
+    fn memory_row(id: &str, meta: &DurableMemoryMetadata, created_at: i64) -> MemoryEntry {
+        MemoryEntry {
+            id: id.into(),
+            content: String::new(),
+            namespace: MemoryNamespace::Personal,
+            metadata: serde_json::to_value(meta).unwrap(),
+            created_at,
+        }
+    }
+
+    fn put(kv: &TestKv, key: &str, entry: &MemoryEntry) {
+        futures::executor::block_on(kv.set(key, &serde_json::to_value(entry).unwrap(), None))
+            .unwrap();
+    }
+
+    #[test]
+    fn library_visibility_is_owner_scoped_and_team_gated() {
+        let alice = MemoryContext::for_owner("project-a", "session", "alice");
+        let bob = MemoryContext::for_owner("project-b", "session", "bob");
+
+        // Private 与跨项目的 Project 记录都出现在库管理页（集中管理，不按项目隔离）。
+        let private_alice = meta_for(MemoryScope::Private, &alice.owner_key, None, None);
+        let project_alice_elsewhere = meta_for(
+            MemoryScope::Project,
+            &alice.owner_key,
+            Some("project-b"),
+            None,
+        );
+        assert!(is_library_visible(&private_alice, &alice));
+        assert!(is_library_visible(&project_alice_elsewhere, &alice));
+
+        // 其他 owner 的记录一律不可见，包括同 project 的 Project 记录。
+        let private_bob = meta_for(MemoryScope::Private, &bob.owner_key, None, None);
+        let project_bob = meta_for(
+            MemoryScope::Project,
+            &bob.owner_key,
+            Some("project-a"),
+            None,
+        );
+        assert!(!is_library_visible(&private_bob, &alice));
+        assert!(!is_library_visible(&project_bob, &alice));
+
+        // 管理页的上下文由 for_owner 构造、恒无 team_id，Team 记录因此 fail closed。
+        let team_alice = meta_for(MemoryScope::Team, &alice.owner_key, None, Some("team-1"));
+        assert!(!is_library_visible(&team_alice, &alice));
+
+        // 一旦未来上下文携带匹配的 team_id，同 team 可见、其他 team 仍不可见。
+        let mut alice_in_team = alice.clone();
+        alice_in_team.team_id = Some("team-1".into());
+        let team_other = meta_for(MemoryScope::Team, &alice.owner_key, None, Some("team-2"));
+        assert!(is_library_visible(&team_alice, &alice_in_team));
+        assert!(!is_library_visible(&team_other, &alice_in_team));
+        assert!(!is_library_visible(&team_alice, &bob));
+    }
+
+    #[test]
+    fn library_manifest_is_owner_scoped_and_skips_corrupt_rows() {
+        let alice = MemoryContext::for_owner("project-a", "session", "alice");
+        let bob = MemoryContext::for_owner("project-b", "session", "bob");
+        let now = now_ms();
+
+        let kv = TestKv::new();
+        let mut private_alice = meta_for(MemoryScope::Private, &alice.owner_key, None, None);
+        private_alice.title = "alice-private".into();
+        let mut project_alice = meta_for(
+            MemoryScope::Project,
+            &alice.owner_key,
+            Some("project-b"),
+            None,
+        );
+        project_alice.title = "alice-other-project".into();
+        let mut team_alice = meta_for(MemoryScope::Team, &alice.owner_key, None, Some("team-1"));
+        team_alice.title = "alice-team".into();
+        let mut private_bob = meta_for(MemoryScope::Private, &bob.owner_key, None, None);
+        private_bob.title = "bob-private".into();
+        let mut expired_alice = meta_for(MemoryScope::Private, &alice.owner_key, None, None);
+        expired_alice.title = "alice-expired".into();
+        expired_alice.expires_at_ms = Some(now - 1);
+
+        put(
+            &kv,
+            "personal/alice/1",
+            &memory_row("a1", &private_alice, now),
+        );
+        put(
+            &kv,
+            "personal/alice/2",
+            &memory_row("a2", &project_alice, now),
+        );
+        put(&kv, "personal/alice/3", &memory_row("a3", &team_alice, now));
+        put(
+            &kv,
+            "personal/alice/4",
+            &memory_row("a4", &expired_alice, now),
+        );
+        put(&kv, "personal/bob/1", &memory_row("b1", &private_bob, now));
+        // 损坏行：非 MemoryEntry JSON 与 metadata 无法解码的条目都应被跳过。
+        put(
+            &kv,
+            "personal/junk/1",
+            &MemoryEntry {
+                id: "junk".into(),
+                content: String::new(),
+                namespace: MemoryNamespace::Personal,
+                metadata: serde_json::json!({"schema_version": 1}),
+                created_at: now,
+            },
+        );
+        futures::executor::block_on(kv.set(
+            "personal/junk/2",
+            &serde_json::json!({"not": "a memory entry"}),
+            None,
+        ))
+        .unwrap();
+
+        let items =
+            futures::executor::block_on(build_durable_library_manifest_items(&kv, &alice)).unwrap();
+        let mut titles: Vec<&str> = items.iter().map(|item| item.title.as_str()).collect();
+        titles.sort_unstable();
+        assert_eq!(titles, ["alice-other-project", "alice-private"]);
     }
 }

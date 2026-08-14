@@ -30,6 +30,8 @@ pub fn AppShellLayout() -> Element {
     let mut show_logout_confirm = use_signal(|| false);
 
     let route = use_route::<Route>();
+    // 对话页在自身内部维护消息滚动；内容容器不可再参与页面级纵向滚动。
+    let is_agent_chat = route == Route::AgentChat {};
     let active_nav = match route {
         Route::PersonalCenter {} => NavKey::PersonalCenter,
         Route::AgentChat {} => NavKey::AgentChat,
@@ -69,6 +71,11 @@ pub fn AppShellLayout() -> Element {
 
     rsx! {
         AppShell {
+            content_class: if is_agent_chat {
+                "ains-app-shell__content--chat".to_string()
+            } else {
+                String::new()
+            },
             sidebar: rsx! {
                 Sidebar {
                     open: sidebar_open,

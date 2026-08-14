@@ -1,6 +1,6 @@
 # Phase 7.1/7.2 对齐清单：跨平台 Sandbox + 权限强化 + 二次确认 + Kernel 中断
 
-对齐基线 OpenHarness `sandbox/` + `permissions/`。本轮交付 P0（7.1 平台级
+对齐基线 Harness `sandbox/` + `permissions/`。本轮交付 P0（7.1 平台级
 Sandbox + 权限模型强化、7.2 敏感操作二次确认）及 Kernel 真实中断遗留项。
 P1（7.3/7.4/7.5）下一批次独立验收。
 

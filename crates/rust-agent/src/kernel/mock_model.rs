@@ -1,4 +1,4 @@
-//! 脚本化 Mock ModelClient（对齐 OpenHarness `tests/test_engine` 的 fake client 模式）。
+//! 脚本化 Mock ModelClient（对齐 Harness `tests/test_engine` 的 fake client 模式）。
 //!
 //! 每次 `stream_response` 调用弹出一段预置事件脚本（delta / complete / retry），
 //! 同时记录请求（RecordingApiClient 语义），用于驱动工具循环的单测与集成测试。

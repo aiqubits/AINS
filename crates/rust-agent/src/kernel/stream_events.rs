@@ -1,4 +1,4 @@
-//! Kernel → UI 流事件（对齐 OpenHarness `engine/stream_events.py` 的七联合类型）。
+//! Kernel → UI 流事件（对齐 Harness `engine/stream_events.py` 的七联合类型）。
 
 use serde_json::Value;
 

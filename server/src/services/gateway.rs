@@ -352,11 +352,7 @@ impl GatewayService {
         }
         if let Some(v) = input.base_url {
             let v = v.trim_end_matches('/').to_string();
-            if !(v.starts_with("https://") || v.starts_with("http://")) {
-                return Err(GatewayError::InvalidInput(
-                    "base_url must be an http(s) URL".into(),
-                ));
-            }
+            validate_base_url(&v)?;
             active.base_url = Set(v);
         }
         if let Some(v) = input.is_active {
@@ -1832,6 +1828,22 @@ fn validate_protocol_capabilities(
     Ok(())
 }
 
+fn validate_base_url(base_url: &str) -> Result<(), GatewayError> {
+    let url = reqwest::Url::parse(base_url)
+        .map_err(|_| GatewayError::InvalidInput("base_url must be an http(s) URL".into()))?;
+    if matches!(url.scheme(), "http" | "https")
+        && url.host().is_some()
+        && url.username().is_empty()
+        && url.password().is_none()
+    {
+        Ok(())
+    } else {
+        Err(GatewayError::InvalidInput(
+            "base_url must be an http(s) URL without embedded credentials".into(),
+        ))
+    }
+}
+
 impl GatewayService {
     fn validate(&self, input: &CreateChannelInput) -> Result<(), GatewayError> {
         if input.name.trim().is_empty()
@@ -1839,7 +1851,7 @@ impl GatewayService {
             || input.models.is_empty()
             || input.capabilities.is_empty()
             || input.weight < 1
-            || !(input.base_url.starts_with("https://") || input.base_url.starts_with("http://"))
+            || validate_base_url(&input.base_url).is_err()
         {
             return Err(GatewayError::InvalidInput("name, api_key, models, capabilities, positive weight, and http(s) base_url are required".into()));
         }
@@ -1907,6 +1919,22 @@ mod tests {
             weight,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn validate_base_url_rejects_embedded_credentials() {
+        for base_url in [
+            "https://token@provider.example",
+            "https://user:secret@provider.example",
+        ] {
+            let error = validate_base_url(base_url).unwrap_err();
+            assert!(matches!(
+                error,
+                GatewayError::InvalidInput(message)
+                    if message.contains("without embedded credentials")
+                        && !message.contains("secret")
+            ));
         }
     }
 

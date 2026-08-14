@@ -1,5 +1,5 @@
 //! FSM 状态与事件定义（对齐 AINS_PLAN 3.3；状态集合直接映射
-//! OpenHarness `engine/query.py` 流式工具循环的各阶段）。
+//! Harness `engine/query.py` 流式工具循环的各阶段）。
 
 use serde::{Deserialize, Serialize};
 

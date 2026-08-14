@@ -11,6 +11,67 @@ use base64::{
 use crate::repositories::channel::ModelCapability;
 use crate::services::gateway::GatewayError;
 
+/// Join a configured channel base URL with an upstream API path suffix.
+///
+/// Tolerates base URLs that already carry the version prefix or a full endpoint
+/// path — as commonly copied verbatim from OpenAI-compatible provider docs.
+/// A full endpoint is normalized back to its API root before applying the
+/// requested suffix, so a channel supporting Chat and Embedding does not turn
+/// `.../v1/chat/completions` into `.../v1/chat/completions/v1/embeddings`.
+/// Query parameters remain attached to the upstream URL; fragments are
+/// client-side only and are discarded.
+fn join_api_path(base_url: &str, suffix: &str) -> Result<String, GatewayError> {
+    let mut url = reqwest::Url::parse(base_url).map_err(|error| {
+        GatewayError::InvalidInput(format!("base_url must be a valid http(s) URL: {error}"))
+    })?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return Err(GatewayError::InvalidInput(
+            "base_url must be a valid http(s) URL without credentials".into(),
+        ));
+    }
+    // Fragments never participate in an HTTP request. Keeping one while
+    // changing the path would make the dispatched URL misleading in logs.
+    url.set_fragment(None);
+
+    let mut base = url.path().trim_end_matches('/').to_string();
+    let suffix = format!("/{}", suffix.trim_start_matches('/'));
+    // A configured full endpoint is only a convenience spelling for this
+    // channel's API root. Strip any known endpoint before applying this call's
+    // suffix; otherwise a multi-capability channel routes every non-matching
+    // capability beneath the first endpoint path.
+    for endpoint in [
+        "/v1/chat/completions",
+        "/v1/messages",
+        "/v1/embeddings",
+        "/v1/audio/transcriptions",
+        "/v1/audio/speech",
+    ] {
+        if let Some(root) = base.strip_suffix(endpoint) {
+            base = root.to_string();
+            break;
+        }
+    }
+    // Base already ends with the version segment that the suffix also
+    // starts with (e.g. base `.../v1` + suffix `v1/chat/completions`).
+    if let Some(version) = suffix
+        .strip_prefix('/')
+        .and_then(|suffix| suffix.split('/').next())
+        && base.ends_with(&format!("/{version}"))
+        && let Some(rest) = suffix
+            .strip_prefix(&format!("/{version}"))
+            .filter(|rest| rest.starts_with('/'))
+    {
+        url.set_path(&format!("{base}{rest}"));
+        return Ok(url.to_string());
+    }
+    url.set_path(&format!("{base}{suffix}"));
+    Ok(url.to_string())
+}
+
 /// The outcome of dispatching a proxy request: what URL to hit and how to
 /// handle the request/response lifecycle.
 #[derive(Debug)]
@@ -45,13 +106,11 @@ pub fn dispatch_proxy(
     base_url: &str,
     body: serde_json::Value,
 ) -> Result<DispatchAction, GatewayError> {
-    let base = base_url.trim_end_matches('/');
-
     match capability {
         ModelCapability::Chat | ModelCapability::Vision | ModelCapability::WebSearch => {
             match protocol_type {
                 "openai" => Ok(DispatchAction::JsonPost {
-                    url: format!("{}/v1/chat/completions", base),
+                    url: join_api_path(base_url, "/v1/chat/completions")?,
                     body,
                 }),
                 "anthropic" => {
@@ -69,7 +128,7 @@ pub fn dispatch_proxy(
                     // proxy layer. For dispatch we just set the URL, and the
                     // caller (GatewayService::proxy) handles body translation.
                     Ok(DispatchAction::JsonPost {
-                        url: format!("{}/v1/messages", base),
+                        url: join_api_path(base_url, "/v1/messages")?,
                         body,
                     })
                 }
@@ -81,7 +140,7 @@ pub fn dispatch_proxy(
         }
         ModelCapability::Embedding => match protocol_type {
             "openai" => Ok(DispatchAction::JsonPost {
-                url: format!("{}/v1/embeddings", base),
+                url: join_api_path(base_url, "/v1/embeddings")?,
                 body,
             }),
             _ => Err(GatewayError::InvalidInput(format!(
@@ -139,7 +198,7 @@ pub fn dispatch_proxy(
             }
 
             Ok(DispatchAction::SttMultipart {
-                url: format!("{}/v1/audio/transcriptions", base),
+                url: join_api_path(base_url, "/v1/audio/transcriptions")?,
                 audio_bytes,
                 filename,
                 model,
@@ -152,7 +211,7 @@ pub fn dispatch_proxy(
         ))),
         ModelCapability::Tts => match protocol_type {
             "openai" => Ok(DispatchAction::TtsBinary {
-                url: format!("{}/v1/audio/speech", base),
+                url: join_api_path(base_url, "/v1/audio/speech")?,
                 body,
             }),
             _ => Err(GatewayError::InvalidInput(format!(
@@ -332,6 +391,123 @@ mod tests {
 
         assert!(
             matches!(result, Err(GatewayError::InvalidInput(message)) if message.contains("STT only supports OpenAI"))
+        );
+    }
+
+    #[test]
+    fn join_api_path_appends_versioned_path_to_plain_base() {
+        assert_eq!(
+            join_api_path("https://api.moonshot.cn", "/v1/chat/completions").unwrap(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        assert_eq!(
+            join_api_path("http://localhost:11434", "/v1/chat/completions").unwrap(),
+            "http://localhost:11434/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn join_api_path_rejects_embedded_credentials() {
+        let error = join_api_path(
+            "https://user:secret@provider.example/v1",
+            "/v1/chat/completions",
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            GatewayError::InvalidInput(message)
+                if message.contains("without credentials") && !message.contains("secret")
+        ));
+    }
+
+    #[test]
+    fn join_api_path_avoids_duplicated_version_prefix() {
+        // base_url 已带 /v1（moonshot 官方文档的标准写法）→ 不能再拼出 /v1/v1/...
+        assert_eq!(
+            join_api_path("https://api.moonshot.cn/v1", "/v1/chat/completions").unwrap(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        // 尾斜杠同样处理
+        assert_eq!(
+            join_api_path("https://api.moonshot.cn/v1/", "/v1/chat/completions").unwrap(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        // anthropic 版本前缀
+        assert_eq!(
+            join_api_path("https://api.anthropic.com/v1", "/v1/messages").unwrap(),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // embedding / stt / tts 端点
+        assert_eq!(
+            join_api_path("https://api.openai.com/v1", "/v1/embeddings").unwrap(),
+            "https://api.openai.com/v1/embeddings"
+        );
+        assert_eq!(
+            join_api_path("https://api.openai.com/v1", "/v1/audio/speech").unwrap(),
+            "https://api.openai.com/v1/audio/speech"
+        );
+    }
+
+    #[test]
+    fn join_api_path_keeps_full_endpoint_in_base_url() {
+        assert_eq!(
+            join_api_path(
+                "https://api.moonshot.cn/v1/chat/completions",
+                "/v1/chat/completions"
+            )
+            .unwrap(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+        assert_eq!(
+            join_api_path(
+                "https://api.moonshot.cn/v1/chat/completions/",
+                "/v1/chat/completions"
+            )
+            .unwrap(),
+            "https://api.moonshot.cn/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn full_endpoint_base_is_reused_as_an_api_root_for_other_capabilities() {
+        // A channel may expose more than one capability. A copied chat
+        // endpoint must still route Embedding/TTS to sibling endpoints rather
+        // than appending below `chat/completions`.
+        let embedding = dispatch_proxy(
+            &ModelCapability::Embedding,
+            "openai",
+            "https://provider.example/v1/chat/completions",
+            serde_json::json!({"model": "embed", "input": "hello"}),
+        )
+        .unwrap();
+        let DispatchAction::JsonPost { url, .. } = embedding else {
+            panic!("expected embedding JSON post");
+        };
+        assert_eq!(url, "https://provider.example/v1/embeddings");
+
+        let tts = dispatch_proxy(
+            &ModelCapability::Tts,
+            "openai",
+            "https://provider.example/proxy/v1/chat/completions",
+            serde_json::json!({"model": "tts", "input": "hello", "voice": "alloy"}),
+        )
+        .unwrap();
+        let DispatchAction::TtsBinary { url, .. } = tts else {
+            panic!("expected TTS binary post");
+        };
+        assert_eq!(url, "https://provider.example/proxy/v1/audio/speech");
+    }
+
+    #[test]
+    fn join_api_path_preserves_query_and_discards_fragment() {
+        assert_eq!(
+            join_api_path(
+                "https://provider.example/v1?tenant=ains#local-only",
+                "/v1/chat/completions"
+            )
+            .unwrap(),
+            "https://provider.example/v1/chat/completions?tenant=ains"
         );
     }
 }

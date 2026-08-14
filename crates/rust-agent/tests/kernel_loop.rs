@@ -1,6 +1,6 @@
 //! Phase 1 工具循环单测 + 完整 Agent Loop 集成测试（Native）。
 //!
-//! 用例对照 OpenHarness `tests/test_engine/test_query_engine.py`：
+//! 用例对照 Harness `tests/test_engine/test_query_engine.py`：
 //! plain text / 工具循环 / 工具异常合成 error result / 未知工具 / max_turns /
 //! retry 状态上报 / 空 assistant 丢弃 / sanitize 悬空 tool_use / continue_pending。
 
@@ -1359,7 +1359,7 @@ async fn multi_tool_use_executes_concurrently_and_aggregates_in_original_order()
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     // 单轮 assistant 消息携带两个 tool_use → 并发执行 → 结果按原始顺序
-    // 聚合成一条 user 消息（对齐 OpenHarness gather 语义）。
+    // 聚合成一条 user 消息（对齐 Harness gather 语义）。
     let assistant = ConversationMessage {
         role: Role::Assistant,
         content: vec![

@@ -1,4 +1,4 @@
-//! 持久记忆抽取 + 会话检查点（AINS_PLAN Phase 2.9，对齐 OpenHarness
+//! 持久记忆抽取 + 会话检查点（AINS_PLAN Phase 2.9，对齐 Harness
 //! `services/memory_extract.py` + `services/session_memory.py`）。
 //!
 //! - 抽取：将近期对话与既有记忆清单交给模型，返回 ≤3 条 JSON 记录，
@@ -16,8 +16,8 @@ use crate::memory::kv::{KvStore, now_ms};
 use crate::memory::memdir::{MemdirStore, MemoryScope, MemoryType, NewMemoryEntry, parse_iso_utc};
 use crate::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
 
-/// 抽取 system prompt（逐字对齐基线 `EXTRACTION_SYSTEM_PROMPT`，OpenHarness 名称保留）。
-pub const EXTRACTION_SYSTEM_PROMPT: &str = "You maintain OpenHarness durable memory.\nSave only stable, future-useful facts that are not derivable from current files,\ngit history, or documentation. Prefer updating existing memories conceptually\nover duplicating them. Do not save secrets. If nothing is worth saving, return\n{\"memories\": []}.\n";
+/// 抽取 system prompt（逐字对齐基线 `EXTRACTION_SYSTEM_PROMPT`，Harness 名称保留）。
+pub const EXTRACTION_SYSTEM_PROMPT: &str = "You maintain Harness durable memory.\nSave only stable, future-useful facts that are not derivable from current files,\ngit history, or documentation. Prefer updating existing memories conceptually\nover duplicating them. Do not save secrets. If nothing is worth saving, return\n{\"memories\": []}.\n";
 
 /// 单次抽取最多保存的记录数（基线 `max_records=3`）。
 pub const MAX_EXTRACT_RECORDS: usize = 3;

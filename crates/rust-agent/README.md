@@ -2,7 +2,7 @@
 
 AINS Agent Runtime Core：单一 crate、WASM/Native 双编译目标的 Embedded Agent Runtime。
 
-- 设计与分阶段计划见仓库根 `AINS_PLAN.md`；特性语义对齐 `OpenHarness/` 基线，
+- 设计与分阶段计划见仓库根 `AINS_PLAN.md`；特性语义对齐 `Harness/` 基线，
   对齐清单归档于 `docs/alignment/`。
 - 业务逻辑只依赖 trait 抽象（`RuntimeAdapter` / `KvStore` / `VectorIndex` /
   `DocumentStore` / `Tool` / `SkillLoader` / `SkillManage` / `ModelClient`）；

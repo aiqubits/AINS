@@ -1,4 +1,4 @@
-//! memdir 可读记忆库（AINS_PLAN Phase 2.8，对齐 OpenHarness `memory/memdir.py` +
+//! memdir 可读记忆库（AINS_PLAN Phase 2.8，对齐 Harness `memory/memdir.py` +
 //! `memory/schema.py`）。
 //!
 //! - `MEMORY.md` 为一行式索引，条目正文存放在独立 topic 文件（frontmatter + body）；
@@ -157,6 +157,19 @@ pub struct MemdirEntry {
 }
 
 /// memdir 存储（挂在 kv 逻辑表上）。
+///
+/// 并发契约：复合写操作（[`MemdirStore::add_entry`]、[`MemdirStore::remove_entry`]、
+/// [`MemdirStore::clear_entries`]）内部由"读取判定 + 写入 + 索引更新"多步组成，
+/// 在 KvStore 层并非原子事务。调用方必须在外部持 `durable_mutation_gate`（或
+/// 等价的跨会话串行化）再进入这些方法，否则并发写入同一存储域时去重判定与
+/// 索引追加可能交错。
+///
+/// 锁由宿主层持有：web 端的 `extract_durable_serialized` /
+/// `clear_durable_memories` / `delete_durable_memory`（native 持
+/// `MemoryService::durable_mutation_gate`，wasm 持 origin 级
+/// `DURABLE_MEMORY_WRITE_LOCK`）在调用本 store 或 `MemoryService` 的管理方法
+/// 前获取；这些方法自身不获取锁。新增调用方必须沿用同一宿主模式，不能绕过
+/// 宿主直接调用。
 pub struct MemdirStore {
     kv: Arc<dyn KvStore>,
     /// Web owner partition. Native uses the legacy unscoped keys to retain
@@ -252,8 +265,9 @@ impl MemdirStore {
                 refreshed.updated_at = timestamp.clone();
                 refreshed.disabled = false;
                 self.write_entry(&refreshed).await?;
-                // 软删除后重新 add：恢复索引行（append 自身幂等）。
-                self.append_index_line(&refreshed.name, &refreshed.filename)
+                // 软删除后重新 add：恢复索引行；标题已变更时同步更新
+                // 既有索引行（upsert），避免 MEMORY.md 索引标题陈旧。
+                self.upsert_index_line(&refreshed.name, &refreshed.filename)
                     .await?;
                 return Ok(existing.filename);
             }
@@ -309,6 +323,61 @@ impl MemdirStore {
             updated.disabled = true;
             updated.updated_at = format_iso_utc(now_ms());
             self.write_entry(&updated).await?;
+            self.drop_index_lines(&entry.filename).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// 永久删除当前存储域内的全部条目及索引，供用户确认的“清空全部”使用。
+    /// 返回移除的条目键数（包含损坏条目）。
+    pub async fn clear_entries(&self) -> Result<u64, MemoryError> {
+        let removed = self.kv.delete_prefix(&self.entry_prefix()).await?;
+        self.kv.delete(&self.index_key()).await?;
+        Ok(removed)
+    }
+
+    /// 永久删除一条条目，供用户主动的数据删除操作使用。
+    pub async fn delete_entry(&self, query: &str) -> Result<bool, MemoryError> {
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            return Ok(false);
+        }
+        for entry in self.scan_raw().await? {
+            let stem = entry.filename.trim_end_matches(".md").to_lowercase();
+            if needle != entry.filename.to_lowercase()
+                && needle != stem
+                && needle != entry.name.to_lowercase()
+                && needle != entry.id.to_lowercase()
+            {
+                continue;
+            }
+            self.kv
+                .delete(&format!("{}{}", self.entry_prefix(), entry.filename))
+                .await?;
+            self.drop_index_lines(&entry.filename).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Permanently delete exactly one entry identified by its canonical id.
+    ///
+    /// Management UIs already retain this id, so they must not use the
+    /// user-friendly `delete_entry` matcher: a user-controlled title can
+    /// otherwise equal another entry's id and remove a different card.
+    pub async fn delete_entry_by_id(&self, id: &str) -> Result<bool, MemoryError> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Ok(false);
+        }
+        for entry in self.scan_raw().await? {
+            if entry.id != id {
+                continue;
+            }
+            self.kv
+                .delete(&format!("{}{}", self.entry_prefix(), entry.filename))
+                .await?;
             self.drop_index_lines(&entry.filename).await?;
             return Ok(true);
         }
@@ -372,25 +441,43 @@ impl MemdirStore {
 
     async fn unique_filename(&self, title: &str) -> Result<String, MemoryError> {
         let slug = slugify(title);
-        // list_prefix 会跳过损坏行：其文件名视为可复用，新条目直接
-        // 覆写该键（自愈；损坏行本就不可解析，无内容可保留）。
+        // `list_prefix` 是原始前缀扫描，包含损坏行在内，因此先按占用集合
+        // 去重；若候选名已被一条损坏行占用（载荷不可解析），其文件名视为
+        // 可复用——`write_entry` 会覆写该键，从而自愈损坏行（其内容本就
+        // 不可读，无信息可保留）。
         let entry_prefix = self.entry_prefix();
         let existing = self.kv.list_prefix(&entry_prefix).await?;
         let taken: Vec<&str> = existing
             .iter()
             .map(|k| k.trim_start_matches(&entry_prefix))
             .collect();
-        let candidate = format!("{slug}.md");
-        if !taken.contains(&candidate.as_str()) {
-            return Ok(candidate);
-        }
-        for i in 2.. {
-            let candidate = format!("{slug}_{i}.md");
+        let mut candidate = format!("{slug}.md");
+        let mut i = 2;
+        loop {
             if !taken.contains(&candidate.as_str()) {
                 return Ok(candidate);
             }
+            if self
+                .row_is_corrupt(&format!("{entry_prefix}{candidate}"))
+                .await?
+            {
+                return Ok(candidate);
+            }
+            candidate = format!("{slug}_{i}.md");
+            i += 1;
         }
-        unreachable!()
+    }
+
+    /// 判断某键是否为一条“损坏行”：载荷无法解码（KV Serialization 错误）
+    /// 或解码后不是字符串。与 `scan_raw` 对损坏行的判定口径保持一致。
+    async fn row_is_corrupt(&self, key: &str) -> Result<bool, MemoryError> {
+        match self.kv.get(key).await {
+            Ok(Some(value)) => Ok(value.as_str().is_none()),
+            // 键在 list 与 get 之间消失：视为可复用。
+            Ok(None) => Ok(true),
+            Err(MemoryError::Serialization(_)) => Ok(true),
+            Err(e) => Err(e),
+        }
     }
 
     async fn append_index_line(&self, title: &str, filename: &str) -> Result<(), MemoryError> {
@@ -405,7 +492,49 @@ impl MemdirStore {
         if !index.is_empty() && !index.ends_with('\n') {
             index.push('\n');
         }
-        index.push_str(&format!("- [{title}]({filename})\n"));
+        // 与 `upsert_index_line` 的刷新路径一致：标题含换行/`]` 会破坏
+        // 索引行的 markdown 链接结构，写前同样清洗（review P3）。
+        let safe_title = sanitize_index_text(title);
+        index.push_str(&format!("- [{safe_title}]({filename})\n"));
+        self.kv
+            .set(&self.index_key(), &Value::String(index), None)
+            .await
+    }
+
+    /// 刷新/更新既有条目的索引行：锚定 `]({filename})` 的行存在则整行
+    /// 重写为新标题，否则按 `append_index_line` 语义追加。刷新路径复用
+    /// append 会因锚定行已存在而跳过，导致索引标题与条目 frontmatter
+    /// 的 `name` 不一致（陈旧标题会误导模型）。
+    async fn upsert_index_line(&self, title: &str, filename: &str) -> Result<(), MemoryError> {
+        let index = self.read_index().await?.unwrap_or_default();
+        let anchor = format!("]({filename})");
+        // 标题含换行/`]` 会破坏索引行的 markdown 链接结构，写前清洗。
+        let safe_title = sanitize_index_text(title);
+        // 锚定行存在：整行重写。用 `lines()` 逐行重建，避免 `split('\n')`
+        // 在结尾换行时多出一个空串导致的多余空行。
+        if index.lines().any(|line| line.trim_end().ends_with(&anchor)) {
+            let mut text = String::new();
+            for line in index.lines() {
+                if line.trim_end().ends_with(&anchor) {
+                    text.push_str(&format!("- [{safe_title}]({filename})"));
+                } else {
+                    // lines() 对 CRLF 保留 \r：整文件重建时剥掉，避免重写后
+                    // 混合行尾（锚定行输出 LF、其余行残留 CRLF）。
+                    text.push_str(line.strip_suffix('\r').unwrap_or(line));
+                }
+                text.push('\n');
+            }
+            return self
+                .kv
+                .set(&self.index_key(), &Value::String(text), None)
+                .await;
+        }
+        // 无既有行：追加（保持与 append_index_line 一致的换行语义）。
+        let mut index = index;
+        if !index.is_empty() && !index.ends_with('\n') {
+            index.push('\n');
+        }
+        index.push_str(&format!("- [{safe_title}]({filename})\n"));
         self.kv
             .set(&self.index_key(), &Value::String(index), None)
             .await
@@ -461,6 +590,15 @@ pub fn generate_memory_id(content: &str, now_ms: i64) -> String {
     let digest = hasher.finalize();
     let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
     format!("mem-{compact}-{hex}")
+}
+
+/// 索引行标题清洗：去除控制字符并剥掉 `[`/`]`，防止破坏
+/// `- [title](file)` 的 markdown 链接结构。
+pub fn sanitize_index_text(title: &str) -> String {
+    title
+        .chars()
+        .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+        .collect()
 }
 
 /// 标题 → slug：非字母数字折叠为 `_`，小写，去首尾 `_`，空回落 `memory`。
@@ -909,5 +1047,40 @@ mod tests {
         // 纯非 ASCII 标题回落固定 slug（冲突由 unique_filename 的 _2 后缀化解）
         assert_eq!(slugify("构建配置"), "memory");
         assert_eq!(slugify("  ---  "), "memory");
+    }
+
+    #[tokio::test]
+    async fn upsert_index_line_normalizes_crlf_on_rewrite() {
+        use crate::memory::in_memory::InMemoryKvStore;
+        use crate::memory::kv::KvStore;
+        use serde_json::Value;
+        use std::sync::Arc;
+
+        let kv: Arc<dyn KvStore> = Arc::new(InMemoryKvStore::default());
+        let store = super::MemdirStore::new(Arc::clone(&kv));
+        // 既有 CRLF 索引（模拟跨平台写入的历史文件）：两行都以 \r\n 结尾，
+        // 其中第一行锚定 build.md。
+        kv.set(
+            &store.index_key(),
+            &Value::String("- [Old title](build.md)\r\n- [Another](other.md)\r\n".into()),
+            None,
+        )
+        .await
+        .unwrap();
+        store
+            .upsert_index_line("New title", "build.md")
+            .await
+            .unwrap();
+        let rewritten = kv
+            .get(&store.index_key())
+            .await
+            .unwrap()
+            .and_then(|v| v.as_str().map(|s| s.to_owned()))
+            .unwrap();
+        // 整文件重建后统一 LF：锚定行重写为 LF，其余行剥掉残留 \r。
+        assert_eq!(
+            rewritten,
+            "- [New title](build.md)\n- [Another](other.md)\n"
+        );
     }
 }

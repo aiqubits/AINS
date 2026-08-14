@@ -3,7 +3,7 @@
 //! - **重要性评分**：`metadata.importance`（f64，默认 1.0），低分优先淘汰；
 //! - **时间衰减**：半衰期指数衰减，旧记忆降低检索权重与保留权重；
 //! - **去重合并**：内容归一化签名（sha256），相同签名的写入合并为刷新；
-//! - 签名归一化口径对齐 OpenHarness `memory/manager.py`：小写、空白折叠、
+//! - 签名归一化口径对齐 Harness `memory/manager.py`：小写、空白折叠、
 //!   去 ASCII 标点。
 
 use serde_json::Value;

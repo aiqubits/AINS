@@ -1,4 +1,4 @@
-//! Tool Runtime 统一抽象（对齐 OpenHarness `tools/base.py`）。
+//! Tool Runtime 统一抽象（对齐 Harness `tools/base.py`）。
 //!
 //! 所有工具（本地 / 远程 MCP / AgentInternal）实现同一 `Tool` trait，经统一
 //! 注册表（`runtime::ToolRuntime`）+ 三态权限（`policy`）+ hooks（`hooks`）
@@ -11,6 +11,7 @@ pub mod memory;
 pub mod network;
 pub mod outputs;
 pub mod runtime;
+pub mod skills;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod filesystem;
@@ -19,6 +20,7 @@ pub mod system;
 
 pub use memory::{MemoryReadTool, MemoryWriteTool, MemoryWriter};
 pub use runtime::ToolRuntime;
+pub use skills::{SkillCreateTool, SkillLoadTool, SkillResourceLoadTool};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -151,6 +153,14 @@ pub enum ToolCategory {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 pub trait Tool: MaybeSendSync {
     fn definition(&self) -> ToolDef;
+
+    /// Whether this registered tool may be advertised to and called by the
+    /// model for the current turn.  Most tools are always available; narrowly
+    /// authorized host actions can opt in only while their user-granted token
+    /// is live.
+    fn is_available(&self) -> bool {
+        true
+    }
 
     /// 按参数自报只读性：同一工具可因参数不同而权限不同，
     /// 由 PermissionChecker 结合 PermissionMode 决策（基线默认 `false`）。

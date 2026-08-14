@@ -1,6 +1,6 @@
 # Phase 0 对齐清单：核心 Trait 定义
 
-对齐基线：`OpenHarness/src/openharness/`（提交时仓库内版本）。
+对齐基线：`Harness/src/harness/`（提交时仓库内版本）。
 范围：Phase 0.2 的七个核心 trait（`Tool` / `KvStore` / `VectorIndex` /
 `DocumentStore` / `SkillLoader` / `SkillManage` / `ModelClient`）及其支撑类型。
 详细行为对齐（sanitize 语义、工具循环、权限交互等）在对应 Phase 的特性清单中另行归档。

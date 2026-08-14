@@ -1,4 +1,4 @@
-//! Native 系统工具（对齐 OpenHarness `bash_tool.py`；Clipboard / Notification /
+//! Native 系统工具（对齐 Harness `bash_tool.py`；Clipboard / Notification /
 //! Screenshot 基线无对应物，按 AINS_PLAN 3.4 设计为宿主集成端口）。
 //!
 //! Shell Command 注册为普通 Tool，但执行路径**必经 Sandbox 层**：

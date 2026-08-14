@@ -4,7 +4,7 @@
 //! 命令是**提示词模板**（不提供新能力）：`/name args` 展开为提交给模型的
 //! prompt（可带模型覆盖与工具白名单）。格式与 Skill 一致（YAML frontmatter +
 //! Markdown body），故二者可互转——命令即"用户可直接调用的 skill"，skill 即
-//! "带元数据的命令模板"。对齐 OpenHarness `commands/registry.py` 的
+//! "带元数据的命令模板"。对齐 Harness `commands/registry.py` 的
 //! `SlashCommand` + 插件 `PluginCommandDefinition` 的 `_render_*_command_prompt`。
 //!
 //! 展开规则（对齐基线并扩展位置参数）：

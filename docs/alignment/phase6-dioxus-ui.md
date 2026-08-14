@@ -1,7 +1,7 @@
 # Phase 6 对齐清单：Dioxus UI 集成（全部任务 6.1–6.12）
 
-对齐基线：`OpenHarness/frontend/terminal/`（React 终端 UI 的交互语义：流式
-消息、工具调用卡片、权限确认、模式切换）与 `OpenHarness/src/openharness/`
+对齐基线：`Harness/frontend/terminal/`（React 终端 UI 的交互语义：流式
+消息、工具调用卡片、权限确认、模式切换）与 `Harness/src/harness/`
 （`engine/stream_events.py`、`permissions/`、`skills/`）。范围：Phase 6 的
 P0 任务——rust-agent 嵌入 Web/Desktop（6.1/6.2）、Chat 对话视图（6.3）、
 Skills 管理面板（6.4）、权限交互 UI（6.11）。P1/P2 任务（6.5–6.10、6.12）
@@ -87,7 +87,7 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 | load 完整性门控 | 损坏不可注入 | `load` 与 list 同口径校验：无 meta 或 checksum 不匹配返回 InvalidFormat，堵经名称旁路加载已篡改内容（Code Review 修正） | 对齐（修正） |
 | 列表读错误处理 | — | `list_entries` 对存储读错误 `?` 上报（仅内容缺失/非字符串载荷才标损坏），避免瞬时读错误把健康 skill 误标为可删除损坏条目（Code Review 修正） | 对齐（修正） |
 | Level 2 引用文件 | load_reference | **偏差**：返回 NotFound，随 Phase 6.8 落地 | 偏差（后置 6.8） |
-| 门控 | platform + requires_tools | `SkillContext{platform,available_tools}`：平台匹配（空=全平台）∧ 依赖工具全可用 | 对齐 |
+| 门控 | platform | `SkillContext{platform,available_tools}`：`metadata.ains.platforms`（`web`/`desktop`/`mobile`）显式声明平台；省略即全平台，列表与按名加载均校验 | AINS runtime extension |
 | SkillManage | create/update/rollback/delete | 仅 `delete_skill` 实现（双 key 原子清除，不存在报 NotFound，损坏条目/孤儿 meta 可删）；create/update **偏差后置 6.8**、rollback **后置 6.9**（调用返回显式错误，不静默成功） | 对齐（delete）/ 偏差（后置） |
 | 面板 | 浏览/删除，无导入 | `SkillsPanel`：卡片列表（trust 徽标 + 元信息）+ 详情抽屉（frontmatter + body 只读）+ 删除二次确认；**无导入/上传入口**（仅 Agent 自主创建）；损坏条目仅可删除不可查看 | 对齐 |
 | 名称校验 | — | `validate_name`：非空、无首尾空白、拒 `/ \ :` 与控制字符（key 注入防护） | AINS 扩展 |
@@ -128,7 +128,7 @@ wasm-pack 浏览器测试。用例数随评审回归演进，以 `cargo test` �
 | 6.5 Agent 状态指示器 | `ui/agent_status.rs`：Idle/Thinking/RunningTools/Compacting/Error 五态圆点+文案（进行态脉冲动画）；宿主从流事件派生状态 | 浏览器实测：/agent 顶部右侧「空闲」常驻 |
 | 6.6 Memory 浏览器 | `ui/memory_viewer.rs` + `web/views/memory.rs`：memdir `scan(500)` 卡片列表 + 详情抽屉（重要度徽标/标签/正文）；/memory 路由 + 侧边栏「记忆库」 | 浏览器实测：标题/副标题/空态渲染 |
 | 6.7 Tool 执行面板 | `ui/tool_panel.rs` + `web/views/tools.rs`：`service::tool_schema_snapshot()`（仅构造 ToolRuntime 取 `api_schemas()` 快照）渲染真实工具名+描述；/tools 路由 + 侧边栏「工具面板」 | 浏览器实测：10 个运行时工具全部展示 |
-| 6.8 Skills 渐进式加载+门控 | `create_skill`（v1.0 Active，frontmatter 提取元数据，trust=Generated）/`update_skill`（minor bump，旧版 Deprecated）；Level 2 `load_reference`/`put_reference`（`skills_ref:` key）；门控已在 `SkillLoader::list`（platform ∧ requires_tools） | native 18 + wasm 契约测试 |
+| 6.8 Skills 渐进式加载+门控 | `create_skill`（v1.0 Active，frontmatter 提取元数据，trust=Generated）/`update_skill`（minor bump，旧版 Deprecated）；Level 2 `load_reference`/`put_reference`（`skills_ref:` key）；`metadata.ains.platforms` 平台门控在 `SkillLoader::list` 与按名加载同时生效 | native + wasm 契约测试 |
 | 6.9 清理与回滚 | 版本化存储（`skills_ver:`/`skills_head:`，`SkillVersion` v{major}.{minor}，链只增不删）；`rollback_skill`（目标提升为新大版本，限保留范围）；`SkillPruner`（最近 3+Golden+活跃版，评分升序淘汰）；`record_outcome` 连续失败≥5 且存在更优版自动回滚；面板详情展示 Active 版本+回滚按钮 | 专项测试：版本链/自动回滚/保留集/引用文件 |
 | 6.10 Mobile 适配 | 既有 sidebar 抽屉+overlay；新增 chat/tools/memory CSS `@media(max-width:640px)`（单列网格、消息 90% 宽、发送钮纯图标） | CSS 媒体查询（随 release 构建交付） |
 | 6.12 Slash Command + todo | `ChatInput` 增 `slash_commands`（`/` 前缀过滤建议下拉）；`/skill <name>` 加载 SKILL.md 全文作为指令发送（失败 warning toast）、`/help` 提示；`ui/todo_list.rs` + `parse_todo_markdown`（`- [ ]`/`- [x]`）从 todo_write 输出同步，有条目时展示于输入区上方 | 浏览器实测：`/` 弹出命令下拉；解析器单测 |

@@ -1,4 +1,4 @@
-//! Native 文件系统工具（对齐 OpenHarness `file_read_tool.py` / `file_write_tool.py`
+//! Native 文件系统工具（对齐 Harness `file_read_tool.py` / `file_write_tool.py`
 //! / `file_edit_tool.py` / `glob_tool.py` / `grep_tool.py`）。
 //!
 //! 仅 Native 编译（WASM 无本地文件系统）。与基线差异（有意）：

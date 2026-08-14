@@ -7,7 +7,7 @@
 //! 下推为 bwrap 参数：文件系统四象限 → `--ro-bind`/`--bind`，网络 →
 //! namespace 隔离 +（可选）`--share-net`。
 //!
-//! 降级语义（遵循 AINS 原则，与 OpenHarness `wrap_command_for_sandbox` 相反）：
+//! 降级语义（遵循 AINS 原则，与 Harness `wrap_command_for_sandbox` 相反）：
 //! bwrap 不存在时 `capabilities().shell=false`，shell 被**拒绝**执行，
 //! 绝不降级为宿主直跑。
 //!

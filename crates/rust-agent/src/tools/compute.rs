@@ -1,6 +1,6 @@
 //! Pure Rust 计算类工具（Calculator / JSON / Text / Markdown / Date，双 target）。
 //!
-//! 基线无对应物（OpenHarness 无此五件套），按 AINS_PLAN 3.2 设计：
+//! 基线无对应物（Harness 无此五件套），按 AINS_PLAN 3.2 设计：
 //! 全部只读、无平台依赖，WASM 与 Native 行为一致。
 
 use serde_json::Value;

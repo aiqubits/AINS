@@ -50,6 +50,7 @@ pub fn SkillsPanel(
     on_open_detail: EventHandler<String>,
     on_close_detail: EventHandler<()>,
     on_delete: EventHandler<String>,
+    on_clear_all: EventHandler<()>,
     /// 回滚到指定版本（(name, version)；Phase 6.9）。
     on_rollback: EventHandler<(String, String)>,
 ) -> Element {
@@ -57,14 +58,25 @@ pub fn SkillsPanel(
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
     // 待删除技能名（Some 时显示确认弹窗）。
     let mut pending_delete = use_signal(|| None::<String>);
+    let mut clear_confirm_open = use_signal(|| false);
 
     let cards = skills.read().clone();
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/skills_panel.css") }
         section { class: "ains-skills",
             header { class: "ains-skills__header",
-                h2 { class: "ains-skills__title", {t.skills_title} }
-                p { class: "ains-skills__subtitle", {t.skills_subtitle} }
+                div {
+                    h2 { class: "ains-skills__title", {t.skills_title} }
+                    p { class: "ains-skills__subtitle", {t.skills_subtitle} }
+                }
+                if !cards.is_empty() {
+                    button {
+                        class: "ains-skills__btn ains-skills__btn--danger",
+                        r#type: "button",
+                        onclick: move |_| clear_confirm_open.set(true),
+                        {t.skills_clear_all_btn}
+                    }
+                }
             }
             if cards.is_empty() {
                 p { class: "ains-skills__empty", {t.skills_empty} }
@@ -143,6 +155,33 @@ pub fn SkillsPanel(
                 }
             }
         }
+
+        if clear_confirm_open() {
+            Modal {
+                title: t.skills_confirm_clear_all_title.to_string(),
+                on_close: move |_| clear_confirm_open.set(false),
+                div { class: "ains-skills__confirm",
+                    p { {t.skills_confirm_clear_all_msg} }
+                    div { class: "ains-skills__confirm-actions",
+                        button {
+                            class: "ains-skills__btn ains-skills__btn--cancel",
+                            r#type: "button",
+                            onclick: move |_| clear_confirm_open.set(false),
+                            {t.modal_close}
+                        }
+                        button {
+                            class: "ains-skills__btn ains-skills__btn--danger",
+                            r#type: "button",
+                            onclick: move |_| {
+                                clear_confirm_open.set(false);
+                                on_clear_all.call(());
+                            },
+                            {t.skills_clear_all_btn}
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -165,6 +204,7 @@ fn SkillCardRow(
     let name_for_open = card.name.clone();
     let name_for_delete = card.name.clone();
     let corrupted = card.corrupted;
+    let system = card.trust == SkillTrustView::System;
     rsx! {
         div { class: if corrupted { "ains-skills__card ains-skills__card--corrupted" } else { "ains-skills__card" },
             button {
@@ -195,12 +235,14 @@ fn SkillCardRow(
                     }
                 }
             }
-            button {
-                class: "ains-skills__delete",
-                r#type: "button",
-                aria_label: t.skills_delete_btn,
-                onclick: move |_| on_delete_request.call(name_for_delete.clone()),
-                Trash2 {}
+            if !system {
+                button {
+                    class: "ains-skills__delete",
+                    r#type: "button",
+                    aria_label: t.skills_delete_btn,
+                    onclick: move |_| on_delete_request.call(name_for_delete.clone()),
+                    Trash2 {}
+                }
             }
         }
     }

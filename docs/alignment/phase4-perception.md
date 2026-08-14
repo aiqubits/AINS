@@ -1,6 +1,6 @@
 # Phase 4 对齐清单：Perception System
 
-对齐基线：`OpenHarness/src/openharness/engine/messages.py`（`ImageBlock`）、
+对齐基线：`Harness/src/harness/engine/messages.py`（`ImageBlock`）、
 `ui/protocol.py`（`FrontendImageAttachment`）、`voice/`、
 `tools/image_to_text_tool.py`（提交时仓库内版本）；文档解析复用 AINS
 Phase 2 `memory/parser.rs`。
