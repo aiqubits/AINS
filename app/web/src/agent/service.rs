@@ -134,6 +134,9 @@ impl ToolStateService {
     /// 与 `ToolRuntime::import_disabled` 的语义差异（review Nit）：后者
     /// 无条件替换且不检查版本号——存储恢复只能走本方法，误用 runtime 侧
     /// 导入会覆盖用户刚做的未落盘切换（破坏 fail-closed 语义）。
+    // legacy 无 scope 协议仅 Native 测试使用（Web 生产一律走 `_for_scope`
+    // 变体）；wasm 下无调用方，整链门控为 native-only。
+    #[cfg(not(target_arch = "wasm32"))]
     #[cfg_attr(not(test), allow(dead_code))]
     fn apply_from_store(&self, disabled: Vec<String>) {
         let mut guard = self.disabled.write().expect("tool state lock poisoned");
@@ -223,6 +226,7 @@ impl ToolStateService {
     /// （fail-safe 但多一轮无谓落盘，且版本号语义失真）。持读锁期间与
     /// `set_enabled`/`apply_from_store` 的写锁互斥，读取一致；dirty 为
     /// 原子量，读锁内 load 同样安全（与 `has_retained_state` 同模式）。
+    #[cfg(not(target_arch = "wasm32"))]
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn snapshot_with_version(&self) -> (Vec<String>, u64) {
         let guard = self.disabled.read().expect("tool state lock poisoned");
@@ -443,6 +447,8 @@ async fn load_tool_states_value(store: &dyn KvStore, key: &str) -> Result<Vec<St
 /// 横幅提示）。持锁后 load 与 persist 互斥：load 先跑则 persist 无法清
 /// dirty（apply 跳过陈旧值），persist 先跑则 load 读到最终值；锁序与
 /// persist 一致（先 PERSIST_LOCK 后 disabled 锁），无死锁。
+// legacy 无 scope 协议（Native 测试专用；Web 生产走 `_from_scope`）。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn load_tool_states_from(store: &dyn KvStore) -> Result<(), String> {
     // 与持久化写串行化锁互斥（见 PERSIST_LOCK 注释），消除陈旧读窗口
@@ -519,6 +525,7 @@ fn registered_tool_names() -> &'static HashSet<String> {
 /// 落盘核心（测试可注入自定义“已知工具注册表”，避免耦合真实
 /// `tool_schema_snapshot()` 的注册内容）。串行化锁在此获取：
 /// [`persist_tool_states_to`] 的并发调用在锁上排队，后发起者覆盖写最新快照。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn persist_tool_states_to_with_known(
     store: &dyn KvStore,
@@ -603,6 +610,7 @@ async fn persist_tool_states_to_scope(
 /// 读取"上次持久化失败"标记：存在表示最近一次切换未落盘，跨挂载/跨重启
 /// 可能回滚，需继续提示用户。无标记返回 None。视图挂载同步的完整流程见
 /// [`sync_persist_error_on_mount`]。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn pending_persist_error_from(store: &dyn KvStore) -> Option<String> {
     match store.get(TOOL_STATES_PERSIST_ERROR_KEY).await {
@@ -642,6 +650,7 @@ pub async fn sync_persist_error_on_mount(message: &str) {
 /// [`sync_persist_error_on_mount`] 的核心，接收任意存储后端（测试注入
 /// mock）；`in_flight` 为挂载时刻是否存在在途落盘任务（测试可注入，不依赖
 /// 进程级状态机）。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn sync_persist_error_on_mount_from(store: &dyn KvStore, message: &str, in_flight: bool) {
     sync_persist_error_on_mount_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message, in_flight)
@@ -668,6 +677,7 @@ async fn sync_persist_error_on_mount_from_key(
 /// 落盘任务（写/删 marker），无在途任务时重读一次缩小该窗口；有在途
 /// 任务时由任务完成路径（成功清空 / 失败置位信号）收敛最终状态，重读
 /// 反而可能读到写入前的 None 而误清任务即将置位的失败信号，故不重读。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn mount_persist_error_pending(store: &dyn KvStore, in_flight: bool) -> Option<String> {
     mount_persist_error_pending_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, in_flight).await
@@ -696,6 +706,7 @@ async fn pending_persist_error_from_key(store: &dyn KvStore, marker_key: &str) -
 /// 尽力写入"上次持久化失败"标记（panic 恢复与持久化失败路径共用，接收
 /// 任意存储后端供测试注入 mock）。写入失败仅记 warn：存储不可用时该次
 /// 提示缺失可接受（加载失败已有横幅兜底）。
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn record_persist_error_marker_from(store: &dyn KvStore, message: &str) {
     record_persist_error_marker_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message).await;
@@ -755,6 +766,7 @@ pub async fn recover_persist_panic(scope: Option<&str>, message: &str) -> bool {
 /// [`recover_persist_panic`] 的核心，接收任意存储后端（测试注入 mock）。
 /// 返回语义同 [`recover_persist_panic`]（#[must_use]：见其文档）。
 #[must_use]
+#[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(not(test), allow(dead_code))]
 async fn recover_persist_panic_from(store: &dyn KvStore, message: &str) -> bool {
     recover_persist_panic_from_key(store, TOOL_STATES_PERSIST_ERROR_KEY, message).await
@@ -1906,6 +1918,9 @@ fn tool_registry_names() -> HashSet<String> {
 
 /// Tool 面板的轻量入口（Phase 6.7）：仅构造 ToolRuntime 取（name,
 /// description, category）快照，不装配 Kernel/会话恢复/权限通道。
+// wasm 单线程：快照桩 Store 仅在注册表投影路径使用，从不跨线程发送；
+// 与 `SkillLoadTool::new` 的同类 allow 保持一致（wasm 下 Arc 非 Send+Sync）。
+#[cfg_attr(target_arch = "wasm32", allow(clippy::arc_with_non_send_sync))]
 pub fn tool_schema_snapshot() -> Vec<(String, String, ToolCategory)> {
     let (runtime, (_, _, skill_load, skill_resource, _)) = schema_runtime();
     // skill 工具在真实会话装配中必然 attach 存储；快照路径没有（也不该

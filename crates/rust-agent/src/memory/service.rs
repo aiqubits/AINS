@@ -2229,7 +2229,9 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait]
+    // 与 trait 声明保持同一平台条件：wasm 下 `?Send`，native 下 `Send`。
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     impl KvStore for TestKv {
         async fn get(&self, key: &str) -> Result<Option<Value>, MemoryError> {
             Ok(self.0.lock().unwrap().get(key).cloned())

@@ -100,7 +100,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    #[tokio::test]
+    // 双端可跑：native 用 tokio，wasm 用 wasm-bindgen-test（无 tokio 运行时）。
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     async fn in_memory_kv_set_get_delete_round_trip() {
         let kv = InMemoryKvStore::default();
         assert!(kv.get("a").await.unwrap().is_none());
@@ -113,16 +115,15 @@ mod tests {
         assert!(kv.get("a").await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     async fn in_memory_kv_list_prefix_filters_expired_and_other_prefixes() {
         let kv = InMemoryKvStore::default();
         kv.set("p:x", &json!(1), None).await.unwrap();
-        kv.set("p:y", &json!(2), Some(Duration::from_millis(1)))
-            .await
-            .unwrap();
+        kv.set("p:y", &json!(2), Some(Duration::ZERO)).await.unwrap();
         kv.set("q:z", &json!(3), None).await.unwrap();
-        // TTL 1ms 立即过期，惰性清理：读路径（get/list）过滤，不残留
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        // 0ms TTL：写入时点即已过期（at <= now），读路径（get/list）惰性过滤，
+        // 不残留。不依赖 sleep，native 与 wasm（无 tokio::time）行为一致。
         assert!(kv.get("p:y").await.unwrap().is_none());
         let keys = kv.list_prefix("p:").await.unwrap();
         assert_eq!(keys, vec!["p:x".to_string()]);

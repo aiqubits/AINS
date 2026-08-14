@@ -1049,7 +1049,9 @@ mod tests {
         assert_eq!(slugify("  ---  "), "memory");
     }
 
-    #[tokio::test]
+    // 双端可跑：native 用 tokio，wasm 用 wasm-bindgen-test（无 tokio 运行时）。
+    #[cfg_attr(not(target_arch = "wasm32"), tokio::test)]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test::wasm_bindgen_test)]
     async fn upsert_index_line_normalizes_crlf_on_rewrite() {
         use crate::memory::in_memory::InMemoryKvStore;
         use crate::memory::kv::KvStore;

@@ -483,6 +483,9 @@ mod tests {
         assert!(!revoked.consume_authorization());
     }
 
+    // native-only：依赖 NativeSkillFiles 与真实文件系统（temp_dir / 目录清理），
+    // wasm 无 OPFS 测试环境，整体跳过（wasm 端由 tests/web_skills.rs 覆盖）。
+    #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn create_validation_failure_does_not_consume_authorization() {
         use crate::memory::{InMemoryKvStore, KvStore};
