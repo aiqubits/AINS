@@ -6,22 +6,23 @@ repos:
       #   - pip install pre-commit
       #   - pre-commit install
       #   - Rust toolchain (stable) with the `wasm32-unknown-unknown` target
-      #     for the web crate: `rustup target add wasm32-unknown-unknown`
+      #     for the wasm32 clippy hook (web / client-api / rust-agent):
+      #     `rustup target add wasm32-unknown-unknown`
       #   - PostgreSQL & Redis for integration tests (not required for
-      #     pre-commit — `--lib` excludes integration tests)
+      #     pre-commit — server hook 用 `--lib` 排除集成测试，其余包纯离线)
       #   - `cargo` in PATH
       # ========================================
-      # 1. 测试：server / web / client-api
+      # 1. 测试：server / web / client-api / rust-agent
       #    server: 只跑单元测试（排除需 PG/Redis 的集成测试）
       #    web:    无外部依赖
       #    client-api: 使用 wiremock 模拟 HTTP，无需外部服务
+      #    rust-agent: 纯离线（tempfile/redb/wiremock），无外部服务
       # ========================================
       - id: test-server
         name: "test (server)"
         description: 运行 server 单元测试
         entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package ains-server --lib --no-fail-fast"
         language: system
-        types: [rust]
         pass_filenames: false
         always_run: true
         verbose: true
@@ -31,7 +32,6 @@ repos:
         description: 运行 web crate 测试
         entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package web --no-fail-fast"
         language: system
-        types: [rust]
         pass_filenames: false
         always_run: true
         verbose: true
@@ -41,20 +41,57 @@ repos:
         description: 运行 client-api 测试（含 wiremock 集成测试）
         entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package client-api --no-fail-fast"
         language: system
-        types: [rust]
+        pass_filenames: false
+        always_run: true
+        verbose: true
+
+      - id: test-rust-agent
+        name: "test (rust-agent)"
+        description: 运行 rust-agent 测试（纯离线，与 CI rust-agent job 对齐）
+        entry: sh -c "AINS_SYS_NO_PROXY=true cargo test --package rust-agent --no-fail-fast"
+        language: system
         pass_filenames: false
         always_run: true
         verbose: true
 
       # ========================================
-      # 2. Clippy：所有 crate
+      # 2. Clippy：所有 crate（native）+ wasm32 target
+      #    clippy-all: 全 workspace native（all-targets + all-features）
+      #    clippy-wasm32-*: 拆分为三个 hook 与 CI 三 job 一一对应，失败时
+      #    同时暴露所有包的问题（`&&` 链式会在首个失败处短路）
       # ========================================
       - id: clippy-all
         name: "clippy (all)"
         description: 对所有 crate 运行 Clippy 静态分析
         entry: cargo clippy --all-targets --all-features --future-incompat-report -- -D warnings
         language: system
-        types: [rust]
+        pass_filenames: false
+        always_run: true
+        verbose: true
+
+      - id: clippy-wasm32-web
+        name: "clippy (wasm32 web)"
+        description: web crate wasm32 target Clippy（对齐 CI web job）
+        entry: cargo clippy --package web --target wasm32-unknown-unknown --all-targets -- -D warnings
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+
+      - id: clippy-wasm32-client-api
+        name: "clippy (wasm32 client-api)"
+        description: client-api crate wasm32 target Clippy（对齐 CI client-api job）
+        entry: cargo clippy --package client-api --target wasm32-unknown-unknown -- -D warnings
+        language: system
+        pass_filenames: false
+        always_run: true
+        verbose: true
+
+      - id: clippy-wasm32-rust-agent
+        name: "clippy (wasm32 rust-agent)"
+        description: rust-agent crate wasm32 target Clippy（对齐 CI rust-agent job）
+        entry: cargo clippy --package rust-agent --target wasm32-unknown-unknown --all-targets -- -D warnings
+        language: system
         pass_filenames: false
         always_run: true
         verbose: true
@@ -67,7 +104,6 @@ repos:
         description: 检查所有 crate 的 Rust 代码格式
         entry: cargo fmt --check
         language: system
-        types: [rust]
         pass_filenames: false
         always_run: true
         verbose: true
