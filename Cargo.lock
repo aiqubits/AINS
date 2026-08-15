@@ -8613,6 +8613,7 @@ dependencies = [
  "dioxus-icons",
  "gloo-timers",
  "i18n",
+ "pulldown-cmark",
  "serde_json",
  "tokio",
 ]

@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{Check, ChevronDown, ChevronRight, CircleStop, Copy, SendHorizontal};
+use pulldown_cmark::{Event, LinkType, Options, Parser, Tag, TagEnd};
 
 use crate::{EN, I18nContext, tf};
 
@@ -22,7 +23,7 @@ pub enum ToolCallStatus {
 /// 对话流单个条目（宿主从 `StreamEvent` 映射产出）。
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatItem {
-    /// 普通文本消息（Markdown 原文按纯文本渲染，保留换行）。
+    /// 普通文本消息（使用安全的 GitHub Markdown 渲染）。
     Text { role: ChatRole, text: String },
     /// 工具调用卡片：Started 时创建为 Running，Completed 后落定。
     ToolCall {
@@ -228,10 +229,18 @@ pub fn ChatView(
                         (key, item)
                     })
                 {
-                    ChatItemRow { key: "{key}", item: item.clone() }
+                    ChatItemRow { key: "{key}", item: item.clone(), markdown_key: key }
                 }
                 if !snapshot.streaming_text.is_empty() {
-                    TextMessage { role: ChatRole::Assistant, text: snapshot.streaming_text }
+                    // 流式增量到达频繁。落定前保持纯文本，避免每个 delta 都
+                    // 重新解析全文并替换整段 HTML；TurnComplete 后会作为普通
+                    // Text 条目以完整 GitHub Markdown 渲染。
+                    TextMessage {
+                        role: ChatRole::Assistant,
+                        text: snapshot.streaming_text,
+                        markdown_key: u64::MAX,
+                        render_markdown: false,
+                    }
                 } else if snapshot.busy {
                     div { class: "ains-chat__thinking", {t.chat_thinking} }
                 }
@@ -255,12 +264,12 @@ pub fn ChatView(
 }
 
 #[component]
-fn ChatItemRow(item: ChatItem) -> Element {
+fn ChatItemRow(item: ChatItem, markdown_key: u64) -> Element {
     let i18n = try_use_context::<I18nContext>();
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
 
     match item {
-        ChatItem::Text { role, text } => rsx! { TextMessage { role, text } },
+        ChatItem::Text { role, text } => rsx! { TextMessage { role, text, markdown_key } },
         ChatItem::ToolCall {
             name,
             input_preview,
@@ -294,9 +303,370 @@ fn ChatItemRow(item: ChatItem) -> Element {
     }
 }
 
+/// Whether a Markdown link/image destination is safe to place in a rendered
+/// HTML attribute.  Markdown comes from both the model and conversation
+/// history, so it must be treated as untrusted input.
+fn is_safe_markdown_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with('#') {
+        return true;
+    }
+
+    // A destination without a scheme is a same-origin relative URL.  Reject
+    // protocol-relative and backslash forms because browsers may interpret
+    // them as cross-origin URLs.
+    if !trimmed.starts_with("//")
+        && !trimmed.starts_with("/\\")
+        && !trimmed.starts_with('\\')
+        && !trimmed.contains(':')
+    {
+        return true;
+    }
+
+    trimmed.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.eq_ignore_ascii_case("https")
+            || scheme.eq_ignore_ascii_case("http")
+            || scheme.eq_ignore_ascii_case("mailto")
+    })
+}
+
+/// The production web CSP permits only same-origin images.  Keep this policy
+/// in the shared renderer too, so Web and Desktop don't display different
+/// content or silently fail to load remote images.
+fn is_safe_same_origin_image_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    !trimmed.is_empty()
+        && !trimmed.starts_with("//")
+        && !trimmed.starts_with("/\\")
+        && (trimmed.starts_with('/')
+            || trimmed.starts_with("./")
+            || trimmed.starts_with("../")
+            || (!trimmed.starts_with('\\') && !trimmed.contains(':')))
+}
+
+#[derive(Clone, Copy)]
+enum ImageRenderMode {
+    Image,
+    Link,
+    AltText,
+}
+
+fn is_email_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric()
+        || matches!(
+            byte,
+            b'.' | b'!'
+                | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'/'
+                | b'='
+                | b'?'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'{'
+                | b'|'
+                | b'}'
+                | b'~'
+                | b'-'
+                | b'@'
+        )
+}
+
+/// Find a GFM-style bare HTTP(S) URL or email address in a plain text node.
+/// The parser already separates Markdown links and code from text events, so
+/// this deliberately runs only on text that is safe to turn into a link.
+fn find_bare_autolink(text: &str, from: usize) -> Option<(usize, usize, LinkType, String)> {
+    let bytes = text.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        let previous_is_word = index > 0
+            && (bytes[index - 1].is_ascii_alphanumeric()
+                || matches!(bytes[index - 1], b'.' | b'-' | b'_' | b'/'));
+        // Email local parts accept substantially more punctuation than URLs.
+        // Treat that whole sequence as one candidate so malformed input such
+        // as `a!a!a` is scanned once rather than once per segment.
+        let previous_is_email_token = index > 0 && is_email_token_byte(bytes[index - 1]);
+
+        let remaining = &text[index..];
+        let url_prefix = if remaining
+            .get(.."https://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("https://"))
+        {
+            Some(("https://".len(), false))
+        } else if remaining
+            .get(.."http://".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("http://"))
+        {
+            Some(("http://".len(), false))
+        } else if remaining
+            .get(.."www.".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("www."))
+        {
+            Some(("www.".len(), true))
+        } else {
+            None
+        };
+        if !previous_is_word && let Some((scheme_len, add_http_scheme)) = url_prefix {
+            let mut end = index + scheme_len;
+            let mut opening_parentheses = 0usize;
+            let mut closing_parentheses = 0usize;
+            while end < bytes.len()
+                && !bytes[end].is_ascii_whitespace()
+                && !matches!(bytes[end], b'<' | b'>' | b'"' | b'\'')
+            {
+                match bytes[end] {
+                    b'(' => opening_parentheses += 1,
+                    b')' => closing_parentheses += 1,
+                    _ => {}
+                }
+                end += 1;
+            }
+            let mut link_end = end;
+            while link_end > index + scheme_len
+                && matches!(bytes[link_end - 1], b'.' | b',' | b'!' | b'?' | b';' | b':')
+            {
+                link_end -= 1;
+            }
+            while link_end > index + scheme_len
+                && bytes[link_end - 1] == b')'
+                && closing_parentheses > opening_parentheses
+            {
+                link_end -= 1;
+                closing_parentheses -= 1;
+            }
+            if link_end > index + scheme_len {
+                let url = text[index..link_end].to_string();
+                let destination = if add_http_scheme {
+                    format!("http://{url}")
+                } else {
+                    url
+                };
+                return Some((index, link_end, LinkType::Autolink, destination));
+            }
+        }
+
+        if !previous_is_email_token && bytes[index].is_ascii_alphanumeric() {
+            let mut end = index;
+            while end < bytes.len() && is_email_token_byte(bytes[end]) {
+                end += 1;
+            }
+            let mut email_end = end;
+            while email_end > index && bytes[email_end - 1] == b'.' {
+                email_end -= 1;
+            }
+            let candidate = &text[index..email_end];
+            if let Some((local, domain)) = candidate.split_once('@')
+                && !local.is_empty()
+                && !domain.is_empty()
+                && !domain.starts_with('-')
+                && !domain.ends_with('-')
+                && domain.contains('.')
+                && !domain.contains('@')
+            {
+                return Some((index, email_end, LinkType::Email, candidate.to_string()));
+            }
+        }
+
+        index += text[index..]
+            .chars()
+            .next()
+            .expect("index is within a UTF-8 string")
+            .len_utf8();
+    }
+    None
+}
+
+fn autolink_text_events(text: &str) -> Vec<Event<'static>> {
+    let mut events = Vec::new();
+    let mut cursor = 0;
+    while let Some((start, end, link_type, destination)) = find_bare_autolink(text, cursor) {
+        if cursor < start {
+            events.push(Event::Text(text[cursor..start].to_string().into()));
+        }
+        events.push(Event::Start(Tag::Link {
+            link_type,
+            dest_url: destination.into(),
+            title: "".into(),
+            id: "".into(),
+        }));
+        events.push(Event::Text(text[start..end].to_string().into()));
+        events.push(Event::End(TagEnd::Link));
+        cursor = end;
+    }
+    if cursor < text.len() {
+        events.push(Event::Text(text[cursor..].to_string().into()));
+    }
+    events
+}
+
+/// A message-local footnote name prevents duplicate DOM IDs when several chat
+/// turns use common labels such as `[^1]`.
+fn namespaced_footnote_name(message_key: u64, name: &str) -> String {
+    format!("ains-footnote-{message_key}-{name}")
+}
+
+/// Render the GitHub-flavored Markdown subset used by agent replies.
+///
+/// `pulldown-cmark` escapes text but intentionally passes raw HTML through.
+/// Convert those events back to text and drop unsafe link wrappers before using
+/// Dioxus's `dangerous_inner_html`; the generated markup then contains only
+/// parser-owned tags and escaped untrusted content.
+fn render_github_markdown(markdown: &str, message_key: u64) -> String {
+    let options = Options::ENABLE_TABLES
+        | Options::ENABLE_FOOTNOTES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS;
+    let mut image_modes = Vec::new();
+    // Keep an entry for each source link so that its closing event mirrors the
+    // decision made at its opening event.  An unsafe destination must not turn
+    // into `href=""`: browsers interpret that as a navigation to this page.
+    let mut link_modes = Vec::new();
+    let mut link_depth = 0usize;
+    let parser = Parser::new_ext(markdown, options).filter_map(move |event| match event {
+        Event::Html(html) | Event::InlineHtml(html) => Some(Event::Text(html)),
+        Event::FootnoteReference(name) => Some(Event::FootnoteReference(
+            namespaced_footnote_name(message_key, &name).into(),
+        )),
+        Event::Start(Tag::FootnoteDefinition(name)) => Some(Event::Start(Tag::FootnoteDefinition(
+            namespaced_footnote_name(message_key, &name).into(),
+        ))),
+        Event::Start(Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            let is_safe = link_type == LinkType::Email || is_safe_markdown_url(&dest_url);
+            link_modes.push(is_safe);
+            link_depth += 1;
+            is_safe.then_some(Event::Start(Tag::Link {
+                link_type,
+                // Keep an email autolink exactly as parsed.  Other URLs are
+                // normalized before insertion so whitespace-only destinations
+                // cannot become an empty-document navigation.
+                dest_url: if link_type == LinkType::Email {
+                    dest_url
+                } else {
+                    dest_url.trim().to_string().into()
+                },
+                title,
+                id,
+            }))
+        }
+        Event::End(TagEnd::Link) => {
+            link_depth = link_depth.saturating_sub(1);
+            link_modes
+                .pop()
+                .unwrap_or(false)
+                .then_some(Event::End(TagEnd::Link))
+        }
+        Event::Start(Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        }) => {
+            let mode = if is_safe_same_origin_image_url(&dest_url) {
+                ImageRenderMode::Image
+            } else if is_safe_markdown_url(&dest_url) && link_depth == 0 {
+                // Remote images are blocked by the Web CSP.  Retain their
+                // useful destination without making a background request.
+                // A link cannot contain another link, so inside an existing
+                // anchor we instead preserve just the image's alt text.
+                ImageRenderMode::Link
+            } else {
+                ImageRenderMode::AltText
+            };
+            image_modes.push(mode);
+            match mode {
+                ImageRenderMode::Image => Some(Event::Start(Tag::Image {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                })),
+                ImageRenderMode::Link => {
+                    link_depth += 1;
+                    Some(Event::Start(Tag::Link {
+                        link_type,
+                        dest_url,
+                        title,
+                        id,
+                    }))
+                }
+                ImageRenderMode::AltText => None,
+            }
+        }
+        Event::End(TagEnd::Image) => match image_modes.pop() {
+            Some(ImageRenderMode::Image) => Some(Event::End(TagEnd::Image)),
+            Some(ImageRenderMode::Link) => {
+                link_depth = link_depth.saturating_sub(1);
+                Some(Event::End(TagEnd::Link))
+            }
+            Some(ImageRenderMode::AltText) | None => None,
+        },
+        event => Some(event),
+    });
+    let mut link_depth = 0usize;
+    let mut image_depth = 0usize;
+    let mut code_block_depth = 0usize;
+    let parser = parser.flat_map(move |event| match event {
+        Event::Start(tag @ Tag::Link { .. }) => {
+            link_depth += 1;
+            vec![Event::Start(tag)]
+        }
+        Event::End(TagEnd::Link) => {
+            link_depth = link_depth.saturating_sub(1);
+            vec![Event::End(TagEnd::Link)]
+        }
+        Event::Start(tag @ Tag::Image { .. }) => {
+            image_depth += 1;
+            vec![Event::Start(tag)]
+        }
+        Event::End(TagEnd::Image) => {
+            image_depth = image_depth.saturating_sub(1);
+            vec![Event::End(TagEnd::Image)]
+        }
+        Event::Start(tag @ Tag::CodeBlock(_)) => {
+            code_block_depth += 1;
+            vec![Event::Start(tag)]
+        }
+        Event::End(TagEnd::CodeBlock) => {
+            code_block_depth = code_block_depth.saturating_sub(1);
+            vec![Event::End(TagEnd::CodeBlock)]
+        }
+        Event::Text(text) if link_depth == 0 && image_depth == 0 && code_block_depth == 0 => {
+            autolink_text_events(&text)
+        }
+        event => vec![event],
+    });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, parser);
+    html
+}
+
 /// 单条文本消息。操作区位于消息框外侧，以便与消息内容清晰分隔。
 #[component]
-fn TextMessage(role: ChatRole, text: String) -> Element {
+fn TextMessage(
+    role: ChatRole,
+    text: String,
+    /// Stable ChatView item key used to namespace generated Markdown IDs.
+    markdown_key: u64,
+    /// Streaming content is rendered as text until the final message arrives;
+    /// parsing every partial response would repeatedly rebuild a growing HTML
+    /// subtree and make long replies lag.
+    #[props(default = true)]
+    render_markdown: bool,
+) -> Element {
     let i18n = try_use_context::<I18nContext>();
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
     let (message_class, bubble_class, meta_class, label) = match role {
@@ -320,13 +690,22 @@ fn TextMessage(role: ChatRole, text: String) -> Element {
         ),
     };
 
+    let markdown_html = render_markdown.then(|| render_github_markdown(&text, markdown_key));
+
     rsx! {
         div { class: message_class,
             div { class: bubble_class,
                 if !label.is_empty() {
                     span { class: "ains-chat__role", {label} }
                 }
-                pre { class: "ains-chat__text", "{text}" }
+                if let Some(markdown_html) = markdown_html {
+                    div {
+                        class: "ains-chat__text ains-chat__markdown",
+                        dangerous_inner_html: "{markdown_html}",
+                    }
+                } else {
+                    pre { class: "ains-chat__text ains-chat__text--plain", "{text}" }
+                }
             }
             div { class: meta_class,
                 MessageCopyButton { text }
@@ -655,5 +1034,170 @@ mod tests {
         // `navigator.clipboard` but reject writes because of permissions.
         assert!(script.contains("catch (_)"));
         assert!(script.find("catch (_)").unwrap() < script.find("document.execCommand").unwrap());
+    }
+
+    #[test]
+    fn github_markdown_renders_common_agent_response_elements() {
+        let html = render_github_markdown(
+            "# Title\n\n**bold** and `code`\n\n- [x] done\n- [ ] todo\n\n| A | B |\n| - | - |\n| 1 | 2 |\n\n~~old~~",
+            1,
+        );
+        assert!(html.contains("<h1>Title</h1>"));
+        assert!(html.contains("<strong>bold</strong>"));
+        assert!(html.contains("<code>code</code>"));
+        assert!(html.contains("type=\"checkbox\" checked=\"\""));
+        assert!(html.contains("<table>"));
+        assert!(html.contains("<del>old</del>"));
+    }
+
+    #[test]
+    fn github_markdown_escapes_raw_html_and_unsafe_urls() {
+        let html = render_github_markdown(
+            "<script>alert('xss')</script>\n\n[bad](javascript:alert(1))\n\n[good](https://example.com)",
+            1,
+        );
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("<p>bad</p>"));
+        assert!(!html.contains("href=\"\""));
+        assert!(html.contains("href=\"https://example.com\""));
+
+        let empty = render_github_markdown("[empty]()", 1);
+        assert_eq!(empty, "<p>empty</p>\n");
+    }
+
+    #[test]
+    fn markdown_url_allowlist_accepts_case_insensitive_protocols() {
+        for url in [
+            "HTTPS://example.com/docs",
+            "Http://example.com/docs",
+            "MAILTO:help@example.com",
+        ] {
+            assert!(is_safe_markdown_url(url), "{url}");
+        }
+        assert!(!is_safe_markdown_url("javascript:alert(1)"));
+        assert!(!is_safe_markdown_url("data:text/html,unsafe"));
+        assert!(!is_safe_markdown_url("  "));
+
+        let html = render_github_markdown("[docs](HTTPS://example.com/docs)", 1);
+        assert!(html.contains("href=\"HTTPS://example.com/docs\""));
+    }
+
+    #[test]
+    fn github_markdown_keeps_relative_and_email_links() {
+        let html = render_github_markdown(
+            "[relative](docs/getting-started.md)\n\n<help@example.com>",
+            1,
+        );
+        assert!(html.contains("href=\"docs/getting-started.md\""));
+        assert!(html.contains("href=\"mailto:help@example.com\""));
+    }
+
+    #[test]
+    fn markdown_images_follow_the_web_csp_policy() {
+        let html = render_github_markdown(
+            "![local](/assets/logo.png)\n\n![remote](https://example.com/logo.png)\n\n![unsafe](javascript:alert(1))",
+            1,
+        );
+        assert!(html.contains("<img src=\"/assets/logo.png\" alt=\"local\""));
+        assert!(html.contains("<a href=\"https://example.com/logo.png\">remote</a>"));
+        assert!(!html.contains("<img src=\"https://example.com/logo.png\""));
+        assert!(!html.contains("javascript:"));
+        assert!(html.contains("unsafe"));
+
+        assert!(is_safe_same_origin_image_url("/assets/logo.png"));
+        assert!(is_safe_same_origin_image_url("../assets/logo.png"));
+        assert!(is_safe_same_origin_image_url("assets/logo.png"));
+        assert!(!is_safe_same_origin_image_url("//example.com/logo.png"));
+        assert!(!is_safe_same_origin_image_url(
+            "https://example.com/logo.png"
+        ));
+    }
+
+    #[test]
+    fn remote_image_inside_a_link_keeps_the_outer_link() {
+        let html =
+            render_github_markdown("[![preview](https://example.com/preview.png)](/details)", 1);
+        assert_eq!(html, "<p><a href=\"/details\">preview</a></p>\n");
+        assert!(!html.contains("https://example.com/preview.png"));
+    }
+
+    #[test]
+    fn unsafe_outer_link_does_not_restore_a_remote_image_link() {
+        let html = render_github_markdown(
+            "[![preview](https://example.com/preview.png)](javascript:alert(1))",
+            1,
+        );
+        assert_eq!(html, "<p>preview</p>\n");
+        assert!(!html.contains("href="));
+    }
+
+    #[test]
+    fn user_markdown_readability_rules_preserve_contrast() {
+        let css = include_str!("../assets/styling/chat_view.css");
+        assert!(css.contains(".ains-chat__msg--user .ains-chat__markdown blockquote"));
+        assert!(css.contains("blockquote {\n  color: inherit;\n}"));
+        assert!(css.contains(".ains-chat__msg--user .ains-chat__markdown code"));
+        assert!(css.contains(".ains-chat__msg--user .ains-chat__markdown th"));
+        assert!(css.contains("color: var(--color-text-primary)"));
+    }
+
+    #[test]
+    fn footnotes_are_namespaced_by_stable_message_key() {
+        let first = render_github_markdown("first[^1]\n\n[^1]: note", 41);
+        let second = render_github_markdown("second[^1]\n\n[^1]: note", 42);
+
+        assert!(first.contains("href=\"#ains-footnote-41-1\""));
+        assert!(first.contains("id=\"ains-footnote-41-1\""));
+        assert!(second.contains("href=\"#ains-footnote-42-1\""));
+        assert!(second.contains("id=\"ains-footnote-42-1\""));
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn github_markdown_autolinks_bare_urls_and_emails_without_touching_code_or_links() {
+        let html = render_github_markdown(
+            "说明： https://example.com/guide. Mirror: www.example.com. Upper: HTTPS://EXAMPLE.COM/path. WWW: WWW.Example.com. Email: help@example.com.\n\n`https://example.com/code`\n\n[existing](https://example.com/existing)",
+            1,
+        );
+        assert!(
+            html.contains("<a href=\"https://example.com/guide\">https://example.com/guide</a>.")
+        );
+        assert!(html.contains("<a href=\"mailto:help@example.com\">help@example.com</a>."));
+        assert!(html.contains("<a href=\"http://www.example.com\">www.example.com</a>."));
+        assert!(
+            html.contains("<a href=\"HTTPS://EXAMPLE.COM/path\">HTTPS://EXAMPLE.COM/path</a>.")
+        );
+        assert!(html.contains("<a href=\"http://WWW.Example.com\">WWW.Example.com</a>."));
+        assert!(html.contains("<code>https://example.com/code</code>"));
+        assert_eq!(
+            html.matches("href=\"https://example.com/existing\"")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn bare_autolink_trims_many_unmatched_closing_parentheses_in_linear_time() {
+        let trailing_parentheses = ")".repeat(4_096);
+        let input = format!("https://example.com/path{trailing_parentheses}");
+
+        let (start, end, link_type, destination) = find_bare_autolink(&input, 0).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(end, "https://example.com/path".len());
+        assert_eq!(link_type, LinkType::Autolink);
+        assert_eq!(destination, "https://example.com/path");
+    }
+
+    #[test]
+    fn email_autolink_scans_punctuation_token_once_and_keeps_valid_addresses() {
+        let malformed = "a!".repeat(4_096);
+        assert!(find_bare_autolink(&malformed, 0).is_none());
+
+        let html = render_github_markdown("Contact ops+alerts@example.com.", 1);
+        assert!(
+            html.contains("<a href=\"mailto:ops+alerts@example.com\">ops+alerts@example.com</a>.")
+        );
     }
 }

@@ -204,9 +204,137 @@
 
 .ains-chat__text {
   margin: 0;
-  white-space: pre-wrap;
   word-break: break-word;
   font-family: inherit;
+}
+
+.ains-chat__text--plain {
+  white-space: pre-wrap;
+}
+
+/* GitHub Markdown output.  Keep all layout scoped to message bubbles so the
+   rendered document cannot affect the surrounding application. */
+.ains-chat__markdown > :first-child {
+  margin-top: 0;
+}
+
+.ains-chat__markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.ains-chat__markdown p,
+.ains-chat__markdown ul,
+.ains-chat__markdown ol,
+.ains-chat__markdown blockquote,
+.ains-chat__markdown pre,
+.ains-chat__markdown table,
+.ains-chat__markdown hr {
+  margin: 0.55em 0;
+}
+
+.ains-chat__markdown h1,
+.ains-chat__markdown h2,
+.ains-chat__markdown h3,
+.ains-chat__markdown h4,
+.ains-chat__markdown h5,
+.ains-chat__markdown h6 {
+  margin: 0.7em 0 0.35em;
+  line-height: 1.3;
+}
+
+.ains-chat__markdown h1 { font-size: 1.45em; }
+.ains-chat__markdown h2 { font-size: 1.3em; }
+.ains-chat__markdown h3 { font-size: 1.15em; }
+.ains-chat__markdown h4,
+.ains-chat__markdown h5,
+.ains-chat__markdown h6 { font-size: 1em; }
+
+.ains-chat__markdown ul,
+.ains-chat__markdown ol {
+  padding-left: 1.5em;
+}
+
+.ains-chat__markdown li + li {
+  margin-top: 0.2em;
+}
+
+.ains-chat__markdown blockquote {
+  padding-left: 0.8em;
+  border-left: 3px solid var(--color-border-default);
+  color: var(--color-text-secondary);
+}
+
+.ains-chat__markdown code {
+  padding: 0.12em 0.32em;
+  border-radius: 4px;
+  background: var(--color-border-light);
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+}
+
+.ains-chat__markdown pre {
+  overflow-x: auto;
+  padding: 10px 12px;
+  border-radius: var(--radius-base);
+  background: var(--color-border-light);
+}
+
+.ains-chat__markdown pre code {
+  padding: 0;
+  background: transparent;
+  font-size: 0.88em;
+}
+
+.ains-chat__markdown a {
+  color: var(--color-brand-indigo-deep);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.ains-chat__msg--user .ains-chat__markdown a {
+  color: inherit;
+}
+
+/* User bubbles use white text. Keep blockquotes readable, while Markdown code
+   and table headers receive a pale background and must opt into dark text. */
+.ains-chat__msg--user .ains-chat__markdown blockquote {
+  color: inherit;
+}
+
+.ains-chat__msg--user .ains-chat__markdown code,
+.ains-chat__msg--user .ains-chat__markdown pre,
+.ains-chat__msg--user .ains-chat__markdown th {
+  color: var(--color-text-primary);
+}
+
+.ains-chat__markdown input[type="checkbox"] {
+  margin: 0 0.4em 0 0;
+  vertical-align: middle;
+}
+
+.ains-chat__markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+}
+
+.ains-chat__markdown th,
+.ains-chat__markdown td {
+  padding: 6px 8px;
+  border: 1px solid var(--color-border-default);
+  text-align: left;
+}
+
+.ains-chat__markdown th {
+  background: var(--color-border-light);
+}
+
+.ains-chat__markdown img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-base);
 }
 
 .ains-chat__message-meta {

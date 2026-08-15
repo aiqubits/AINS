@@ -7,6 +7,7 @@ edition.workspace = true
 dioxus = { workspace = true }
 dioxus-icons = { workspace = true }
 i18n = { workspace = true, features = ["dioxus"] }
+pulldown-cmark = { workspace = true }
 serde_json = { workspace = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
