@@ -447,6 +447,44 @@
   font-weight: 600;
 }
 
+.ains-chat__quota-notice {
+  align-self: center;
+  max-width: 460px;
+  padding: 16px;
+  border: 1px solid var(--color-error-border);
+  border-radius: var(--radius-lg);
+  background: var(--color-accent-pink-soft-bg);
+  color: var(--color-text-primary);
+}
+
+.ains-chat__quota-title {
+  font-weight: 600;
+  color: var(--color-error-text);
+}
+
+.ains-chat__quota-description {
+  margin: 6px 0 12px;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.ains-chat__quota-action {
+  display: inline-flex;
+  align-items: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: var(--radius-md);
+  background: var(--color-brand-indigo);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.ains-chat__quota-action:hover {
+  filter: brightness(1.06);
+}
+
 /* ── 工具调用卡片 ── */
 
 .ains-chat__tool {

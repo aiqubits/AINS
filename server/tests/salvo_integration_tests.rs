@@ -69,7 +69,7 @@ async fn test_user_registration() {
 
     let (status, body) = salvo::post_json(&server, "/api/public/auth/register", &payload).await;
     assert_eq!(status, reqwest::StatusCode::OK);
-    // 注册接口返回 { message, user_id, email_verified }，不直接返回 email/name/role
+    // 注册接口返回注册状态，不直接返回 email/name/role。
     assert_eq!(body["message"], "User registered successfully");
     assert!(body["user_id"].is_string(), "user_id should be a string");
     assert_eq!(body["email_verified"], true);

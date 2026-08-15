@@ -24,6 +24,8 @@ use crate::components::now_unix_secs;
 pub enum RegisterOutcome {
     /// 服务端已自动验证，注册完毕即可登录。
     LoggedIn,
+    /// 注册成功，不能安全地自动登录；用户需要在登录页继续完成登录。
+    NeedsManualLogin,
     /// 需要走邮件验证流程。`email` 用于构造 `/verify-email/{email}` 路由。
     NeedsVerification { email: String },
 }
@@ -36,9 +38,53 @@ pub struct PendingRegistration {
     pub remember: bool,
 }
 
+/// 注册后登录页需要展示的反馈。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualLoginNotice {
+    /// 已确认系统启用了微信验证码登录。
+    CaptchaRequired,
+    /// 无法读取当前能力状态；不能安全自动登录，但也不能声称验证码已启用。
+    CaptchaStatusUnknown,
+}
+
+/// 手动登录时验证码输入框的展示与必填策略。
+///
+/// 能力状态未知时仍须展示输入框，避免用户在服务端实际要求验证码时无从输入；
+/// 但不能在前端把它标记为必填，因为服务端也可能实际上未启用该能力。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManualLoginCaptchaPolicy {
+    pub show_input: bool,
+    pub require_input: bool,
+}
+
 /// 判定一个 `ClientError` 是否为鉴权失败（401/403）。
 fn is_auth_failure(err: &ClientError) -> bool {
     matches!(err, ClientError::Other(401, _) | ClientError::Other(403, _))
+}
+
+/// 只有成功读取到“未启用”时才允许自动登录。读取失败时保守地改为手动登录，
+/// 但由 UI 用中性提示说明状态未知，不能错误宣称微信验证码已启用。
+pub(crate) fn manual_login_notice_for_wechat_status(
+    current: Option<bool>,
+) -> Option<ManualLoginNotice> {
+    match current {
+        Some(true) => Some(ManualLoginNotice::CaptchaRequired),
+        Some(false) => None,
+        None => Some(ManualLoginNotice::CaptchaStatusUnknown),
+    }
+}
+
+pub(crate) fn manual_login_captcha_policy(notice: ManualLoginNotice) -> ManualLoginCaptchaPolicy {
+    match notice {
+        ManualLoginNotice::CaptchaRequired => ManualLoginCaptchaPolicy {
+            show_input: true,
+            require_input: true,
+        },
+        ManualLoginNotice::CaptchaStatusUnknown => ManualLoginCaptchaPolicy {
+            show_input: true,
+            require_input: false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -79,6 +125,41 @@ mod tests {
     #[test]
     fn auth_failure_network_is_not() {
         assert!(!is_auth_failure(&ClientError::Network("timeout".into())));
+    }
+
+    #[test]
+    fn manual_login_notice_uses_current_capability() {
+        assert_eq!(
+            manual_login_notice_for_wechat_status(Some(true)),
+            Some(ManualLoginNotice::CaptchaRequired)
+        );
+        assert_eq!(manual_login_notice_for_wechat_status(Some(false)), None);
+    }
+
+    #[test]
+    fn manual_login_notice_is_neutral_when_capability_check_fails() {
+        assert_eq!(
+            manual_login_notice_for_wechat_status(None),
+            Some(ManualLoginNotice::CaptchaStatusUnknown)
+        );
+    }
+
+    #[test]
+    fn manual_login_captcha_policy_keeps_unknown_status_usable() {
+        assert_eq!(
+            manual_login_captcha_policy(ManualLoginNotice::CaptchaRequired),
+            ManualLoginCaptchaPolicy {
+                show_input: true,
+                require_input: true,
+            }
+        );
+        assert_eq!(
+            manual_login_captcha_policy(ManualLoginNotice::CaptchaStatusUnknown),
+            ManualLoginCaptchaPolicy {
+                show_input: true,
+                require_input: false,
+            }
+        );
     }
 
     // ── CurrentUser::is_admin ──
@@ -163,6 +244,8 @@ pub struct AuthState {
     pub token_expires_at: Signal<Option<u64>>,
     pub initialized: Signal<bool>,
     pub pending_registration: Signal<Option<PendingRegistration>>,
+    /// 注册/邮箱验证成功后，通知登录页展示适当的手动登录反馈。
+    pub manual_login_notice: Signal<Option<ManualLoginNotice>>,
     /// 静默刷新进行中标志——防止并发 refresh 请求。
     refreshing: Signal<bool>,
 }
@@ -179,6 +262,7 @@ impl AuthState {
             token_expires_at: Signal::new(None),
             initialized: Signal::new(false),
             pending_registration: Signal::new(None),
+            manual_login_notice: Signal::new(None),
             refreshing: Signal::new(false),
         }
     }
@@ -427,6 +511,18 @@ impl AuthState {
             .await?;
 
         if resp.email_verified {
+            // 注册响应反映的是注册时的配置；自动登录前始终读取当前开关，避免
+            // 服务重启或配置变更后仍错误地提交无验证码登录。
+            let current_wechat_enabled = self
+                .client
+                .wechat_enabled()
+                .await
+                .ok()
+                .map(|response| response.enabled);
+            if let Some(notice) = manual_login_notice_for_wechat_status(current_wechat_enabled) {
+                self.manual_login_notice.set(Some(notice));
+                return Ok(RegisterOutcome::NeedsManualLogin);
+            }
             self.login(email, password, remember, None).await?;
             Ok(RegisterOutcome::LoggedIn)
         } else {

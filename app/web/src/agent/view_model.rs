@@ -9,6 +9,12 @@ use rust_agent::kernel::{
 use serde_json::Value;
 use ui::{ChatItem, ChatRole, ChatViewState, ToolCallStatus};
 
+/// 服务端套餐门禁的稳定错误码。匹配消息而非展示文案，避免将上游网关细节
+/// 泄露到对话区域；该码由 API 的 403 错误信封和流式终态事件共同携带。
+fn is_no_active_plan_error(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("no_active_plan")
+}
+
 /// 恢复会话历史 → 初始 Chat 条目。
 ///
 /// 仅落定 Text 内容；tool_use/tool_result block 无 UI 配对信息，渲染为已
@@ -394,10 +400,14 @@ pub fn apply_stream_event(
             state.busy = false;
             // Kernel 异常结束时不会再有中断确认；允许用户重新发送。
             state.interrupt_pending = false;
-            state.push_item(ChatItem::ErrorNote {
-                text: message,
-                recoverable,
-            });
+            if is_no_active_plan_error(&message) {
+                state.push_item(ChatItem::QuotaNotice);
+            } else {
+                state.push_item(ChatItem::ErrorNote {
+                    text: message,
+                    recoverable,
+                });
+            }
             None
         }
         StreamEvent::Status { message } => {
@@ -762,6 +772,19 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn no_active_plan_becomes_a_friendly_quota_notice() {
+        let mut state = ChatViewState::default();
+        apply_stream_event(
+            &mut state,
+            StreamEvent::Error {
+                message: "request failed: [no_active_plan] no active plan".into(),
+                recoverable: true,
+            },
+        );
+        assert!(matches!(state.items.last(), Some(ChatItem::QuotaNotice)));
     }
 
     #[test]

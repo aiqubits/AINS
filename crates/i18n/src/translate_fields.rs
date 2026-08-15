@@ -40,6 +40,8 @@ translate! {
     auth_forgot_label: "Forgot password?" => "忘记凭证?",
     auth_submit_login: "Log In Now" => "立即登录",
     auth_submit_register: "Sign Up Now" => "立即注册",
+    auth_register_manual_login: "Registration successful. Please log in with your WeChat captcha." => "注册成功，请使用微信验证码登录。",
+    auth_register_manual_login_status_unknown: "Registration successful. Please log in manually; the captcha option will appear if it is required." => "注册成功，请手动登录；如系统要求微信验证码，登录页会显示对应输入框。",
 
     // code_console.rs
     code_console_title: "Request Log" => "服务链路追踪监控",
@@ -537,6 +539,9 @@ translate! {
     chat_compacting: "Compacting context ({phase})" => "上下文压缩中（{phase}）",
     chat_error_recoverable: "Recoverable error" => "可恢复错误",
     chat_error_fatal: "Session failed" => "会话已失败",
+    chat_quota_title: "Unable to start a conversation" => "暂时无法开始对话",
+    chat_quota_description: "Your AI usage quota is exhausted, or you do not have an active plan. Activate a plan or add quota to continue." => "你的 AI 调用额度已用完，或当前未开通可用套餐。开通套餐或补充额度后即可继续使用。",
+    chat_quota_manage: "View plans and quota" => "查看套餐与额度",
     chat_copy: "Copy message" => "复制消息",
     chat_copied: "Copied" => "已复制",
     chat_copy_failed: "Copy failed" => "复制失败",

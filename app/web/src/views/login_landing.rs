@@ -8,7 +8,7 @@ use ui::{AuthForm, AuthMode, AuthPayload, I18nContext, LanguageSwitcher, Languag
 
 use crate::Route;
 use crate::api::{ErrorContext, humanize_error};
-use crate::auth::{AuthState, RegisterOutcome};
+use crate::auth::{AuthState, ManualLoginNotice, RegisterOutcome, manual_login_captcha_policy};
 use crate::components::{HttpMethod, LogBus, push_log_result};
 
 const QRCODE_IMG: Asset = asset!("/assets/qrcode-op.jpg");
@@ -16,6 +16,7 @@ const QRCODE_IMG: Asset = asset!("/assets/qrcode-op.jpg");
 /// 提交表单后的导航动作。
 enum SubmitAction {
     Nothing,
+    ReturnToLogin,
     NavigateToVerify { email: String },
 }
 
@@ -70,7 +71,33 @@ pub fn LoginLanding() -> Element {
     let remember = use_signal(|| false);
     let mut loading = use_signal(|| false);
     let mut error_msg = use_signal(|| Option::<String>::None);
+    let mut info_msg = use_signal(|| Option::<String>::None);
     let mut wechat_enabled = use_signal(|| false);
+    // 若注册后的能力查询失败，仍需让用户能够输入验证码完成登录。未知状态下
+    // 输入框仅展示、不在前端强制必填；确认启用时才强制填写。
+    // 这些状态仅在本次登录页生命周期内有效，避免影响之后的普通登录。
+    let mut manual_captcha_input = use_signal(|| false);
+    let mut manual_captcha_required = use_signal(|| false);
+
+    // 注册或邮箱验证完成后，AuthState 置位一次性通知；登录页消费后展示
+    // 成功反馈。该信号订阅确保本页内从“注册”切回“登录”时也能立即显示。
+    let mut auth_for_manual_login_notice = auth.clone();
+    use_effect(move || {
+        let notice = { *auth_for_manual_login_notice.manual_login_notice.read() };
+        if let Some(notice) = notice {
+            auth_for_manual_login_notice.manual_login_notice.set(None);
+            let captcha_policy = manual_login_captcha_policy(notice);
+            manual_captcha_input.set(captcha_policy.show_input);
+            manual_captcha_required.set(captcha_policy.require_input);
+            let message = match notice {
+                ManualLoginNotice::CaptchaRequired => t.auth_register_manual_login.to_string(),
+                ManualLoginNotice::CaptchaStatusUnknown => {
+                    t.auth_register_manual_login_status_unknown.to_string()
+                }
+            };
+            info_msg.set(Some(message));
+        }
+    });
 
     // 检查服务端是否启用了 WeChat 验证码登录功能
     {
@@ -119,7 +146,8 @@ pub fn LoginLanding() -> Element {
                     remember: Some(remember),
                     loading: *loading.read(),
                     error: error_msg.read().clone(),
-                    show_captcha_input: *wechat_enabled.read(),
+                    info: info_msg.read().clone(),
+                    show_captcha_input: *wechat_enabled.read() || *manual_captcha_input.read(),
                     on_forgot: move |_: MouseEvent| {
                         nav.push(Route::ForgotPassword {});
                     },
@@ -128,7 +156,8 @@ pub fn LoginLanding() -> Element {
                             return;
                         }
                         // 前端表单校验
-                        if payload.mode == AuthMode::Login && *wechat_enabled.read()
+                        if payload.mode == AuthMode::Login
+                            && (*wechat_enabled.read() || *manual_captcha_required.read())
                             && payload.captcha_code.trim().is_empty()
                         {
                             error_msg.set(Some(t.login_captcha_empty.to_string()));
@@ -170,8 +199,9 @@ pub fn LoginLanding() -> Element {
 
                         loading.set(true);
                         error_msg.set(None);
+                        info_msg.set(None);
 
-                        let mode_check = mode;
+                        let mut mode_check = mode;
 
                         spawn(async move {
                             let result: Result<SubmitAction, client_api::ClientError> = match payload_mode {
@@ -211,6 +241,7 @@ pub fn LoginLanding() -> Element {
                                     }
                                     res.map(|outcome| match outcome {
                                         RegisterOutcome::LoggedIn => SubmitAction::Nothing,
+                                        RegisterOutcome::NeedsManualLogin => SubmitAction::ReturnToLogin,
                                         RegisterOutcome::NeedsVerification { email } => {
                                             SubmitAction::NavigateToVerify {
                                                 email,
@@ -222,6 +253,9 @@ pub fn LoginLanding() -> Element {
                             loading.set(false);
                             match result {
                                 Ok(SubmitAction::Nothing) => {}
+                                Ok(SubmitAction::ReturnToLogin) => {
+                                    mode_check.set(AuthMode::Login);
+                                }
                                 Ok(SubmitAction::NavigateToVerify { email }) => {
                                     nav_async.push(Route::VerifyEmail { email });
                                 }

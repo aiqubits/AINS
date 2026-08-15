@@ -16,7 +16,7 @@ use ui::{I18nContext, tf};
 
 use crate::Route;
 use crate::api::{ErrorContext, humanize_error};
-use crate::auth::AuthState;
+use crate::auth::{AuthState, manual_login_notice_for_wechat_status};
 use crate::components::{HttpMethod, LogBus, push_log_result};
 
 /// 服务端 `MAX_FAILED_ATTEMPTS = 5`：与 `server/src/services/verification.rs:16` 保持一致。
@@ -135,8 +135,23 @@ pub fn VerifyEmail(email: String) -> Element {
 
             match res {
                 Ok(_) => {
-                    // 验证成功 → 取出 pending → 自动 login
+                    // 验证成功 → 取出 pending。此时重新读取当前开关，避免注册
+                    // 与邮箱验证之间服务端重启/改配置后仍发起无验证码自动登录。
                     if let Some(pending) = auth_async.take_pending_registration() {
+                        let manual_login_notice = auth_async
+                            .client
+                            .wechat_enabled()
+                            .await
+                            .map(|response| response.enabled)
+                            .ok();
+                        if let Some(notice) =
+                            manual_login_notice_for_wechat_status(manual_login_notice)
+                        {
+                            auth_async.manual_login_notice.set(Some(notice));
+                            loading.set(false);
+                            nav.replace(Route::LoginLanding {});
+                            return;
+                        }
                         let path_login = "/api/public/auth/login".to_string();
                         let login_res = auth_async
                             .login(&pending.email, &pending.password, pending.remember, None)

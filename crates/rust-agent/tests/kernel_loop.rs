@@ -906,6 +906,43 @@ async fn retry_event_surfaces_as_status() {
 }
 
 #[tokio::test]
+async fn terminal_retry_surfaces_once_as_error_without_missing_final_message() {
+    let model = Arc::new(ScriptedModelClient::new(vec![vec![
+        ModelStreamEvent::Retry {
+            message: "request failed: [no_active_plan] no active plan".into(),
+            attempt: 4,
+            max_attempts: 4,
+            delay_secs: 0.0,
+        },
+    ]]));
+    let (_, events) = run_kernel(model, vec![], test_config(), vec![user_message("hi")]).await;
+
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            StreamEvent::Error { message, .. } => Some(message),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        errors.len(),
+        1,
+        "terminal retry must emit exactly one error: {events:?}"
+    );
+    assert!(errors[0].contains("no_active_plan"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Status { .. })),
+        "terminal retry must not be rendered as retry status: {events:?}"
+    );
+    assert!(
+        !errors[0].contains("Model stream finished without a final message"),
+        "terminal retry must not fall through to the generic missing-final error"
+    );
+}
+
+#[tokio::test]
 async fn empty_assistant_message_is_ignored_with_error_event() {
     let model = Arc::new(ScriptedModelClient::new(vec![vec![
         ModelStreamEvent::Complete {

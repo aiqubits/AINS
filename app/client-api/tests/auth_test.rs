@@ -422,7 +422,8 @@ async fn test_register_response_missing_email_verified_defaults_to_false() {
         .await;
 
     assert!(result.is_ok());
-    assert!(!result.unwrap().email_verified);
+    let response = result.unwrap();
+    assert!(!response.email_verified);
 }
 
 // ──────────────────────────────────────────────

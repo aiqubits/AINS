@@ -41,6 +41,20 @@ pub enum ChatItem {
     CompactNote { phase: String },
     /// 错误行；`recoverable=false` 表示会话终止。
     ErrorNote { text: String, recoverable: bool },
+    /// 用户没有可用 AI 套餐或调用额度时的可行动提示。
+    ///
+    /// 这与一般错误分开，确保不会把上游网关、HTTP 状态和内部错误码
+    /// 直接暴露给终端用户。
+    QuotaNotice,
+}
+
+/// 宿主提供的套餐管理入口。
+///
+/// UI crate 同时供 Web 和 Desktop 使用；只有具备对应页面的宿主才提供 URL，
+/// 从而避免共享组件硬编码某一端专属路由。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct QuotaManagementLink {
+    pub href: Option<String>,
 }
 
 /// ChatView 渲染状态：条目列表 + 流式尾部增量 + 忙碌位。
@@ -267,6 +281,8 @@ pub fn ChatView(
 fn ChatItemRow(item: ChatItem, markdown_key: u64) -> Element {
     let i18n = try_use_context::<I18nContext>();
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
+    let quota_management_href =
+        try_use_context::<QuotaManagementLink>().and_then(|link| link.href.clone());
 
     match item {
         ChatItem::Text { role, text } => rsx! { TextMessage { role, text, markdown_key } },
@@ -300,6 +316,19 @@ fn ChatItemRow(item: ChatItem, markdown_key: u64) -> Element {
                 }
             }
         }
+        ChatItem::QuotaNotice => rsx! {
+            div { class: "ains-chat__quota-notice",
+                div { class: "ains-chat__quota-title", {t.chat_quota_title} }
+                p { class: "ains-chat__quota-description", {t.chat_quota_description} }
+                if let Some(href) = quota_management_href {
+                    a {
+                        class: "ains-chat__quota-action",
+                        href: href,
+                        {t.chat_quota_manage}
+                    }
+                }
+            }
+        },
     }
 }
 

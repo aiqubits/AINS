@@ -40,6 +40,9 @@ pub fn AuthForm(
     #[props(default)] remember: Option<Signal<bool>>,
     #[props(default = false)] loading: bool,
     #[props(default)] error: Option<String>,
+    /// 非错误状态的流程反馈（如注册成功后请手动完成验证码登录）。
+    #[props(default)]
+    info: Option<String>,
     /// 点击「忘记凭证?」链接时由调用方注入的处理（如导航到密码重置路由）。
     /// 不传则降级为默认行为（链接不可点击）。
     #[props(default)]
@@ -171,6 +174,10 @@ pub fn AuthForm(
 
                 if let Some(err) = error.as_ref() {
                     p { class: "ains-auth__error", "{err}" }
+                }
+
+                if let Some(info) = info.as_ref() {
+                    p { class: "ains-auth__info", "{info}" }
                 }
 
                 if *mode.read() == AuthMode::Login {

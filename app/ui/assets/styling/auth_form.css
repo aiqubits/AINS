@@ -127,6 +127,18 @@
   line-height: 1.5;
 }
 
+.ains-auth__info {
+  margin: 0;
+  padding: 10px 12px;
+  background: rgba(220, 252, 231, 0.7);
+  border: 1px solid rgba(134, 239, 172, 0.7);
+  border-radius: 12px;
+  color: #166534;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
 /* 移动端：减小表单卡片内边距 */
 @media (max-width: 640px) {
   .ains-auth {

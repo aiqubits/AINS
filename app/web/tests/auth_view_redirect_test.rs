@@ -14,6 +14,7 @@ const FORGOT_VIEW: &str = include_str!("../src/views/forgot_password.rs");
 const RESET_VIEW: &str = include_str!("../src/views/reset_password.rs");
 const VERIFY_VIEW: &str = include_str!("../src/views/verify_email.rs");
 const NOT_FOUND_VIEW: &str = include_str!("../src/views/not_found.rs");
+const LOGIN_VIEW: &str = include_str!("../src/views/login_landing.rs");
 
 /// 需要“已登录守卫 → PersonalCenter”的公开鉴权页。
 const AUTH_GUARD_VIEWS: [(&str, &str); 3] = [
@@ -64,5 +65,35 @@ fn not_found_back_targets_public_root_only() {
     assert!(
         !NOT_FOUND_VIEW.contains("Route::PersonalCenter"),
         "not_found.rs 不应指向受保护的 Route::PersonalCenter（未登录用户会被弹开）"
+    );
+}
+
+/// 注册/邮箱验证后的手动登录应始终提供验证码输入；只有确认启用时才在
+/// 前端强制填写。能力状态未知时保持中性提示，不能误导用户系统已开启验证码。
+#[test]
+fn manual_login_notice_distinguishes_confirmed_and_unknown_captcha_status() {
+    assert!(
+        LOGIN_VIEW.contains("let mut manual_captcha_input = use_signal(|| false);"),
+        "登录页需要保留手动验证码输入状态"
+    );
+    assert!(
+        LOGIN_VIEW.contains("let mut manual_captcha_required = use_signal(|| false);"),
+        "登录页需要区分验证码展示与必填状态"
+    );
+    assert!(
+        LOGIN_VIEW.contains("manual_login_captcha_policy(notice)"),
+        "登录页必须使用经过单测的手动登录验证码策略"
+    );
+    assert!(
+        LOGIN_VIEW.contains("*wechat_enabled.read() || *manual_captcha_input.read()"),
+        "能力状态未知时也必须展示验证码输入"
+    );
+    assert!(
+        LOGIN_VIEW.contains("*wechat_enabled.read() || *manual_captcha_required.read()"),
+        "仅确认启用时才在前端强制填写验证码"
+    );
+    assert!(
+        LOGIN_VIEW.contains("auth_register_manual_login_status_unknown"),
+        "能力状态未知时必须显示中性提示，不能宣称微信验证码已启用"
     );
 }

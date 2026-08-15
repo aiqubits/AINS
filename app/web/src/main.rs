@@ -3,7 +3,7 @@ use dioxus::prelude::*;
 use auth::AuthState;
 use components::{AppShellLayout, LogBus, RequireAuth};
 use i18n::Language;
-use ui::I18nContext;
+use ui::{I18nContext, QuotaManagementLink};
 use views::{
     AgentChat, Auth, Channels, Dashboard, ForgotPassword, LoginLanding, Memory, Metering, NotFound,
     Orders, PersonalCenter, Plans, ResetPassword, Settings, Skills, Tenants, Tools, Users,
@@ -134,6 +134,10 @@ fn App() -> Element {
     // Agent 视图（/agent）直接消费 Client 上下文（token 跨 clone 共享），
     // 使 agent_chat 视图可被 desktop 端复用。
     use_context_provider(|| auth.client.clone());
+    // 仅 Web 端提供套餐管理页；共享 ChatView 由此决定是否显示跳转入口。
+    use_context_provider(|| QuotaManagementLink {
+        href: Some("/personal".to_string()),
+    });
 
     // 应用启动时一次性恢复 localStorage 中的会话并拉取真实用户资料。
     // 必须放在路由挂载之前——这样无论首屏路由是 /、/users、/settings 还是 /auth，

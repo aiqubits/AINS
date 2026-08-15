@@ -61,8 +61,8 @@ pub use global_styles::GlobalStyles;
 // Agent UI（Phase 6）—— 纯展示组件，视图模型由宿主从 rust-agent 映射。
 mod chat_view;
 pub use chat_view::{
-    ChatInput, ChatItem, ChatRole, ChatView, ChatViewState, SlashCommandView, ToolCallCard,
-    ToolCallStatus,
+    ChatInput, ChatItem, ChatRole, ChatView, ChatViewState, QuotaManagementLink, SlashCommandView,
+    ToolCallCard, ToolCallStatus,
 };
 
 mod permission_dialog;

@@ -640,6 +640,18 @@ impl<R: RuntimeAdapter> AgentKernel<R> {
                     max_attempts,
                     delay_secs,
                 } => {
+                    // `attempt == max_attempts` is the ModelClient protocol's
+                    // terminal-failure signal (for example an exhausted plan).
+                    // It is not a progress status: emitting one here and then
+                    // falling through to the missing-Complete error produced two
+                    // contradictory, implementation-facing messages in the UI.
+                    if is_terminal_retry(attempt, max_attempts) {
+                        self.emit(StreamEvent::Error {
+                            message,
+                            recoverable: true,
+                        });
+                        return None;
+                    }
                     self.emit(StreamEvent::Status {
                         message: format_retry_status(&message, attempt, max_attempts, delay_secs),
                     });
@@ -836,14 +848,20 @@ fn agent_event_hook_payload(event: &AgentEvent, cwd: &std::path::Path) -> Map<St
 /// `attempt < max_attempts`；终态失败（不可重试/重试耗尽）以
 /// `attempt == max_attempts` 承载，不得渲染为“重试中”误导 UI。
 fn format_retry_status(message: &str, attempt: u32, max_attempts: u32, delay_secs: f32) -> String {
-    if attempt >= max_attempts {
-        format!("Model request failed: {message}")
-    } else {
-        format!(
-            "Request failed; retrying in {delay_secs:.1}s \
-             (attempt {attempt} of {max_attempts}): {message}"
-        )
-    }
+    debug_assert!(
+        attempt < max_attempts,
+        "terminal retry must become StreamEvent::Error"
+    );
+    format!(
+        "Request failed; retrying in {delay_secs:.1}s \
+         (attempt {attempt} of {max_attempts}): {message}"
+    )
+}
+
+/// ModelClient 用 `attempt == max_attempts` 表示终态失败；大于也按终态
+/// 防御性处理，避免异常上游事件被误显示为重试进度。
+fn is_terminal_retry(attempt: u32, max_attempts: u32) -> bool {
+    attempt >= max_attempts
 }
 
 /// 传输层错误的用户可读归一化（对齐基线网络启发式分类）。
@@ -873,15 +891,9 @@ mod tests {
     }
 
     #[test]
-    fn format_retry_status_terminal_failure_not_rendered_as_retrying() {
-        // 回归：终态事件（attempt == max_attempts，delay 0.0）曾被渲染为
-        // "retrying in 0.0s (attempt 4 of 4)"，误导 UI 显示“重试中”
-        let status = format_retry_status("request failed: [no_active_plan] x", 4, 4, 0.0);
-        assert!(
-            !status.contains("retrying"),
-            "terminal failure must not say retrying: {status}"
-        );
-        assert!(status.contains("Model request failed"));
-        assert!(status.contains("no_active_plan"));
+    fn terminal_retry_is_emitted_as_an_error_not_a_status() {
+        assert!(is_terminal_retry(4, 4));
+        assert!(is_terminal_retry(5, 4));
+        assert!(!is_terminal_retry(3, 4));
     }
 }

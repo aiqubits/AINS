@@ -15,5 +15,6 @@ pub use jwt::{JwtPayload, decode_payload};
 #[allow(unused_imports)] // PendingRegistration is part of the public API surface
 // (referenced by `AuthState::pending_registration` field type),
 // even if no view consumes it directly.
-pub use state::{AuthState, CurrentUser, PendingRegistration, RegisterOutcome};
+pub use state::{AuthState, CurrentUser, ManualLoginNotice, PendingRegistration, RegisterOutcome};
+pub(crate) use state::{manual_login_captcha_policy, manual_login_notice_for_wechat_status};
 pub use storage::{clear_jwt, clear_token, load_jwt, load_token, save_jwt, save_token};
