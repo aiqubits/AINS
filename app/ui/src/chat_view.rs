@@ -105,6 +105,24 @@ async fn copy_message_text(text: String) -> bool {
     document::eval(&script).await.is_ok()
 }
 
+const CHAT_SCROLL_ID: &str = "ains-chat-scroll";
+const CHAT_FOLLOW_THRESHOLD_PX: f64 = 48.0;
+
+/// A small tolerance prevents fractional scroll positions from disabling
+/// follow mode while the user is visually at the end of the conversation.
+fn is_near_chat_bottom(scroll_top: f64, client_height: i32, scroll_height: i32) -> bool {
+    scroll_top + f64::from(client_height) >= f64::from(scroll_height) - CHAT_FOLLOW_THRESHOLD_PX
+}
+
+fn scroll_chat_to_bottom() {
+    spawn(async move {
+        let _ = document::eval(
+            "const el = document.getElementById('ains-chat-scroll'); if (el) { el.scrollTop = el.scrollHeight; }",
+        )
+        .await;
+    });
+}
+
 impl ChatViewState {
     /// 追加条目并分配稳定 key。
     pub fn push_item(&mut self, item: ChatItem) {
@@ -135,50 +153,102 @@ impl ChatViewState {
     }
 }
 
-/// Chat 对话视图 —— 消息列表 + 流式尾部 + 自动滚动（Phase 6.3）。
+/// Chat 对话视图 —— 消息列表 + 流式尾部 + 条件自动滚动（Phase 6.3）。
 #[component]
-pub fn ChatView(state: ReadSignal<ChatViewState>) -> Element {
+pub fn ChatView(
+    state: ReadSignal<ChatViewState>,
+    /// Monotonically increasing request from the host when the user has
+    /// actively submitted a new prompt. This is intentionally separate from
+    /// stream updates so reading history remains stable.
+    scroll_to_latest_request: ReadSignal<u64>,
+) -> Element {
     let i18n = try_use_context::<I18nContext>();
     let t = i18n.as_ref().map(|c| c.t()).unwrap_or(&EN);
+    // 用户位于消息末尾时跟随流式输出；主动向上阅读历史则保持阅读位置。
+    let mut follow_latest = use_signal(|| true);
+    let mut show_jump_to_latest = use_signal(|| false);
 
-    // 条目或流式文本变化时滚动到底部（与 CodeConsole 同一模式）。
+    // A successful user submission is an explicit intent to see the new turn.
+    // This effect deliberately depends only on the request signal; regular
+    // streamed state changes continue through the conditional effect below.
+    use_effect(move || {
+        let _ = scroll_to_latest_request();
+        follow_latest.set(true);
+        show_jump_to_latest.set(false);
+        scroll_chat_to_bottom();
+    });
+
+    // 只在用户仍位于底部时跟随新内容。`peek` 避免用户单纯滚动历史时
+    // 触发 effect 并错误显示“回到底部”入口。
     use_effect(move || {
         let snapshot = state.read();
         if snapshot.items.is_empty() && snapshot.streaming_text.is_empty() {
             return;
         }
-        spawn(async move {
-            let _ = document::eval(
-                "const el = document.getElementById('ains-chat-scroll'); \
-                 if (el) { el.scrollTop = el.scrollHeight; }",
-            )
-            .await;
-        });
+        if *follow_latest.peek() {
+            show_jump_to_latest.set(false);
+            scroll_chat_to_bottom();
+        } else {
+            show_jump_to_latest.set(true);
+        }
     });
 
     let snapshot = state.read().clone();
     rsx! {
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/chat_view.css") }
-        div { id: "ains-chat-scroll", class: "ains-chat__scroll no-scrollbar",
-            if snapshot.items.is_empty() && snapshot.streaming_text.is_empty() {
-                p { class: "ains-chat__empty", {t.chat_empty_hint} }
+        div { class: "ains-chat__message-pane",
+            div {
+                id: CHAT_SCROLL_ID,
+                class: "ains-chat__scroll no-scrollbar",
+                tabindex: "0",
+                role: "region",
+                aria_label: t.chat_history_label,
+                onscroll: move |event| {
+                    let scroll = event.data();
+                    let near_bottom = is_near_chat_bottom(
+                        scroll.scroll_top(),
+                        scroll.client_height(),
+                        scroll.scroll_height(),
+                    );
+                    follow_latest.set(near_bottom);
+                    if near_bottom {
+                        show_jump_to_latest.set(false);
+                    }
+                },
+                if snapshot.items.is_empty() && snapshot.streaming_text.is_empty() {
+                    p { class: "ains-chat__empty", {t.chat_empty_hint} }
+                }
+                for (key , item) in snapshot
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, item)| {
+                        // 稳定 key；未经 helper 维护时回退索引（旧行为）
+                        let key = snapshot.item_keys.get(idx).copied().unwrap_or(idx as u64);
+                        (key, item)
+                    })
+                {
+                    ChatItemRow { key: "{key}", item: item.clone() }
+                }
+                if !snapshot.streaming_text.is_empty() {
+                    TextMessage { role: ChatRole::Assistant, text: snapshot.streaming_text }
+                } else if snapshot.busy {
+                    div { class: "ains-chat__thinking", {t.chat_thinking} }
+                }
             }
-            for (key , item) in snapshot
-                .items
-                .iter()
-                .enumerate()
-                .map(|(idx, item)| {
-                    // 稳定 key；未经 helper 维护时回退索引（旧行为）
-                    let key = snapshot.item_keys.get(idx).copied().unwrap_or(idx as u64);
-                    (key, item)
-                })
-            {
-                ChatItemRow { key: "{key}", item: item.clone() }
-            }
-            if !snapshot.streaming_text.is_empty() {
-                TextMessage { role: ChatRole::Assistant, text: snapshot.streaming_text }
-            } else if snapshot.busy {
-                div { class: "ains-chat__thinking", {t.chat_thinking} }
+            if show_jump_to_latest() {
+                button {
+                    class: "ains-chat__jump-latest",
+                    r#type: "button",
+                    aria_label: t.chat_scroll_to_bottom,
+                    onclick: move |_| {
+                        follow_latest.set(true);
+                        show_jump_to_latest.set(false);
+                        scroll_chat_to_bottom();
+                    },
+                    ChevronDown { class: "ains-chat__jump-latest-icon" }
+                    span { {t.chat_scroll_to_bottom} }
+                }
             }
         }
     }
@@ -490,6 +560,14 @@ fn filter_slash_suggestions(draft: &str, commands: &[SlashCommandView]) -> Vec<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chat_bottom_tolerance_only_follows_when_visually_near_end() {
+        assert!(is_near_chat_bottom(552.0, 400, 1_000));
+        assert!(is_near_chat_bottom(560.5, 400, 1_000));
+        assert!(!is_near_chat_bottom(551.5, 400, 1_000));
+        assert!(!is_near_chat_bottom(100.0, 400, 1_000));
+    }
 
     fn commands() -> Vec<SlashCommandView> {
         vec![

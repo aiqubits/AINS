@@ -21,6 +21,7 @@ use crate::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::policy::sandbox::ShellRequest;
 use crate::policy::sandbox::{NoopSandbox, Sandbox};
+use crate::prompts::PROMPT_HOOK_SYSTEM_PROMPT;
 
 /// Hook 触发点（对齐 `hooks/events.py`，10 个）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -453,14 +454,10 @@ impl HookExecutor {
                 ..Default::default()
             };
         }
-        // 与基线 prompt 前缀逐字一致（品牌名换 AINS）
-        let system_prompt = "You are validating whether a hook condition passes in AINS. \
-                             Return strict JSON: {\"ok\": true} or {\"ok\": false, \"reason\": \"...\"}."
-            .to_string();
         let request = ModelRequest {
             model: hook.model.clone().or_else(|| self.default_model.clone()),
             messages: vec![ConversationMessage::from_user_text(prompt)],
-            system_prompt: Some(system_prompt),
+            system_prompt: Some(PROMPT_HOOK_SYSTEM_PROMPT.to_string()),
             max_output_tokens: 512,
             tools: Vec::new(),
         };

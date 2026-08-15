@@ -41,6 +41,7 @@ use crate::memory::stores::{ExtractionSessionState, MemoryStores};
 use crate::memory::vector::{MemoryEntry, MemoryNamespace, Metric, VectorIndexConfig};
 use crate::model_client::ModelClient;
 use crate::personalization::contains_secret_material;
+use crate::prompts::durable_memory_extraction_request;
 
 /// embedding contract 在 kv 表中的键（§7.1）。
 pub const EMBEDDING_CONTRACT_KEY: &str = "memory/embedding_contract";
@@ -1175,15 +1176,15 @@ impl MemoryService {
     /// LLM 抽取 + 逐条写入（§9.5–9.6）。
     async fn extract_with_llm(&self, transcript: &str) -> Result<ExtractionOutcome, MemoryError> {
         let manifest = self.build_manifest().await?;
-        let prompt = format!(
-            "Existing memory files:\n{}\n\nRecent conversation:\n{}\n\nReturn JSON only: {{\"memories\": [{{\"title\": str, \"content\": str, \"description\": str, \"type\": \"user|feedback|project|reference\", \"scope\": \"private|project|team\", \"importance\": float, \"ttl_days\": int, \"tags\": [str]}}]}} with at most {} records.",
-            if manifest.is_empty() {
-                "(none)".to_string()
-            } else {
-                manifest.join("\n")
-            },
+        let manifest = if manifest.is_empty() {
+            "(none)".to_string()
+        } else {
+            manifest.join("\n")
+        };
+        let prompt = durable_memory_extraction_request(
+            &manifest,
             transcript,
-            self.config.auto_extract_max_records
+            self.config.auto_extract_max_records,
         );
 
         let request = crate::model_client::ModelRequest {

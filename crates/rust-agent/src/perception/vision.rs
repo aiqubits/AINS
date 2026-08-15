@@ -11,9 +11,7 @@ use crate::error::AgentError;
 use crate::kernel::messages::{ContentBlock, ConversationMessage, Role};
 use crate::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
 use crate::perception::{MAX_IMAGE_BYTES, PerceptionOutcome};
-
-/// 默认图像描述提示词（未显式指定 prompt 时使用）。
-pub const DEFAULT_VISION_PROMPT: &str = "Describe this image in detail.";
+pub use crate::prompts::DEFAULT_VISION_PROMPT;
 
 /// Vision 通道（无状态；采集与模型调用均为方法入口）。
 #[derive(Debug, Clone, Copy, Default)]

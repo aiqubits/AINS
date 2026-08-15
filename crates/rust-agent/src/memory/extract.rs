@@ -15,9 +15,8 @@ use crate::kernel::messages::{ContentBlock, ConversationMessage, Role};
 use crate::memory::kv::{KvStore, now_ms};
 use crate::memory::memdir::{MemdirStore, MemoryScope, MemoryType, NewMemoryEntry, parse_iso_utc};
 use crate::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
-
-/// 抽取 system prompt（逐字对齐基线 `EXTRACTION_SYSTEM_PROMPT`，Harness 名称保留）。
-pub const EXTRACTION_SYSTEM_PROMPT: &str = "You maintain Harness durable memory.\nSave only stable, future-useful facts that are not derivable from current files,\ngit history, or documentation. Prefer updating existing memories conceptually\nover duplicating them. Do not save secrets. If nothing is worth saving, return\n{\"memories\": []}.\n";
+pub use crate::prompts::EXTRACTION_SYSTEM_PROMPT;
+use crate::prompts::legacy_memory_extraction_request;
 
 /// 单次抽取最多保存的记录数（基线 `max_records=3`）。
 pub const MAX_EXTRACT_RECORDS: usize = 3;
@@ -88,15 +87,12 @@ impl MemoryExtractor {
     ) -> Result<ExtractionOutcome, AgentError> {
         let manifest = self.build_manifest().await?;
         let transcript = format_transcript(messages);
-        let prompt = format!(
-            "Existing memory files:\n{}\n\nRecent conversation:\n{}\n\nReturn JSON only: {{\"memories\": [{{\"title\": str, \"content\": str, \"description\": str, \"type\": \"user|feedback|project|reference\", \"scope\": \"private|project|team\"}}]}} with at most {MAX_EXTRACT_RECORDS} records.",
-            if manifest.is_empty() {
-                "(none)".to_string()
-            } else {
-                manifest.join("\n")
-            },
-            transcript
-        );
+        let manifest = if manifest.is_empty() {
+            "(none)".to_string()
+        } else {
+            manifest.join("\n")
+        };
+        let prompt = legacy_memory_extraction_request(&manifest, &transcript, MAX_EXTRACT_RECORDS);
 
         let request = ModelRequest {
             model: None,

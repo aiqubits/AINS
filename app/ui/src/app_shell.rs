@@ -11,6 +11,12 @@ pub fn AppShell(
     sidebar: Element,
     top_header: Element,
     children: Element,
+    /// Route-level modifier for the main viewport container.
+    ///
+    /// The chat view supplies this so the shell itself cannot become a second
+    /// vertical scroll container beside the message list.
+    #[props(default)]
+    main_class: String,
     /// Route-level modifier for views that manage their own scrolling.
     #[props(default)]
     content_class: String,
@@ -19,7 +25,7 @@ pub fn AppShell(
         document::Link { rel: "stylesheet", href: asset!("/assets/styling/app_shell.css") }
         div { class: "ains-app-shell",
             {sidebar}
-            div { class: "ains-app-shell__main",
+            div { class: "ains-app-shell__main {main_class}",
                 {top_header}
                 main { class: "ains-app-shell__content {content_class}", {children} }
             }

@@ -19,6 +19,7 @@ pub mod personalization;
 pub mod platform;
 pub mod plugins;
 pub mod policy;
+pub mod prompts;
 pub mod runtime_adapter;
 pub mod skills;
 pub mod swarm;

@@ -11,10 +11,19 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  min-height: 0;
   height: 100vh;
+  height: 100dvh;
   overflow-y: auto;
   position: relative;
   z-index: 10;
+}
+
+/* The chat has one intentional vertical scroll surface: its message list.
+   Keep the shell from becoming a competing scroll container and making the
+   composer disappear when the conversation gets long. */
+.ains-app-shell__main--chat {
+  overflow: hidden;
 }
 
 .ains-app-shell__content {
@@ -31,6 +40,7 @@
 /* 对话页只有消息列表承担纵向滚动。限制内容容器的溢出，避免页面滚动条与
    消息列表滚动条同时出现；实际滚动由 .ains-chat__scroll 提供。 */
 .ains-app-shell__content--chat {
+  flex: 1 1 auto;
   min-height: 0;
   overflow: hidden;
 }

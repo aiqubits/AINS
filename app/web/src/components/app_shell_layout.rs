@@ -71,6 +71,11 @@ pub fn AppShellLayout() -> Element {
 
     rsx! {
         AppShell {
+            main_class: if is_agent_chat {
+                "ains-app-shell__main--chat".to_string()
+            } else {
+                String::new()
+            },
             content_class: if is_agent_chat {
                 "ains-app-shell__content--chat".to_string()
             } else {

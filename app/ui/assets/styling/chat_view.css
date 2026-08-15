@@ -7,7 +7,10 @@
   display: flex;
   flex-direction: column;
   height: calc(100vh - 132px);
+  height: calc(100dvh - 132px);
   min-height: 420px;
+  min-width: 0;
+  overflow: hidden;
 }
 
 .ains-app-shell__content--chat .ains-agent-chat {
@@ -16,12 +19,54 @@
   height: auto;
 }
 
+/* Desktop renders AgentChat below a separate navbar rather than inside the
+   web app shell.  Below the original 420px minimum's required viewport, let
+   the message pane shrink so the composer stays visible instead of restoring
+   page-level scrolling. */
+@media (max-height: 552px) {
+  .ains-agent-chat {
+    min-height: 0;
+  }
+}
+
 .ains-agent-chat__toolbar {
   display: flex;
   align-items: center;
   gap: 12px;
   padding: 0 16px 8px;
   flex: 0 0 auto;
+}
+
+.ains-agent-chat__status {
+  margin-left: auto;
+  flex: 0 0 auto;
+}
+
+/* Initialization and tool-state failures can include backend diagnostics.
+   Keep those exceptional notices readable without letting them consume the
+   fixed chat viewport or push the composer out of view. */
+.ains-agent-chat__notices {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: min(25vh, 220px);
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  padding: 0 16px 8px;
+}
+
+.ains-agent-chat__notice {
+  margin: 0 0 4px;
+  padding: 8px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.ains-agent-chat__notice--error {
+  color: var(--color-error-text);
+}
+
+.ains-agent-chat__notice--muted {
+  color: var(--color-text-muted);
 }
 
 .ains-agent-chat__todos {
@@ -34,14 +79,60 @@
   overflow-y: auto;
 }
 
+.ains-chat__message-pane {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
 .ains-chat__scroll {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-gutter: stable;
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding: 16px;
+}
+
+.ains-chat__scroll:focus-visible {
+  outline: 2px solid var(--color-brand-indigo-light);
+  outline-offset: -2px;
+}
+
+.ains-chat__jump-latest {
+  position: absolute;
+  left: 50%;
+  bottom: 16px;
+  z-index: 2;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transform: translateX(-50%);
+  padding: 7px 12px;
+  border: 1px solid var(--color-accent-indigo-soft-border);
+  border-radius: var(--radius-full);
+  background: #ffffff;
+  box-shadow: var(--shadow-md);
+  color: var(--color-brand-indigo-deep);
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.ains-chat__jump-latest:hover,
+.ains-chat__jump-latest:focus-visible {
+  background: var(--color-accent-indigo-soft-bg);
+  outline: none;
+}
+
+.ains-chat__jump-latest-icon {
+  width: 14px;
+  height: 14px;
 }
 
 .ains-chat__empty {
@@ -326,6 +417,8 @@
   display: flex;
   flex-direction: column;
   flex: 0 0 auto;
+  z-index: 1;
+  background: var(--color-page-gradient);
 }
 
 /* Slash 命令建议下拉（Phase 6.12） */
@@ -456,8 +549,22 @@
 
 /* Mobile 适配（Phase 6.10） */
 @media (max-width: 640px) {
+  /* The shell intentionally clips page overflow on the chat route.  Let the
+     toolbar wrap here so its mode control and destructive clear action stay
+     reachable instead of overflowing horizontally. */
+  .ains-agent-chat__toolbar {
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 0 12px 8px;
+  }
+  .ains-agent-chat__toolbar .ains-perm-mode {
+    flex: 1 0 100%;
+  }
   .ains-chat__msg {
     max-width: 90%;
+  }
+  .ains-chat__jump-latest {
+    bottom: 12px;
   }
   .ains-chat__input-row {
     padding: 10px 12px;
@@ -472,5 +579,14 @@
   }
   .ains-chat__slash {
     margin: 0 12px 6px;
+  }
+}
+
+@media (max-width: 374px) {
+  .ains-perm-mode {
+    gap: 6px;
+  }
+  .ains-perm-mode__seg {
+    padding-inline: 8px;
   }
 }

@@ -15,6 +15,8 @@ use crate::kernel::messages::{
 };
 use crate::kernel::state::CompactTrigger;
 use crate::model_client::{ModelClient, ModelRequest, ModelStreamEvent};
+pub use crate::prompts::COMPACT_PROMPT;
+use crate::prompts::COMPACTION_SYSTEM_PROMPT;
 
 use futures::StreamExt;
 
@@ -406,30 +408,6 @@ pub fn try_session_memory_compaction(
 
 // ── 第 4 级：LLM 全量摘要（基线 `compact_conversation`）──
 
-/// 无工具压缩提示词（基线 `get_compact_prompt` 的前导 + 模板 + 尾注）。
-pub const COMPACT_PROMPT: &str = "\
-CRITICAL: Respond with TEXT ONLY. Do NOT call any tools. You already have all \
-the context you need in the conversation above.
-
-Your task is to create a detailed summary of the conversation so far. This \
-summary will replace the earlier messages, so it must capture all important \
-information.
-
-First, draft your analysis inside <analysis> tags. Then produce a structured \
-summary inside <summary> tags with these sections:
-1. Primary Request and Intent
-2. Key Technical Concepts
-3. Files and Code Sections (with paths and line numbers)
-4. Errors and Fixes
-5. Problem Solving
-6. All User Messages
-7. Pending Tasks
-8. Current Work
-9. Optional Next Step
-
-REMINDER: Respond with plain text only — an <analysis> block followed by a \
-<summary> block. Tool calls will be rejected.";
-
 /// 抽取 `<summary>` 内容、剥离 `<analysis>`（基线 `format_compact_summary`）。
 pub fn format_compact_summary(raw: &str) -> String {
     let mut text = strip_tag_block(raw, "analysis");
@@ -588,7 +566,7 @@ async fn collect_summary(
     let request = ModelRequest {
         model: model_name.map(str::to_string),
         messages: replace_images_with_placeholders(request_messages),
-        system_prompt: Some("You are a conversation summarizer.".to_string()),
+        system_prompt: Some(COMPACTION_SYSTEM_PROMPT.to_string()),
         max_output_tokens: MAX_OUTPUT_TOKENS_FOR_SUMMARY,
         tools: Vec::new(),
     };

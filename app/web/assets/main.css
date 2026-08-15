@@ -30,6 +30,14 @@ body {
   min-height: 100vh;
 }
 
+/* On the chat route the app shell owns the viewport.  This keeps browser
+   scroll chaining from turning the document into a second message scroller. */
+#main:has(.ains-app-shell__main--chat) {
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
+}
+
 a {
   color: inherit;
   text-decoration: none;

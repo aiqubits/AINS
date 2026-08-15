@@ -31,6 +31,7 @@ use crate::memory::now_ms;
 use crate::model_client::{
     EventStream, ModelClient, ModelRequest, ModelStreamEvent, UsageSnapshot,
 };
+use crate::prompts::TOOL_CALL_PROTOCOL_HEADER;
 use crate::runtime_adapter::RuntimeAdapter;
 
 /// 最大重试次数（基线 `MAX_RETRIES = 3`，总尝试 4 次）。
@@ -265,18 +266,7 @@ pub fn build_ai_request(request: &ModelRequest) -> AiRequest {
 
 /// 工具协议段：可用工具清单 + `<tool_use>` 调用协议说明。
 fn render_tool_protocol(tools: &[crate::tools::ToolDef]) -> String {
-    let mut section = String::from(
-        "# Tool Call Protocol\n\
-         To call a tool, output a block in EXACTLY this format (multiple blocks allowed,\n\
-         IDs must be unique within one reply):\n\
-         <tool_use id=\"call_1\" name=\"tool_name\">\n\
-         {\"arg\": \"value\"}\n\
-         </tool_use>\n\
-         The block content must be the tool input as strict JSON. Tool results will be\n\
-         returned in the next user message inside <tool_result id=\"...\"> blocks.\n\
-         Do not mention these tags to the user or wrap them in code fences.\n\n\
-         ## Available Tools\n",
-    );
+    let mut section = String::from(TOOL_CALL_PROTOCOL_HEADER);
     for tool in tools {
         section.push_str(&format!(
             "- {}: {}\n  input schema: {}\n",

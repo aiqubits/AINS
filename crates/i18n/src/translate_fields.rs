@@ -540,6 +540,8 @@ translate! {
     chat_copy: "Copy message" => "复制消息",
     chat_copied: "Copied" => "已复制",
     chat_copy_failed: "Copy failed" => "复制失败",
+    chat_history_label: "Conversation history" => "对话历史",
+    chat_scroll_to_bottom: "Jump to latest" => "回到最新消息",
 
     // permission_dialog.rs / permission_controls.rs（Phase 6.11）
     perm_dialog_title: "Tool Permission Request" => "工具权限请求",

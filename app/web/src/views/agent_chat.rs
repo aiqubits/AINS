@@ -162,6 +162,9 @@ pub fn AgentChat() -> Element {
     let client = use_context::<Client>();
 
     let mut chat = use_signal(ChatViewState::default);
+    // 仅由用户主动提交触发的“回到最新消息”请求。ChatView 用它区分
+    // 用户新问题与普通流式更新：前者应恢复跟随，后者应保留历史阅读位置。
+    let mut scroll_to_latest_request = use_signal(|| 0u64);
     let mut mode = use_signal(PermissionModeView::default);
     let mut init_error = use_signal(|| None::<String>);
     // 工具状态横幅（恢复失败 + 持久化失败）不再用组件信号/装配时快照：
@@ -614,6 +617,7 @@ pub fn AgentChat() -> Element {
                 engine.allow_for_session("skill_create");
             }
             view_model::push_user(&mut chat.write(), &text);
+            scroll_to_latest_request.set(scroll_to_latest_request().wrapping_add(1));
             agent_status.set(AgentStatusView::Thinking);
             let mut tx = tx;
             spawn(async move {
@@ -674,6 +678,8 @@ pub fn AgentChat() -> Element {
                             Ok(content) => {
                                 let prompt = view_model::skill_prompt(&name, &content);
                                 view_model::push_user(&mut chat.write(), &format!("/skill {name}"));
+                                scroll_to_latest_request
+                                    .set(scroll_to_latest_request().wrapping_add(1));
                                 agent_status.set(AgentStatusView::Thinking);
                                 // 发送成功后才入镜像：Kernel 已退出时快照不残留
                                 // 它从未见过的用户消息（镜像与内核对话保持一致）
@@ -721,6 +727,7 @@ pub fn AgentChat() -> Element {
             return true;
         }
         view_model::push_user(&mut chat.write(), &text);
+        scroll_to_latest_request.set(scroll_to_latest_request().wrapping_add(1));
         agent_status.set(AgentStatusView::Thinking);
         let mut tx = tx;
         spawn(async move {
@@ -935,6 +942,10 @@ pub fn AgentChat() -> Element {
         .read()
         .as_ref()
         .map(|msg| msg.question.clone());
+    let has_chat_notices = init_error.read().is_some()
+        || !ready()
+        || TOOL_STATE_LOAD_ERROR.read().is_some()
+        || PERSIST_ERROR.read().is_some();
 
     rsx! {
         // 工具状态横幅样式（review 低风险 5）：ToolStateBanner 不再内联
@@ -963,55 +974,57 @@ pub fn AgentChat() -> Element {
                     Trash2 { width: 15, height: 15 }
                     span { {t.agent_clear_conversation} }
                 }
-                div { style: "margin-left:auto;",
+                div { class: "ains-agent-chat__status",
                     AgentStatus { status: agent_status() }
                 }
             }
 
-            if let Some(err) = init_error.read().as_ref() {
-                div { style: "padding:16px;color:var(--color-error-text);",
-                    "{t.agent_init_failed}: {err}"
-                }
-            } else if !ready() {
-                div { style: "padding:16px;color:var(--color-text-muted);", {t.agent_initializing} }
-            }
+            if has_chat_notices {
+                div { class: "ains-agent-chat__notices",
+                    if let Some(err) = init_error.read().as_ref() {
+                        div { class: "ains-agent-chat__notice ains-agent-chat__notice--error",
+                            "{t.agent_init_failed}: {err}"
+                        }
+                    } else if !ready() {
+                        div { class: "ains-agent-chat__notice ains-agent-chat__notice--muted",
+                            {t.agent_initializing}
+                        }
+                    }
 
-            // 工具状态恢复失败横幅（与 /tools 视图对称，进程级信号
-            // TOOL_STATE_LOAD_ERROR 共享订阅）：fail-open 回退为全部工具
-            // 活跃，需显式告知用户此前停用可能未生效。本进程已有未落盘
-            // 切换时（review 中等问题 3）加载被跳过、内存清单保留，文案
-            // 需区分，避免误导用户以为停用已失效。文案依据写入信号时的
-            // 失败时刻快照，不随会话期间 dirty 变化而漂移。
-            if let Some((err, retained)) = TOOL_STATE_LOAD_ERROR.read().as_ref() {
-                div { style: "margin:0 16px 8px;",
-                    ToolStateBanner {
-                        message: format!(
-                            "{}: {err}",
-                            if *retained {
-                                t.tool_states_load_failed_local
-                            } else {
-                                t.tool_states_load_failed
-                            },
-                        ),
+                    // 工具状态恢复失败横幅（与 /tools 视图对称，进程级信号
+                    // TOOL_STATE_LOAD_ERROR 共享订阅）：fail-open 回退为全部工具
+                    // 活跃，需显式告知用户此前停用可能未生效。本进程已有未落盘
+                    // 切换时（review 中等问题 3）加载被跳过、内存清单保留，文案
+                    // 需区分，避免误导用户以为停用已失效。文案依据写入信号时的
+                    // 失败时刻快照，不随会话期间 dirty 变化而漂移。
+                    if let Some((err, retained)) = TOOL_STATE_LOAD_ERROR.read().as_ref() {
+                        ToolStateBanner {
+                            message: format!(
+                                "{}: {err}",
+                                if *retained {
+                                    t.tool_states_load_failed_local
+                                } else {
+                                    t.tool_states_load_failed
+                                },
+                            ),
+                        }
+                    }
+
+                    // 上次切换未落盘横幅（与 /tools 视图对称，进程级信号
+                    // PERSIST_ERROR 共享订阅）：落盘任务失败置位、成功清空——会话
+                    // 存活期间实时反映 /tools 面板或本会话内切换的落盘结果，替代
+                    // 原 AgentBridge 装配时一次性快照。Warning 变体与恢复失败
+                    // （Error）区分（review Minor 1）。
+                    if let Some(err) = PERSIST_ERROR.read().as_ref() {
+                        ToolStateBanner {
+                            kind: ToolStateBannerKind::Warning,
+                            message: err.clone(),
+                        }
                     }
                 }
             }
 
-            // 上次切换未落盘横幅（与 /tools 视图对称，进程级信号
-            // PERSIST_ERROR 共享订阅）：落盘任务失败置位、成功清空——会话
-            // 存活期间实时反映 /tools 面板或本会话内切换的落盘结果，替代
-            // 原 AgentBridge 装配时一次性快照。Warning 变体与恢复失败
-            // （Error）区分（review Minor 1）。
-            if let Some(err) = PERSIST_ERROR.read().as_ref() {
-                div { style: "margin:0 16px 8px;",
-                    ToolStateBanner {
-                        kind: ToolStateBannerKind::Warning,
-                        message: err.clone(),
-                    }
-                }
-            }
-
-            ChatView { state: chat }
+            ChatView { state: chat, scroll_to_latest_request }
             // 待办列表（6.12）：仅在有条目时展示
             if !todos.read().is_empty() {
                 div { class: "ains-agent-chat__todos",
