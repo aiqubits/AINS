@@ -4,7 +4,10 @@
 //! 已登录用户自动跳转到 `/dashboard`。
 
 use dioxus::prelude::*;
-use ui::{AuthForm, AuthMode, AuthPayload, I18nContext, LanguageSwitcher, LanguageSwitcherVariant};
+use ui::{
+    AuthForm, AuthMode, AuthPayload, I18nContext, LanguageSwitcher, LanguageSwitcherVariant,
+    Translations,
+};
 
 use crate::Route;
 use crate::api::{ErrorContext, humanize_error};
@@ -18,6 +21,109 @@ enum SubmitAction {
     Nothing,
     ReturnToLogin,
     NavigateToVerify { email: String },
+}
+
+/// 将语义化的手动登录提示按当前语言转换为展示文案。
+///
+/// 不把翻译后的字符串存入 signal，避免用户切换语言后仍看到旧语言的提示。
+fn manual_login_notice_text(t: &Translations, notice: ManualLoginNotice) -> String {
+    match notice {
+        ManualLoginNotice::CaptchaRequired => t.auth_register_manual_login.to_string(),
+        ManualLoginNotice::CaptchaStatusUnknown => {
+            t.auth_register_manual_login_status_unknown.to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dioxus_core::{NoOpMutations, VirtualDom};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use ui::{EN, ZH};
+
+    #[test]
+    fn manual_login_notice_uses_the_current_translation_set() {
+        assert_eq!(
+            manual_login_notice_text(&EN, ManualLoginNotice::CaptchaRequired),
+            EN.auth_register_manual_login
+        );
+        assert_eq!(
+            manual_login_notice_text(&ZH, ManualLoginNotice::CaptchaRequired),
+            ZH.auth_register_manual_login
+        );
+        assert_ne!(
+            manual_login_notice_text(&EN, ManualLoginNotice::CaptchaRequired),
+            manual_login_notice_text(&ZH, ManualLoginNotice::CaptchaRequired)
+        );
+        assert_eq!(
+            manual_login_notice_text(&EN, ManualLoginNotice::CaptchaStatusUnknown),
+            EN.auth_register_manual_login_status_unknown
+        );
+        assert_eq!(
+            manual_login_notice_text(&ZH, ManualLoginNotice::CaptchaStatusUnknown),
+            ZH.auth_register_manual_login_status_unknown
+        );
+    }
+
+    /// 覆盖注册成功提示已经展示后，用户再切换语言的场景。
+    #[test]
+    fn displayed_manual_login_notice_rerenders_in_the_new_language() {
+        static EN_NOTICE_RENDERED: AtomicBool = AtomicBool::new(false);
+        static ZH_NOTICE_RENDERED: AtomicBool = AtomicBool::new(false);
+
+        EN_NOTICE_RENDERED.store(false, Ordering::SeqCst);
+        ZH_NOTICE_RENDERED.store(false, Ordering::SeqCst);
+
+        let mut dom = VirtualDom::new(|| {
+            use_context_provider(|| I18nContext::new(ui::Language::En));
+            let i18n = use_context::<I18nContext>();
+            // 模拟注册完成后已保留的提示状态；该状态跨语言切换保持不变。
+            let manual_login_info = use_signal(|| Some(ManualLoginNotice::CaptchaRequired));
+            let info = (*manual_login_info.read())
+                .map(|notice| manual_login_notice_text(i18n.t(), notice));
+
+            // 语言切换在提交后的 effect 中发生，模拟 LanguageSwitcher 的事件更新，
+            // 而非在渲染过程中写入 signal。
+            let mut switched = use_signal(|| false);
+            let mut i18n_for_switch = i18n;
+            use_effect(move || {
+                if !*switched.read() {
+                    switched.set(true);
+                    i18n_for_switch.set_lang(ui::Language::Zh);
+                }
+            });
+
+            match i18n.lang() {
+                ui::Language::En => {
+                    EN_NOTICE_RENDERED.store(
+                        info.as_deref() == Some(EN.auth_register_manual_login),
+                        Ordering::SeqCst,
+                    );
+                }
+                ui::Language::Zh => {
+                    ZH_NOTICE_RENDERED.store(
+                        info.as_deref() == Some(ZH.auth_register_manual_login),
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+
+            rsx! { p { "{info:?}" } }
+        });
+        dom.rebuild_in_place();
+        dom.render_immediate(&mut NoOpMutations);
+        dom.render_immediate(&mut NoOpMutations);
+
+        assert!(
+            EN_NOTICE_RENDERED.load(Ordering::SeqCst),
+            "提示首次显示时应使用英文"
+        );
+        assert!(
+            ZH_NOTICE_RENDERED.load(Ordering::SeqCst),
+            "切换语言后，已显示的提示应重新渲染为中文"
+        );
+    }
 }
 
 #[component]
@@ -71,7 +177,8 @@ pub fn LoginLanding() -> Element {
     let remember = use_signal(|| false);
     let mut loading = use_signal(|| false);
     let mut error_msg = use_signal(|| Option::<String>::None);
-    let mut info_msg = use_signal(|| Option::<String>::None);
+    // 保留提示的语义状态；实际文案在渲染时按当前 i18n 语言生成。
+    let mut manual_login_info = use_signal(|| Option::<ManualLoginNotice>::None);
     let mut wechat_enabled = use_signal(|| false);
     // 若注册后的能力查询失败，仍需让用户能够输入验证码完成登录。未知状态下
     // 输入框仅展示、不在前端强制必填；确认启用时才强制填写。
@@ -89,13 +196,7 @@ pub fn LoginLanding() -> Element {
             let captcha_policy = manual_login_captcha_policy(notice);
             manual_captcha_input.set(captcha_policy.show_input);
             manual_captcha_required.set(captcha_policy.require_input);
-            let message = match notice {
-                ManualLoginNotice::CaptchaRequired => t.auth_register_manual_login.to_string(),
-                ManualLoginNotice::CaptchaStatusUnknown => {
-                    t.auth_register_manual_login_status_unknown.to_string()
-                }
-            };
-            info_msg.set(Some(message));
+            manual_login_info.set(Some(notice));
         }
     });
 
@@ -124,6 +225,8 @@ pub fn LoginLanding() -> Element {
         loading.set(false);
     });
 
+    let info = (*manual_login_info.read()).map(|notice| manual_login_notice_text(t, notice));
+
     rsx! {
         document::Link {
             rel: "stylesheet",
@@ -146,7 +249,7 @@ pub fn LoginLanding() -> Element {
                     remember: Some(remember),
                     loading: *loading.read(),
                     error: error_msg.read().clone(),
-                    info: info_msg.read().clone(),
+                    info,
                     show_captcha_input: *wechat_enabled.read() || *manual_captcha_input.read(),
                     on_forgot: move |_: MouseEvent| {
                         nav.push(Route::ForgotPassword {});
@@ -199,7 +302,7 @@ pub fn LoginLanding() -> Element {
 
                         loading.set(true);
                         error_msg.set(None);
-                        info_msg.set(None);
+                        manual_login_info.set(None);
 
                         let mut mode_check = mode;
 
