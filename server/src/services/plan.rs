@@ -46,6 +46,8 @@ pub enum PlanError {
     InvalidInput(String),
     #[error("Insufficient balance")]
     InsufficientBalance,
+    #[error("Purchase limit reached")]
+    PurchaseLimitReached,
     #[error("No active plan with remaining calls")]
     NoActivePlan,
     #[error(transparent)]
@@ -61,6 +63,7 @@ pub struct CreatePlanInput {
     pub price: i64,
     pub total_calls: i64,
     pub validity_days: i32,
+    pub purchase_limit: Option<i32>,
     pub status: Option<String>,
 }
 
@@ -72,6 +75,8 @@ pub struct UpdatePlanInput {
     pub price: Option<i64>,
     pub total_calls: Option<i64>,
     pub validity_days: Option<i32>,
+    /// Outer `None` leaves the field unchanged; `Some(None)` removes the limit.
+    pub purchase_limit: Option<Option<i32>>,
     pub status: Option<String>,
 }
 
@@ -81,6 +86,13 @@ pub struct PurchaseOutcome {
     pub user_plan: UserPlanResponse,
     /// The buyer's balance after deduction (stored units).
     pub balance: i64,
+}
+
+/// User-specific availability metadata. Kept separate from `PlanResponse` so
+/// admin plan responses never expose a misleading, context-free usage count.
+pub struct AvailablePlan {
+    pub plan: PlanResponse,
+    pub purchases_used: u64,
 }
 
 pub struct PlanService {
@@ -189,8 +201,14 @@ impl PlanService {
         })
     }
 
-    /// List the active (purchasable) plans of a tenant — user-facing.
-    pub async fn list_available(&self, tenant_id: &str) -> Result<Vec<PlanResponse>, PlanError> {
+    /// List active plans together with the caller's cumulative paid purchase
+    /// count. The aggregate is bounded to this user and grouped in SQL, so the
+    /// response does not require loading their historical instances.
+    pub async fn list_available(
+        &self,
+        tenant_id: &str,
+        user_id: i64,
+    ) -> Result<Vec<AvailablePlan>, PlanError> {
         let items = PlanEntity::find()
             .filter(PlanColumn::TenantId.eq(tenant_id))
             .filter(PlanColumn::Status.eq("active"))
@@ -198,7 +216,33 @@ impl PlanService {
             .all(&*self.db)
             .await
             .context("list available plans")?;
-        Ok(items.into_iter().map(Into::into).collect())
+        let purchase_counts: Vec<(Option<i64>, i64)> = UserPlanEntity::find()
+            .select_only()
+            .column(UserPlanColumn::PlanId)
+            .column_as(UserPlanColumn::Id.count(), "purchase_count")
+            .filter(UserPlanColumn::UserId.eq(user_id))
+            .filter(UserPlanColumn::Source.eq(SOURCE_PURCHASE))
+            .filter(UserPlanColumn::PlanId.is_not_null())
+            .group_by(UserPlanColumn::PlanId)
+            .into_tuple()
+            .all(&*self.db)
+            .await
+            .context("count purchases for available plans")?;
+        let purchase_counts = purchase_counts
+            .into_iter()
+            .filter_map(|(plan_id, count)| plan_id.map(|id| (id, count.max(0) as u64)))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        Ok(items
+            .into_iter()
+            .map(|plan| {
+                let purchases_used = purchase_counts.get(&plan.id).copied().unwrap_or(0);
+                AvailablePlan {
+                    plan: plan.into(),
+                    purchases_used,
+                }
+            })
+            .collect())
     }
 
     pub async fn create(&self, input: CreatePlanInput) -> Result<PlanResponse, PlanError> {
@@ -206,6 +250,7 @@ impl PlanService {
             return Err(PlanError::InvalidInput("name is required".into()));
         }
         validate_plan_numbers(input.price, input.total_calls, input.validity_days as i64)?;
+        validate_purchase_limit(input.purchase_limit)?;
         let status = input.status.unwrap_or_else(|| "active".to_string());
         validate_plan_status(&status)?;
 
@@ -218,6 +263,7 @@ impl PlanService {
             price: Set(input.price),
             total_calls: Set(input.total_calls),
             validity_days: Set(input.validity_days),
+            purchase_limit: Set(input.purchase_limit),
             status: Set(status),
             created_at: Set(now),
             updated_at: Set(now),
@@ -247,6 +293,7 @@ impl PlanService {
             input.total_calls.unwrap_or(plan.total_calls),
             input.validity_days.unwrap_or(plan.validity_days) as i64,
         )?;
+        validate_purchase_limit(input.purchase_limit.unwrap_or(plan.purchase_limit))?;
         if let Some(ref status) = input.status {
             validate_plan_status(status)?;
         }
@@ -269,6 +316,9 @@ impl PlanService {
         }
         if let Some(validity_days) = input.validity_days {
             active.validity_days = Set(validity_days);
+        }
+        if let Some(purchase_limit) = input.purchase_limit {
+            active.purchase_limit = Set(purchase_limit);
         }
         if let Some(status) = input.status {
             active.status = Set(status);
@@ -392,6 +442,18 @@ impl PlanService {
         // both violations read as NotFound (no cross-tenant leak).
         if plan.tenant_id != user.tenant_id || plan.status != "active" {
             return Err(PlanError::NotFound);
+        }
+        if let Some(purchase_limit) = plan.purchase_limit {
+            let purchase_count = UserPlanEntity::find()
+                .filter(UserPlanColumn::UserId.eq(user_id))
+                .filter(UserPlanColumn::PlanId.eq(plan_id))
+                .filter(UserPlanColumn::Source.eq(SOURCE_PURCHASE))
+                .count(&txn)
+                .await
+                .context("count prior plan purchases")?;
+            if purchase_count >= purchase_limit as u64 {
+                return Err(PlanError::PurchaseLimitReached);
+            }
         }
         if user.balance < plan.price {
             return Err(PlanError::InsufficientBalance);
@@ -577,14 +639,15 @@ async fn insert_user_plan<C: ConnectionTrait>(
 /// year 262142) when computing expires_at at grant/purchase time.
 const MAX_VALIDITY_DAYS: i64 = 36_500;
 
-/// Validate that plan numeric fields are strictly positive (and bounded).
+/// Validate that price is non-negative and the remaining numeric fields are
+/// strictly positive (and bounded).
 fn validate_plan_numbers(
     price: i64,
     total_calls: i64,
     validity_days: i64,
 ) -> Result<(), PlanError> {
-    if price <= 0 {
-        return Err(PlanError::InvalidInput("price must be positive".into()));
+    if price < 0 {
+        return Err(PlanError::InvalidInput("price must be non-negative".into()));
     }
     if total_calls <= 0 {
         return Err(PlanError::InvalidInput(
@@ -610,18 +673,24 @@ fn validate_plan_status(status: &str) -> Result<(), PlanError> {
     }
 }
 
+fn validate_purchase_limit(purchase_limit: Option<i32>) -> Result<(), PlanError> {
+    if purchase_limit.is_some_and(|limit| limit <= 0) {
+        return Err(PlanError::InvalidInput(
+            "purchase_limit must be positive when provided".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn plan_numbers_must_be_positive() {
+    fn plan_price_must_be_non_negative_and_other_numbers_positive() {
+        assert!(validate_plan_numbers(0, 1, 1).is_ok());
         assert!(validate_plan_numbers(1, 1, 1).is_ok());
         assert!(validate_plan_numbers(1, 1, MAX_VALIDITY_DAYS).is_ok());
-        assert!(matches!(
-            validate_plan_numbers(0, 1, 1),
-            Err(PlanError::InvalidInput(_))
-        ));
         assert!(matches!(
             validate_plan_numbers(1, 0, 1),
             Err(PlanError::InvalidInput(_))
@@ -660,6 +729,21 @@ mod tests {
     }
 
     #[test]
+    fn purchase_limit_is_optional_and_positive() {
+        assert!(validate_purchase_limit(None).is_ok());
+        assert!(validate_purchase_limit(Some(1)).is_ok());
+        assert!(validate_purchase_limit(Some(i32::MAX)).is_ok());
+        assert!(matches!(
+            validate_purchase_limit(Some(0)),
+            Err(PlanError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            validate_purchase_limit(Some(-1)),
+            Err(PlanError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
     fn scope_rules() {
         assert!(PlanService::in_scope("system", "default", "other"));
         assert!(PlanService::in_scope("admin", "t1", "t1"));
@@ -673,6 +757,10 @@ mod tests {
         assert_eq!(
             PlanError::InsufficientBalance.to_string(),
             "Insufficient balance"
+        );
+        assert_eq!(
+            PlanError::PurchaseLimitReached.to_string(),
+            "Purchase limit reached"
         );
         assert_eq!(
             PlanError::NoActivePlan.to_string(),

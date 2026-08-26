@@ -252,6 +252,8 @@ jobs:
       run: cargo clippy --package web --target wasm32-unknown-unknown --all-targets -- -D warnings
     - name: Run Web Tests
       run: cargo test --package web --verbose
+    - name: Run UI Tests
+      run: cargo test --package ui --verbose
     # 生产构建链路：与 Dockerfile.web 的 `dx build` 完全一致（NO_DOWNLOADS=1
     # + 本地 esbuild/wasm-bindgen-cli/wasm-opt），验证发布产物契约。
     - name: Build Web (dx, matches Dockerfile.web)
@@ -323,6 +325,9 @@ jobs:
     # IndexedDB 等浏览器环境测试仅在 CI 执行（AINS_PLAN Phase 0.5）
     - name: Run wasm tests (headless Chrome)
       run: wasm-pack test --headless --chrome crates/rust-agent
+    # Modal 的 focus/inert/堆叠行为依赖真实 DOM，NoOpDocument 单测无法覆盖。
+    - name: Run UI browser tests (headless Chrome)
+      run: wasm-pack test --headless --chrome app/ui
 
   # ========================================
   # Desktop App CI (Phase 6.2 native agent embedding)

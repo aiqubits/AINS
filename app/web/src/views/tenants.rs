@@ -519,7 +519,12 @@ fn render_delete_confirm(
         .unwrap_or_else(|| t.tenants_no_target.to_string());
     let confirm_delete_title = t.tenants_confirm_delete_title.to_string();
 
-    let on_cancel = move |_: MouseEvent| close_all(signals);
+    let signals_for_cancel = signals;
+    let on_cancel = move |_: MouseEvent| {
+        if !*signals_for_cancel.submitting.read() {
+            close_all(signals_for_cancel);
+        }
+    };
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
@@ -641,7 +646,12 @@ fn render_form_modal(
     let form_status_active = t.tenants_form_status_active.to_string();
     let form_status_disabled = t.tenants_form_status_disabled.to_string();
 
-    let on_close = move |_: MouseEvent| close_all(signals);
+    let signals_for_close = signals;
+    let on_close = move |_: MouseEvent| {
+        if !*signals_for_close.submitting.read() {
+            close_all(signals_for_close);
+        }
+    };
     let mut signals_for_status = signals;
     let pick_active = move |_: MouseEvent| signals_for_status.form_status.set("active".to_string());
     let pick_disabled =
@@ -742,6 +752,7 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
+            disable_close: submitting,
             div { class: "ains-form-stack",
                 if let Some(err) = form_error.as_ref() {
                     p { class: "ains-form-error", "{err}" }

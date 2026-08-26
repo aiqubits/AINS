@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AINS 套餐限购次数原型</title>
+
+  <!-- 直接复用生产页面正在使用的样式，保证原型与现有后台像素级同源。 -->
+  <link rel="stylesheet" href="../../app/ui/assets/styling/tokens.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/button.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/modal.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/app_shell.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/sidebar.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/top_header.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/language_switcher.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/badge.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/data_table.css">
+  <link rel="stylesheet" href="../../app/ui/assets/styling/text_input.css">
+  <link rel="stylesheet" href="../../app/web/assets/main.css">
+
+  <style>
+    [hidden] { display: none !important; }
+    .prototype-svg-sprite { position: absolute; width: 0; height: 0; overflow: hidden; }
+    .prototype-icon { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .prototype-delete:disabled { cursor: not-allowed; opacity: 0.45; }
+    .prototype-modal-submit { margin-top: 2px; }
+    @media (max-width: 767px) {
+      .prototype-sidebar-open { transform: translateX(0); }
+    }
+  </style>
+</head>
+<body>
+  <svg class="prototype-svg-sprite" aria-hidden="true">
+    <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83z"/><path d="m22 12.5-9.17 4.17a2 2 0 0 1-1.66 0L2 12.5"/><path d="m22 17.5-9.17 4.17a2 2 0 0 1-1.66 0L2 17.5"/></symbol>
+    <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M20 7V6a2 2 0 0 0-2-2H5a3 3 0 0 0 0 6h15v8a2 2 0 0 1-2 2H5a3 3 0 0 1-3-3V7"/><path d="M16 14h.01"/></symbol>
+    <symbol id="i-bot" viewBox="0 0 24 24"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2M20 14h2M15 13v2M9 13v2"/></symbol>
+    <symbol id="i-sparkles" viewBox="0 0 24 24"><path d="m12 3-1.9 5.1L5 10l5.1 1.9L12 17l1.9-5.1L19 10l-5.1-1.9zM5 3v4M3 5h4M19 17v4M17 19h4"/></symbol>
+    <symbol id="i-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></symbol>
+    <symbol id="i-wrench" viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5-5L12 3.6 9.6 6 7.3 3.7a4 4 0 0 0 5 5l-9.5 9.5a2 2 0 0 0 2.8 2.8l9.5-9.5a4 4 0 0 0-.4-5.2z"/></symbol>
+    <symbol id="i-user" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="m19 8 2 2-4 4-2-2z"/></symbol>
+    <symbol id="i-server" viewBox="0 0 24 24"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01M6 18h.01"/></symbol>
+    <symbol id="i-route" viewBox="0 0 24 24"><circle cx="6" cy="19" r="3"/><path d="M9 19h6.5a3.5 3.5 0 0 0 0-7h-7a3.5 3.5 0 0 1 0-7H15"/><circle cx="18" cy="5" r="3"/></symbol>
+    <symbol id="i-activity" viewBox="0 0 24 24"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></symbol>
+    <symbol id="i-package" viewBox="0 0 24 24"><path d="m7.5 4.27 9 5.15M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5M12 22V12"/></symbol>
+    <symbol id="i-card" viewBox="0 0 24 24"><rect width="20" height="14" x="2" y="5" rx="2"/><path d="M2 10h20"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M21 12c.552 0 1.005-.449.95-.998a10 10 0 1 0-8.953 10.95C12.449 22.005 12 21.552 12 21V13a1 1 0 0 1 1-1z"/><path d="M21.95 8A10 10 0 0 0 16 2.05V8z"/></symbol>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/></symbol>
+    <symbol id="i-menu" viewBox="0 0 24 24"><path d="M4 12h16M4 6h16M4 18h16"/></symbol>
+    <symbol id="i-language" viewBox="0 0 24 24"><path d="m5 8 6 6M4 14l6-6 2-3M2 5h12M7 2h1M22 22l-5-10-5 10M14 18h6"/></symbol>
+    <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></symbol>
+    <symbol id="i-external-link" viewBox="0 0 24 24"><path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M5 12h14M12 5v14"/></symbol>
+    <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></symbol>
+    <symbol id="i-trash" viewBox="0 0 24 24"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  </svg>
+
+  <div id="main" class="ains-app-shell">
+    <div id="sidebarOverlay" class="ains-sidebar-overlay" hidden></div>
+    <aside id="sidebar" class="ains-sidebar">
+      <div class="ains-sidebar__logo">
+        <div class="ains-sidebar__logo-icon"><svg class="prototype-icon"><use href="#i-layers"/></svg></div>
+        <div class="ains-sidebar__logo-text">
+          <span class="ains-sidebar__logo-title">AINS</span>
+          <span class="ains-sidebar__logo-subtitle">AI 原生系统</span>
+        </div>
+        <button class="ains-sidebar__close" type="button" aria-label="关闭菜单"><svg class="prototype-icon"><use href="#i-close"/></svg></button>
+      </div>
+
+      <nav class="ains-sidebar__nav no-scrollbar">
+        <div class="ains-sidebar__group">
+          <div class="ains-sidebar__group-caption">账户中心</div>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-wallet"/></svg><span class="ains-sidebar__item-label">个人中心</span></button>
+        </div>
+        <div class="ains-sidebar__group">
+          <div class="ains-sidebar__group-caption">AI Agent</div>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-bot"/></svg><span class="ains-sidebar__item-label">智能对话</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-sparkles"/></svg><span class="ains-sidebar__item-label">技能库</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-database"/></svg><span class="ains-sidebar__item-label">记忆库</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-wrench"/></svg><span class="ains-sidebar__item-label">工具面板</span></button>
+        </div>
+        <div class="ains-sidebar__group">
+          <div class="ains-sidebar__group-caption-row"><span class="ains-sidebar__group-caption">数据管理</span><span class="ains-badge ains-badge--amber-compact">admin_layer</span></div>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-user"/></svg><span class="ains-sidebar__item-label">用户管理</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-server"/></svg><span class="ains-sidebar__item-label">租户管理</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-route"/></svg><span class="ains-sidebar__item-label">渠道管理</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-activity"/></svg><span class="ains-sidebar__item-label">用量统计</span></button>
+          <button class="ains-sidebar__item ains-sidebar__item--active" type="button"><svg class="prototype-icon"><use href="#i-package"/></svg><span class="ains-sidebar__item-label">套餐管理</span></button>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-card"/></svg><span class="ains-sidebar__item-label">支付订单</span></button>
+        </div>
+        <div class="ains-sidebar__group">
+          <div class="ains-sidebar__group-caption">系统监控</div>
+          <button class="ains-sidebar__item" type="button"><svg class="prototype-icon"><use href="#i-chart"/></svg><span class="ains-sidebar__item-label">控制中心</span></button>
+        </div>
+      </nav>
+
+      <div class="ains-sidebar__footer">
+        <a class="ains-sidebar__github-card" href="https://github.com/aiqubits/ains" target="_blank" rel="noreferrer">
+          <svg class="ains-sidebar__github-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5A12 12 0 0 0 8.2 23.9c.6.1.8-.3.8-.6v-2.1c-3.3.7-4-1.4-4-1.4-.5-1.4-1.3-1.8-1.3-1.8-1.1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1.1 1.8 2.8 1.3 3.5 1 .1-.8.4-1.3.8-1.6-2.7-.3-5.5-1.3-5.5-5.9 0-1.3.5-2.4 1.2-3.2-.1-.3-.5-1.5.1-3.2 0 0 1-.3 3.3 1.2a11.5 11.5 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.7 1.7.3 2.9.1 3.2.8.8 1.2 1.9 1.2 3.2 0 4.6-2.8 5.6-5.5 5.9.4.4.8 1.1.8 2.2v3.3c0 .3.2.7.8.6A12 12 0 0 0 12 .5Z"/></svg>
+          <div class="ains-sidebar__github-text"><span class="ains-sidebar__github-repo">aiqubits/ains</span><span class="ains-sidebar__github-sub">在 GitHub 上查看源码</span></div>
+          <svg class="ains-sidebar__github-arrow prototype-icon"><use href="#i-external-link"/></svg>
+        </a>
+        <div class="ains-sidebar__copyright"><div>© 2026 AINS Fullstack Framework.</div><div>Powered by </div></div>
+      </div>
+    </aside>
+
+    <div class="ains-app-shell__main">
+      <header class="ains-top-header">
+        <div class="ains-top-header__left">
+          <button id="menuButton" class="ains-top-header__hamburger" type="button" aria-label="打开菜单" aria-controls="sidebar" aria-expanded="false"><svg class="prototype-icon"><use href="#i-menu"/></svg></button>
+          <div class="ains-top-header__search">
+            <svg class="ains-top-header__search-icon prototype-icon"><use href="#i-search"/></svg>
+            <input id="tableSearch" class="ains-top-header__search-input" type="search" aria-label="搜索套餐" placeholder="搜索套餐名称或描述...">
+          </div>
+        </div>
+        <div class="ains-top-header__right">
+          <button class="ls-header-btn" type="button"><svg class="ls-header-icon prototype-icon"><use href="#i-language"/></svg><span class="ls-header-label">中文</span></button>
+          <span class="ains-top-header__status"><span class="ains-top-header__status-dot"></span><span class="ains-top-header__status-text">Node Online</span></span>
+          <div class="ains-top-header__user-menu">
+            <div class="ains-top-header__user ains-top-header__user--clickable">
+              <div class="ains-top-header__avatar">WS</div>
+              <div class="ains-top-header__identity"><span class="ains-top-header__name">租户管理员</span><span class="ains-top-header__email">admin@ains.dev</span></div>
+              <svg class="ains-top-header__user-chevron prototype-icon"><use href="#i-chevron"/></svg>
+            </div>
+          </div>
+        </div>
+      </header>
+
+      <main class="ains-app-shell__content">
+        <div class="ains-users">
+          <header class="ains-users__header">
+            <div class="ains-users__title-block"><h1 class="ains-users__title">套餐管理</h1><p class="ains-users__subtitle">创建并管理租户用户的订阅套餐</p></div>
+            <div class="ains-users__header-actions"><button id="newPlanButton" class="ains-btn ains-btn--primary" type="button"><svg class="prototype-icon"><use href="#i-plus"/></svg>新建套餐</button></div>
+          </header>
+
+          <div class="ains-users__table-wrapper">
+            <div class="ains-table">
+              <table class="ains-table__table">
+                <thead class="ains-table__head">
+                  <tr>
+                    <th class="ains-table__th ains-table__align--left">名称</th>
+                    <th class="ains-table__th ains-table__align--right w-24">价格</th>
+                    <th class="ains-table__th ains-table__align--right w-20">调用次数</th>
+                    <th class="ains-table__th ains-table__align--right w-20">有效期(天)</th>
+                    <th class="ains-table__th ains-table__align--right w-24">限购/人</th>
+                    <th class="ains-table__th ains-table__align--center w-24">状态</th>
+                    <th class="ains-table__th ains-table__align--left w-40">创建时间</th>
+                    <th class="ains-table__th ains-table__align--center w-32">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="planRows" class="ains-table__body">
+                  <tr data-search="入门套餐 适合轻度体验与个人试用">
+                    <td><span class="ains-table__name-cell" title="适合轻度体验与个人试用" data-id="1927164723886448640">入门套餐</span></td>
+                    <td class="ains-table__mono ains-table__align--right">19.90</td><td class="ains-table__mono ains-table__align--right">1000</td><td class="ains-table__mono ains-table__align--right">30</td><td class="ains-table__mono ains-table__align--right">1 次</td>
+                    <td><span class="ains-badge ains-badge--user">上架</span></td><td class="ains-table__mono">2026-08-25 09:30</td>
+                    <td><div class="ains-table__row-actions"><button class="ains-table__action prototype-edit" type="button" title="编辑套餐" aria-label="编辑入门套餐" data-plan="0"><svg class="prototype-icon"><use href="#i-pencil"/></svg></button><button class="ains-table__action ains-table__action--danger prototype-delete" type="button" title="删除功能未在原型中实现" aria-label="删除入门套餐（原型未实现）" disabled><svg class="prototype-icon"><use href="#i-trash"/></svg></button></div></td>
+                  </tr>
+                  <tr data-search="专业套餐 适合日常开发与高频使用">
+                    <td><span class="ains-table__name-cell" title="适合日常开发与高频使用" data-id="1927164723886448641">专业套餐</span></td>
+                    <td class="ains-table__mono ains-table__align--right">59.00</td><td class="ains-table__mono ains-table__align--right">5000</td><td class="ains-table__mono ains-table__align--right">90</td><td class="ains-table__mono ains-table__align--right">3 次</td>
+                    <td><span class="ains-badge ains-badge--user">上架</span></td><td class="ains-table__mono">2026-08-24 16:20</td>
+                    <td><div class="ains-table__row-actions"><button class="ains-table__action prototype-edit" type="button" title="编辑套餐" aria-label="编辑专业套餐" data-plan="1"><svg class="prototype-icon"><use href="#i-pencil"/></svg></button><button class="ains-table__action ains-table__action--danger prototype-delete" type="button" title="删除功能未在原型中实现" aria-label="删除专业套餐（原型未实现）" disabled><svg class="prototype-icon"><use href="#i-trash"/></svg></button></div></td>
+                  </tr>
+                  <tr data-search="企业套餐 团队长期使用套餐">
+                    <td><span class="ains-table__name-cell" title="团队长期使用套餐" data-id="1927164723886448642">企业套餐</span></td>
+                    <td class="ains-table__mono ains-table__align--right">199.00</td><td class="ains-table__mono ains-table__align--right">30000</td><td class="ains-table__mono ains-table__align--right">365</td><td class="ains-table__mono ains-table__align--right">不限</td>
+                    <td><span class="ains-badge ains-badge--admin">下架</span></td><td class="ains-table__mono">2026-08-20 11:05</td>
+                    <td><div class="ains-table__row-actions"><button class="ains-table__action prototype-edit" type="button" title="编辑套餐" aria-label="编辑企业套餐" data-plan="2"><svg class="prototype-icon"><use href="#i-pencil"/></svg></button><button class="ains-table__action ains-table__action--danger prototype-delete" type="button" title="删除功能未在原型中实现" aria-label="删除企业套餐（原型未实现）" disabled><svg class="prototype-icon"><use href="#i-trash"/></svg></button></div></td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="ains-pagination">
+              <div id="paginationInfo" class="ains-pagination__info" aria-live="polite">共 3 条，第 1 / 1 页</div>
+              <div class="ains-pagination__controls"><button class="ains-pagination__btn" type="button" disabled>上一页</button><button class="ains-pagination__btn" type="button" disabled>下一页</button><div class="ains-pagination__per-page"><span>每页</span><select class="ains-pagination__select"><option>20</option><option>50</option><option>100</option></select><span>条</span></div></div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+  </div>
+
+  <div id="planModal" hidden>
+    <div id="modalBackdrop" class="ains-modal__backdrop"></div>
+    <div class="ains-modal__wrap" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div class="ains-modal__card">
+        <header class="ains-modal__header"><h3 id="modalTitle" class="ains-modal__title">编辑套餐</h3><button id="modalClose" class="ains-modal__close" type="button" aria-label="关闭"><svg class="prototype-icon"><use href="#i-close"/></svg></button></header>
+        <div class="ains-modal__body">
+          <form id="planForm" class="ains-form-stack">
+            <div class="ains-input"><label class="ains-input__label" for="planName">套餐名称</label><div class="ains-input__field-wrapper"><input id="planName" class="ains-input__field" name="name" type="text" required placeholder="如：入门套餐"></div></div>
+            <div class="ains-input"><label class="ains-input__label" for="planDescription">套餐描述</label><div class="ains-input__field-wrapper"><input id="planDescription" class="ains-input__field" name="description" type="text"></div></div>
+            <div class="ains-input"><label class="ains-input__label" for="planPrice">价格</label><div class="ains-input__field-wrapper"><input id="planPrice" class="ains-input__field" name="price" type="number" min="0" step="any" required></div></div>
+            <div class="ains-input"><label class="ains-input__label" for="planCalls">调用次数</label><div class="ains-input__field-wrapper"><input id="planCalls" class="ains-input__field" name="total_calls" type="number" min="1" step="1" required></div></div>
+            <div class="ains-input">
+              <label class="ains-input__label" for="planPurchaseLimit">限购次数</label>
+              <div class="ains-input__field-wrapper"><input id="planPurchaseLimit" class="ains-input__field" name="purchase_limit" type="number" min="1" step="1"></div>
+            </div>
+            <div class="ains-input"><label class="ains-input__label" for="planValidity">有效期（天）</label><div class="ains-input__field-wrapper"><input id="planValidity" class="ains-input__field" name="validity_days" type="number" min="1" max="36500" step="1" required></div></div>
+            <div id="statusField" class="ains-form-field">
+              <span id="statusLabel" class="ains-form-label">状态</span>
+              <div class="ains-form-pill-group" role="group" aria-labelledby="statusLabel"><button id="statusActive" class="ains-form-pill ains-form-pill--active" type="button" data-status="active" aria-pressed="true">上架</button><button id="statusDisabled" class="ains-form-pill" type="button" data-status="disabled" aria-pressed="false">下架</button></div>
+            </div>
+            <button id="modalSubmit" class="ains-btn ains-btn--primary ains-btn--block prototype-modal-submit" type="submit">保存</button>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const plans = [
+      { name: '入门套餐', description: '适合轻度体验与个人试用', price: '19.90', calls: '1000', validity: '30', purchaseLimit: '1', status: 'active' },
+      { name: '专业套餐', description: '适合日常开发与高频使用', price: '59.00', calls: '5000', validity: '90', purchaseLimit: '3', status: 'active' },
+      { name: '企业套餐', description: '团队长期使用套餐', price: '199.00', calls: '30000', validity: '365', purchaseLimit: '', status: 'disabled' }
+    ];
+
+    const modal = document.getElementById('planModal');
+    const dialog = modal.querySelector('[role="dialog"]');
+    const main = document.getElementById('main');
+    const form = document.getElementById('planForm');
+    let previouslyFocusedElement = null;
+    const fields = {
+      name: document.getElementById('planName'),
+      description: document.getElementById('planDescription'),
+      price: document.getElementById('planPrice'),
+      calls: document.getElementById('planCalls'),
+      validity: document.getElementById('planValidity'),
+      purchaseLimit: document.getElementById('planPurchaseLimit')
+    };
+
+    function setStatus(status) {
+      const active = document.getElementById('statusActive');
+      const disabled = document.getElementById('statusDisabled');
+      active.classList.toggle('ains-form-pill--active', status === 'active');
+      disabled.classList.toggle('ains-form-pill--active', status === 'disabled');
+      active.setAttribute('aria-pressed', String(status === 'active'));
+      disabled.setAttribute('aria-pressed', String(status === 'disabled'));
+      form.dataset.status = status;
+    }
+
+    function focusableDialogElements() {
+      return [...dialog.querySelectorAll('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])')];
+    }
+
+    function openModal(plan) {
+      const editing = Boolean(plan);
+      previouslyFocusedElement = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      document.getElementById('modalTitle').textContent = editing ? '编辑套餐' : '新建套餐';
+      document.getElementById('modalSubmit').textContent = editing ? '保存' : '创建';
+      document.getElementById('statusField').hidden = !editing;
+      fields.name.value = plan?.name ?? '';
+      fields.description.value = plan?.description ?? '';
+      fields.price.value = plan?.price ?? '';
+      fields.calls.value = plan?.calls ?? '';
+      fields.validity.value = plan?.validity ?? '';
+      fields.purchaseLimit.value = plan?.purchaseLimit ?? '';
+      setStatus(plan?.status ?? 'active');
+      modal.hidden = false;
+      main.inert = true;
+      document.body.style.overflow = 'hidden';
+      fields.name.focus();
+    }
+
+    function closeModal() {
+      if (modal.hidden) return;
+      modal.hidden = true;
+      main.inert = false;
+      document.body.style.overflow = '';
+      if (previouslyFocusedElement && document.contains(previouslyFocusedElement)) previouslyFocusedElement.focus();
+      previouslyFocusedElement = null;
+    }
+
+    document.getElementById('newPlanButton').addEventListener('click', () => openModal(null));
+    document.querySelectorAll('.prototype-edit').forEach(button => button.addEventListener('click', () => openModal(plans[Number(button.dataset.plan)])));
+    document.getElementById('modalClose').addEventListener('click', closeModal);
+    document.getElementById('modalBackdrop').addEventListener('click', closeModal);
+    document.querySelectorAll('[data-status]').forEach(button => button.addEventListener('click', () => setStatus(button.dataset.status)));
+    form.addEventListener('submit', event => { event.preventDefault(); if (form.reportValidity()) closeModal(); });
+    document.addEventListener('keydown', event => {
+      if (modal.hidden) return;
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeModal();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+
+      const focusable = focusableDialogElements();
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    });
+
+    document.getElementById('tableSearch').addEventListener('input', event => {
+      const query = event.target.value.trim().toLowerCase();
+      let visibleCount = 0;
+      document.querySelectorAll('#planRows tr').forEach(row => {
+        row.hidden = query !== '' && !row.dataset.search.toLowerCase().includes(query);
+        if (!row.hidden) visibleCount += 1;
+      });
+      document.getElementById('paginationInfo').textContent = visibleCount === 0 ? '共 0 条' : `共 ${visibleCount} 条，第 1 / 1 页`;
+    });
+
+    const sidebar = document.getElementById('sidebar');
+    const sidebarOverlay = document.getElementById('sidebarOverlay');
+    const menuButton = document.getElementById('menuButton');
+    function closeSidebar() { sidebar.classList.remove('prototype-sidebar-open'); sidebarOverlay.hidden = true; menuButton.setAttribute('aria-expanded', 'false'); }
+    menuButton.addEventListener('click', () => { sidebar.classList.add('prototype-sidebar-open'); sidebarOverlay.hidden = false; menuButton.setAttribute('aria-expanded', 'true'); });
+    document.querySelector('.ains-sidebar__close').addEventListener('click', closeSidebar);
+    sidebarOverlay.addEventListener('click', closeSidebar);
+
+    // 默认展示最能体现新字段的“编辑专业套餐”状态；关闭后可查看列表或新建态。
+    openModal(plans[1]);
+  </script>
+</body>
+</html>

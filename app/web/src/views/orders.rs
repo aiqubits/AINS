@@ -519,7 +519,12 @@ fn render_delete_confirm(
         .unwrap_or_else(|| t.orders_no_target.to_string());
     let confirm_delete_title = t.orders_confirm_delete_title.to_string();
 
-    let on_cancel = move |_: MouseEvent| close_all(signals);
+    let signals_for_cancel = signals;
+    let on_cancel = move |_: MouseEvent| {
+        if !*signals_for_cancel.submitting.read() {
+            close_all(signals_for_cancel);
+        }
+    };
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
@@ -617,7 +622,12 @@ fn render_form_modal(
     let invalid_amount = t.orders_invalid_amount.to_string();
     let no_target_id = t.orders_modal_no_target_id.to_string();
 
-    let on_close = move |_: MouseEvent| close_all(signals);
+    let signals_for_close = signals;
+    let on_close = move |_: MouseEvent| {
+        if !*signals_for_close.submitting.read() {
+            close_all(signals_for_close);
+        }
+    };
 
     let editing_for_submit = editing.clone();
     let mut signals_for_submit = signals;
@@ -744,6 +754,7 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
+            disable_close: submitting,
             div { class: "ains-form-stack",
                 if let Some(err) = form_error.as_ref() {
                     p { class: "ains-form-error", "{err}" }

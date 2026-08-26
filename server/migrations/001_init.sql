@@ -138,9 +138,10 @@ CREATE TABLE IF NOT EXISTS plans (
     tenant_id VARCHAR(255) NOT NULL REFERENCES tenants(id) ON DELETE RESTRICT,
     name VARCHAR(255) NOT NULL,
     description TEXT NOT NULL DEFAULT '',
-    price BIGINT NOT NULL CHECK (price > 0),
+    price BIGINT NOT NULL CHECK (price >= 0),
     total_calls BIGINT NOT NULL CHECK (total_calls > 0),
     validity_days INTEGER NOT NULL CHECK (validity_days > 0),
+    purchase_limit INTEGER CHECK (purchase_limit IS NULL OR purchase_limit > 0),
     status VARCHAR(32) NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'disabled')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -173,6 +174,12 @@ CREATE TABLE IF NOT EXISTS user_plans (
 -- Covers per-user plan listing and the consume_call earliest-expiry lookup.
 CREATE INDEX IF NOT EXISTS idx_user_plans_user
     ON user_plans(user_id, expires_at DESC);
+
+-- Supports cumulative purchase-limit checks. Admin grants are excluded from
+-- the limit by source, so keep the index focused on purchase instances only.
+CREATE INDEX IF NOT EXISTS idx_user_plans_purchase_count
+    ON user_plans(user_id, plan_id)
+    WHERE source = 'purchase';
 
 -- Payment orders (audit trail of plan purchases and manual entries).
 -- tenant_id and user_email are snapshots taken at order creation so that

@@ -7,7 +7,7 @@
 use crate::{
     handlers::helpers::{self, extract_handler_context},
     repositories::{plan::PlanResponse, user_plan::UserPlanResponse},
-    services::plan::{CreatePlanInput, PlanError, PlanService, UpdatePlanInput},
+    services::plan::{AvailablePlan, CreatePlanInput, PlanError, PlanService, UpdatePlanInput},
     services::user::BALANCE_SCALE,
     snowflake::SnowflakeId,
 };
@@ -24,6 +24,11 @@ fn error(e: PlanError) -> HttpError {
             400,
             "insufficient_balance",
             "Insufficient balance to purchase this plan",
+        ),
+        PlanError::PurchaseLimitReached => HttpError::with_status(
+            409,
+            "purchase_limit_reached",
+            "Purchase limit reached for this plan",
         ),
         // NoActivePlan is only ever produced by `consume_call`, which is
         // consumed by the AI response gate (responses.rs) — the arm here
@@ -63,7 +68,16 @@ pub struct CreatePlanRequest {
     pub price: i64,
     pub total_calls: i64,
     pub validity_days: i32,
+    pub purchase_limit: Option<i32>,
     pub status: Option<String>,
+}
+
+fn deserialize_present_nullable<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
@@ -73,6 +87,8 @@ pub struct UpdatePlanRequest {
     pub price: Option<i64>,
     pub total_calls: Option<i64>,
     pub validity_days: Option<i32>,
+    #[serde(default, deserialize_with = "deserialize_present_nullable")]
+    pub purchase_limit: Option<Option<i32>>,
     pub status: Option<String>,
 }
 
@@ -130,6 +146,7 @@ pub async fn create_plan(mut req: crate::ServerRequest) -> Result<Response, Http
                 price: body.price,
                 total_calls: body.total_calls,
                 validity_days: body.validity_days,
+                purchase_limit: body.purchase_limit,
                 status: body.status,
             })
             .await
@@ -154,6 +171,7 @@ pub async fn update_plan(mut req: crate::ServerRequest) -> Result<Response, Http
                     price: body.price,
                     total_calls: body.total_calls,
                     validity_days: body.validity_days,
+                    purchase_limit: body.purchase_limit,
                     status: body.status,
                 },
                 &actor.role,
@@ -229,19 +247,42 @@ pub async fn list_my_plans(req: crate::ServerRequest) -> Result<Response, HttpEr
 
 #[derive(Serialize)]
 struct AvailablePlansResponse {
-    items: Vec<PlanResponse>,
+    items: Vec<AvailablePlanResponse>,
+}
+
+#[derive(Serialize)]
+struct AvailablePlanResponse {
+    #[serde(flatten)]
+    plan: PlanResponse,
+    purchases_used: u64,
+}
+
+impl From<AvailablePlan> for AvailablePlanResponse {
+    fn from(value: AvailablePlan) -> Self {
+        Self {
+            plan: value.plan,
+            purchases_used: value.purchases_used,
+        }
+    }
 }
 
 /// `GET /api/plans/available` — active plans of the caller's tenant.
 pub async fn list_available_plans(req: crate::ServerRequest) -> Result<Response, HttpError> {
     let (state, actor) = extract_handler_context(&req)?;
+    let user_id: i64 = actor
+        .user_id
+        .parse()
+        .map_err(|_| HttpError::unauthorized("Invalid user ID in token"))?;
     // Consistent with the purchase gate: users of a disabled tenant cannot
     // browse purchasable plans either.
     helpers::require_actor_tenant_active(&state, &actor).await?;
     let items = PlanService::new(state.db)
-        .list_available(&actor.tenant_id)
+        .list_available(&actor.tenant_id, user_id)
         .await
-        .map_err(error)?;
+        .map_err(error)?
+        .into_iter()
+        .map(Into::into)
+        .collect();
     Response::json(&AvailablePlansResponse { items })
 }
 
@@ -319,4 +360,22 @@ pub async fn purchase_plan(req: crate::ServerRequest) -> Result<Response, HttpEr
         display_balance: outcome.balance as f64 / BALANCE_SCALE as f64,
         message: "Plan purchased successfully".to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UpdatePlanRequest;
+
+    #[test]
+    fn update_purchase_limit_distinguishes_missing_null_and_value() {
+        let missing: UpdatePlanRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.purchase_limit, None);
+
+        let unlimited: UpdatePlanRequest =
+            serde_json::from_str(r#"{"purchase_limit":null}"#).unwrap();
+        assert_eq!(unlimited.purchase_limit, Some(None));
+
+        let limited: UpdatePlanRequest = serde_json::from_str(r#"{"purchase_limit":3}"#).unwrap();
+        assert_eq!(limited.purchase_limit, Some(Some(3)));
+    }
 }

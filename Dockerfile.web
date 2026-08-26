@@ -143,6 +143,11 @@ RUN apk add --no-cache curl
 # Copy built frontend assets (Dioxus outputs to target/dx/<package>/release/<platform>/public)
 COPY --from=builder /app/target/dx/web/release/web/public /usr/share/nginx/html
 
+# Dioxus fingerprints assets referenced by the application, while browsers may
+# request /favicon.ico before the WASM application injects its <link> element.
+# Keep an unversioned root copy for that conventional request.
+COPY app/web/assets/favicon.ico /usr/share/nginx/html/favicon.ico
+
 # Copy default nginx configuration (can be overridden via volume mount)
 COPY nginx/default.conf /etc/nginx/conf.d/default.conf
 

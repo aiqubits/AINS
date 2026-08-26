@@ -18,7 +18,9 @@
 //! 购买是有意叠加语义，见服务端 test_sequential_repurchase_stacks_instances）。
 
 use chrono::{DateTime, Utc};
-use client_api::{ClientError, PaymentOrderResponse, PlanResponse, UserPlanResponse};
+use client_api::{
+    AvailablePlanResponse, ClientError, PaymentOrderResponse, PlanResponse, UserPlanResponse,
+};
 use dioxus::prelude::*;
 use dioxus_icons::lucide::{LoaderCircle, TriangleAlert, Wallet};
 
@@ -28,7 +30,7 @@ use crate::api::{ErrorContext, humanize_error};
 use crate::auth::AuthState;
 use crate::balance::format_balance;
 use crate::components::{ConfirmDialog, HttpMethod, LogBus, push_log_err, push_log_ok};
-use crate::views::{order_method_label, order_status_label};
+use crate::views::{format_purchase_limit, order_method_label, order_status_label};
 
 /// 区块加载状态（余额单独用 `Option<i64>` + 错误信号表达）。
 #[derive(Debug, Clone)]
@@ -46,11 +48,16 @@ fn can_afford(balance: i64, price: i64) -> bool {
     balance >= price
 }
 
-/// 购买按钮是否可用：余额未加载（None）时禁用，避免盲买。
+/// 购买按钮是否可用：免费套餐无需依赖余额接口；付费套餐在余额未加载
+/// （None）时禁用，避免盲买。
 /// 与 [`show_insufficient_label`] 分离：余额未知 ≠ 余额不足，
 /// 前者仍显示“购买”文案（置灰），后者显示“余额不足”。
 fn buy_button_enabled(balance: Option<i64>, price: i64) -> bool {
-    balance.is_some_and(|b| can_afford(b, price))
+    price == 0 || balance.is_some_and(|b| can_afford(b, price))
+}
+
+fn purchase_limit_reached(purchase_limit: Option<i32>, purchases_used: u64) -> bool {
+    purchase_limit.is_some_and(|limit| purchases_used >= limit as u64)
 }
 
 /// 是否展示“余额不足”文案：仅在余额已知且确实不足时。
@@ -220,7 +227,7 @@ pub fn PersonalCenter() -> Element {
     let balance = use_signal(|| Option::<i64>::None);
     let balance_error = use_signal(|| Option::<String>::None);
     let my_plans = use_signal(|| SectionState::<UserPlanResponse>::Loading);
-    let available = use_signal(|| SectionState::<PlanResponse>::Loading);
+    let available = use_signal(|| SectionState::<AvailablePlanResponse>::Loading);
     let orders = use_signal(|| SectionState::<PaymentOrderResponse>::Loading);
     // 购买成功后递增：仅驱动"我的套餐"与"账单记录"重拉。
     let refresh_version = use_signal(|| 0u64);
@@ -660,11 +667,11 @@ fn render_my_plans_section(
     }
 }
 
-/// 可购套餐：模板列表 + 购买入口。余额不足或余额未加载时按钮禁用
-/// （存储单位 i64 比较，服务端 400 仍兜底）。
+/// 可购套餐：模板列表 + 购买入口。付费套餐在余额不足或余额未加载时
+/// 禁用；免费套餐不依赖余额加载（服务端仍是最终校验兜底）。
 fn render_available_section(
     t: &'static Translations,
-    state: SectionState<PlanResponse>,
+    state: SectionState<AvailablePlanResponse>,
     balance: Option<i64>,
     feedback_ok: bool,
     feedback_err: Option<String>,
@@ -686,19 +693,27 @@ fn render_available_section(
                 Column::new(t.plans_column_validity)
                     .width("w-24")
                     .align(Align::Right),
+                Column::new(t.plans_column_purchase_limit)
+                    .width("w-24")
+                    .align(Align::Right),
                 Column::new(t.plans_column_actions)
                     .width("w-28")
                     .align(Align::Center),
             ];
             let rows: Vec<Element> = items
                 .into_iter()
-                .map(|plan| {
+                .map(|available_plan| {
+                    let plan = available_plan.plan;
                     let id = plan.id.clone();
                     let name = plan.name.clone();
                     let description = plan.description.clone();
                     let price_display = format_balance(plan.price);
-                    let affordable = buy_button_enabled(balance, plan.price);
-                    let buy_label = if show_insufficient_label(balance, plan.price) {
+                    let limit_reached =
+                        purchase_limit_reached(plan.purchase_limit, available_plan.purchases_used);
+                    let affordable = buy_button_enabled(balance, plan.price) && !limit_reached;
+                    let buy_label = if limit_reached {
+                        t.pc_buy_limit_reached
+                    } else if show_insufficient_label(balance, plan.price) {
                         t.pc_buy_insufficient
                     } else {
                         t.pc_buy_btn
@@ -725,6 +740,7 @@ fn render_available_section(
                             td { class: "ains-table__mono ains-table__align--right", "{price_display}" }
                             td { class: "ains-table__mono ains-table__align--right", "{plan.total_calls}" }
                             td { class: "ains-table__mono ains-table__align--right", "{plan.validity_days}" }
+                            td { class: "ains-table__mono ains-table__align--right", "{format_purchase_limit(t, plan.purchase_limit)}" }
                             td {
                                 button {
                                     class: "ains-btn ains-btn--primary",
@@ -1036,7 +1052,8 @@ mod tests {
     use super::{
         PurchaseSignals, apply_purchase_failure, apply_purchase_success, balance_response_is_stale,
         buy_button_enabled, can_afford, next_page, plan_source_label, plan_status_label,
-        plan_status_variant, prev_page, purchase_error_keeps_dialog_open, show_insufficient_label,
+        plan_status_variant, prev_page, purchase_error_keeps_dialog_open, purchase_limit_reached,
+        show_insufficient_label,
     };
     use crate::balance::BALANCE_SCALE;
     use client_api::{ClientError, PlanResponse};
@@ -1050,6 +1067,27 @@ mod tests {
     fn can_afford_exact_price_is_allowed() {
         // 余额恰好等于价格：允许购买（购后余额归零）。
         assert!(can_afford(BALANCE_SCALE * 4, BALANCE_SCALE * 4));
+    }
+
+    #[test]
+    fn zero_balance_can_afford_a_free_plan() {
+        assert!(can_afford(0, 0));
+        assert!(buy_button_enabled(Some(0), 0));
+        assert!(!show_insufficient_label(Some(0), 0));
+    }
+
+    #[test]
+    fn free_plan_does_not_depend_on_balance_loading() {
+        assert!(buy_button_enabled(None, 0));
+        assert!(!show_insufficient_label(None, 0));
+    }
+
+    #[test]
+    fn cumulative_purchase_limit_disables_reached_plan() {
+        assert!(!purchase_limit_reached(None, u64::MAX));
+        assert!(!purchase_limit_reached(Some(2), 1));
+        assert!(purchase_limit_reached(Some(2), 2));
+        assert!(purchase_limit_reached(Some(2), 3));
     }
 
     #[test]
@@ -1162,14 +1200,15 @@ mod tests {
             ClientError::Other(400, r#"{"error":"insufficient_balance"}"#.into()),
             ClientError::Other(404, r#"{"error":"not_found"}"#.into()),
             ClientError::Other(403, r#"{"error":"forbidden"}"#.into()),
+            ClientError::Other(409, r#"{"error":"purchase_limit_reached"}"#.into()),
             ClientError::Network("timeout".into()),
         ];
         for err in &terminal {
             assert!(!purchase_error_keeps_dialog_open(err), "err: {err:?}");
         }
 
-        // 409 但错误码不是 purchase_in_progress（如 conflict）或体
-        // 非 JSON：不是可重试锁冲突，不得保持弹窗。
+        // 限购冲突与其他 409（如 conflict）都不是可重试锁冲突，
+        // 不得保持弹窗；非 JSON 体同理。
         let conflict = ClientError::Other(409, r#"{"error":"conflict"}"#.into());
         assert!(!purchase_error_keeps_dialog_open(&conflict));
         let garbled = ClientError::Other(409, "not json".into());

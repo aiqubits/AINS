@@ -19,7 +19,7 @@ mod tools;
 mod users;
 mod verify_email;
 
-use ui::Translations;
+use ui::{Translations, tf};
 
 pub use agent_chat::AgentChat;
 pub use auth::Auth;
@@ -101,9 +101,25 @@ pub(crate) fn order_method_label<'a>(t: &'static Translations, method: &'a str) 
     }
 }
 
+/// Per-user purchase limit display shared by the management and self-service
+/// plan tables. `None` means the plan can be purchased without a count limit.
+pub(crate) fn format_purchase_limit(
+    t: &'static Translations,
+    purchase_limit: Option<i32>,
+) -> String {
+    match purchase_limit {
+        Some(1) => t.plans_purchase_limit_once.to_string(),
+        Some(limit) => tf(
+            t.plans_purchase_limit_count,
+            &[("count", &limit.to_string())],
+        ),
+        None => t.plans_purchase_limit_unlimited.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{order_method_label, order_status_label, short_tenant_id};
+    use super::{format_purchase_limit, order_method_label, order_status_label, short_tenant_id};
     use i18n::{EN, ZH};
 
     #[test]
@@ -158,5 +174,14 @@ mod tests {
     #[test]
     fn order_method_unknown_passes_through_verbatim() {
         assert_eq!(order_method_label(&EN, "stripe"), "stripe");
+    }
+
+    #[test]
+    fn purchase_limit_display_is_shared_and_localized() {
+        assert_eq!(format_purchase_limit(&EN, Some(1)), "1 time");
+        assert_eq!(format_purchase_limit(&EN, Some(2)), "2 times");
+        assert_eq!(format_purchase_limit(&EN, None), "Unlimited");
+        assert_eq!(format_purchase_limit(&ZH, Some(1)), "1 次");
+        assert_eq!(format_purchase_limit(&ZH, None), "不限");
     }
 }

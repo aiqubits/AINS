@@ -30,6 +30,7 @@ async fn test_salvo_plan_routes_and_quota_gate() {
             "price": 40_000_000_000i64,
             "total_calls": 2,
             "validity_days": 30,
+            "purchase_limit": 1,
         })),
     )
     .await;
@@ -38,6 +39,7 @@ async fn test_salvo_plan_routes_and_quota_gate() {
         reqwest::StatusCode::OK,
         "salvo plan creation should succeed: {plan}"
     );
+    assert_eq!(plan["purchase_limit"], 1);
     let plan_id = plan["id"].as_str().unwrap().to_string();
 
     // ── Regular user in the default tenant ──
@@ -63,8 +65,9 @@ async fn test_salvo_plan_routes_and_quota_gate() {
         .as_array()
         .unwrap()
         .iter()
-        .any(|p| p["id"] == plan_id.as_str());
-    assert!(visible, "created plan should be purchasable: {body}");
+        .find(|p| p["id"] == plan_id.as_str())
+        .expect("created plan should be purchasable");
+    assert_eq!(visible["purchases_used"], 0, "body: {body}");
 
     // Route order: /users/me/plans must NOT be swallowed by /users/{id}/plans
     // (the latter is admin-guarded and would 403 for a user role).
@@ -111,6 +114,52 @@ async fn test_salvo_plan_routes_and_quota_gate() {
     assert_eq!(body["order"]["status"], "paid");
     assert_eq!(body["balance"], 60_000_000_000i64);
 
+    let (status, available) = salvo::get(&server, "/api/plans/available", Some(&user_token)).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "body: {available}");
+    let limited = available["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == plan_id.as_str())
+        .expect("limited plan remains visible");
+    assert_eq!(limited["purchases_used"], 1);
+
+    // The nullable update contract and terminal purchase-limit conflict must
+    // behave identically through Salvo's request adapter.
+    let (status, body) = salvo::post(
+        &server,
+        &format!("/api/plans/{}/purchase", plan_id),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "body: {body}");
+    assert_eq!(body["error"], "purchase_limit_reached");
+
+    let (status, body) = salvo::put(
+        &server,
+        &format!("/api/plans/{}", plan_id),
+        Some(&sys_token),
+        Some(&json!({ "purchase_limit": null })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "clear limit: {body}");
+    assert!(body["purchase_limit"].is_null());
+
+    let (status, body) = salvo::post(
+        &server,
+        &format!("/api/plans/{}/purchase", plan_id),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "purchase after clearing limit: {body}"
+    );
+    assert_eq!(body["balance"], 20_000_000_000i64);
+
     // me/plans now shows the active instance; me/orders shows the purchase.
     let (status, body) = salvo::get(&server, "/api/users/me/plans", Some(&user_token)).await;
     assert_eq!(status, reqwest::StatusCode::OK);
@@ -119,8 +168,46 @@ async fn test_salvo_plan_routes_and_quota_gate() {
 
     let (status, body) = salvo::get(&server, "/api/users/me/orders", Some(&user_token)).await;
     assert_eq!(status, reqwest::StatusCode::OK, "me/orders: {body}");
-    assert_eq!(body["total"], 1);
+    assert_eq!(body["total"], 2);
     assert_eq!(body["items"][0]["user_email"], user_email.as_str());
+
+    // Free-plan parity: Salvo must deserialize a zero price, persist it, and
+    // execute the shared transactional purchase path without changing balance.
+    let (status, free_plan) = salvo::post(
+        &server,
+        "/api/plans",
+        Some(&sys_token),
+        Some(&json!({
+            "tenant_id": "default",
+            "name": format!("Salvo Free Plan {}", common::unique_table_name("sv_free")),
+            "price": 0,
+            "total_calls": 1,
+            "validity_days": 1,
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "salvo free-plan creation should succeed: {free_plan}"
+    );
+    assert_eq!(free_plan["price"], 0);
+    let free_plan_id = free_plan["id"].as_str().unwrap();
+
+    let (status, free_purchase) = salvo::post(
+        &server,
+        &format!("/api/plans/{free_plan_id}/purchase"),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "salvo free-plan purchase should succeed: {free_purchase}"
+    );
+    assert_eq!(free_purchase["order"]["amount"], 0);
+    assert_eq!(free_purchase["balance"], 20_000_000_000i64);
 
     // Admin order listing works and the user is still barred from it.
     let (status, _) = salvo::get(&server, "/api/orders", Some(&sys_token)).await;

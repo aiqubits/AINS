@@ -50,7 +50,7 @@ pub enum ErrorContext {
 /// 购买链路专属错误码 → 文案（PlanManagement 与 PersonalCenter 两语境
 /// 共享，防止双处维护导致文案静默漂移）。
 ///
-/// 仅覆盖三个购买专属错误码；调用方需先排除 401（会话失效语义
+/// 仅覆盖四个购买专属错误码；调用方需先排除 401（会话失效语义
 /// 优先）。validation_error 不在此处理 —— 两语境均约定 403/404
 /// 状态码优先于 validation_error 错误码。
 fn purchase_code_message(code: &str, lang: Language) -> Option<String> {
@@ -60,9 +60,13 @@ fn purchase_code_message(code: &str, lang: Language) -> Option<String> {
         (Language::En, "purchase_in_progress") => {
             "A purchase is already in progress, please try again shortly"
         }
+        (Language::En, "purchase_limit_reached") => {
+            "You have reached the purchase limit for this plan"
+        }
         (Language::Zh, "no_active_plan") => "没有可用套餐或套餐次数已用尽",
         (Language::Zh, "insufficient_balance") => "余额不足，无法购买该套餐",
         (Language::Zh, "purchase_in_progress") => "已有一笔购买正在处理中，请稍后再试",
+        (Language::Zh, "purchase_limit_reached") => "已达到该套餐的购买上限",
         _ => return None,
     };
     Some(msg.to_string())
@@ -623,6 +627,20 @@ mod tests {
     }
 
     #[test]
+    fn humanize_personal_center_purchase_limit_reached_zh() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_limit_reached"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
+        assert_eq!(msg, "已达到该套餐的购买上限");
+    }
+
+    #[test]
+    fn humanize_personal_center_purchase_limit_reached_en() {
+        let err = ClientError::Other(409, r#"{"error":"purchase_limit_reached"}"#.into());
+        let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::En);
+        assert_eq!(msg, "You have reached the purchase limit for this plan");
+    }
+
+    #[test]
     fn humanize_personal_center_401_zh() {
         let err = ClientError::Other(401, r#"{"error":"unauthorized"}"#.into());
         let msg = humanize_error(&err, ErrorContext::PersonalCenter, Language::Zh);
@@ -669,13 +687,14 @@ mod tests {
 
     #[test]
     fn purchase_code_messages_identical_across_contexts() {
-        // 防漂移守卫：三个购买专属错误码在 PlanManagement 与
+        // 防漂移守卫：四个购买专属错误码在 PlanManagement 与
         // PersonalCenter 两语境下必须产生完全一致的文案（共享
         // purchase_code_message），不随状态码变化（401 除外）。
         for code in [
             "no_active_plan",
             "insufficient_balance",
             "purchase_in_progress",
+            "purchase_limit_reached",
         ] {
             for status in [400u16, 403, 409] {
                 let err = ClientError::Other(status, format!(r#"{{"error":"{code}"}}"#));

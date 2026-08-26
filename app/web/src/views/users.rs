@@ -804,7 +804,12 @@ fn render_delete_confirm(
         .unwrap_or_else(|| t.users_no_target.to_string());
     let confirm_delete_title = t.users_confirm_delete_title.to_string();
 
-    let on_cancel = move |_: MouseEvent| close_all(signals);
+    let signals_for_cancel = signals;
+    let on_cancel = move |_: MouseEvent| {
+        if !*signals_for_cancel.submitting.read() {
+            close_all(signals_for_cancel);
+        }
+    };
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
@@ -937,7 +942,12 @@ fn render_form_modal(
     let balance_increase = t.users_balance_increase_btn.to_string();
     let balance_decrease = t.users_balance_decrease_btn.to_string();
 
-    let on_close = move |_: MouseEvent| close_all(signals);
+    let signals_for_close = signals;
+    let on_close = move |_: MouseEvent| {
+        if !*signals_for_close.submitting.read() {
+            close_all(signals_for_close);
+        }
+    };
     let mut signals_for_role = signals;
     let pick_admin = move |_: MouseEvent| signals_for_role.form_role.set("admin".to_string());
     let pick_user = move |_: MouseEvent| signals_for_role.form_role.set("user".to_string());
@@ -1154,6 +1164,7 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
+            disable_close: submitting,
             div {
                 class: "ains-form-stack",
                 // 点击下拉以外的任意空白/字段区域时关闭租户下拉（不影响模态框）。

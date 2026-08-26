@@ -126,6 +126,31 @@ async fn create_plan(
     total_calls: i64,
     validity_days: i32,
 ) -> String {
+    create_plan_with_limit(
+        app,
+        token,
+        tenant_id,
+        name,
+        price,
+        total_calls,
+        validity_days,
+        None,
+    )
+    .await
+}
+
+/// Create a plan with an optional per-user cumulative purchase limit.
+#[allow(clippy::too_many_arguments)]
+async fn create_plan_with_limit(
+    app: &Router,
+    token: &str,
+    tenant_id: Option<&str>,
+    name: &str,
+    price: i64,
+    total_calls: i64,
+    validity_days: i32,
+    purchase_limit: Option<i32>,
+) -> String {
     let mut body = json!({
         "name": name,
         "price": price,
@@ -135,11 +160,19 @@ async fn create_plan(
     if let Some(t) = tenant_id {
         body["tenant_id"] = json!(t);
     }
+    if let Some(limit) = purchase_limit {
+        body["purchase_limit"] = json!(limit);
+    }
     let (status, resp) = post(app, "/api/plans", Some(token), Some(&body)).await;
     assert_eq!(
         status,
         StatusCode::OK,
         "plan creation should succeed: {resp}"
+    );
+    assert_eq!(
+        resp["purchase_limit"],
+        purchase_limit.map_or(Value::Null, Value::from),
+        "purchase-limit response contract must match create input: {resp}"
     );
     resp["id"].as_str().unwrap().to_string()
 }
@@ -258,15 +291,51 @@ async fn test_plan_management_requires_admin() {
 }
 
 #[tokio::test]
+async fn test_plan_price_allows_zero_on_create_and_update() {
+    let app = axum_helpers::create_app().await;
+    let admin_token =
+        axum_helpers::create_admin_and_login(&app, &common::unique_email("free_plan_adm")).await;
+
+    let free_plan_name = format!("Free Plan {}", common::unique_table_name("p"));
+    let (status, body) = post(
+        &app,
+        "/api/plans",
+        Some(&admin_token),
+        Some(&json!({
+            "name": free_plan_name,
+            "price": 0,
+            "total_calls": 10,
+            "validity_days": 30
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create free plan: {body}");
+    assert_eq!(body["price"], 0);
+
+    let paid_plan_id = create_plan(&app, &admin_token, None, "Paid To Free Plan", 1, 10, 30).await;
+    let (status, body) = put(
+        &app,
+        &format!("/api/plans/{paid_plan_id}"),
+        Some(&admin_token),
+        Some(&json!({ "price": 0 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "update plan to free: {body}");
+    assert_eq!(body["price"], 0);
+}
+
+#[tokio::test]
 async fn test_plan_create_validation() {
     let app = axum_helpers::create_app().await;
     let admin_token =
         axum_helpers::create_admin_and_login(&app, &common::unique_email("plan_val_adm")).await;
 
     for body in [
-        json!({ "name": "Bad", "price": 0, "total_calls": 10, "validity_days": 30 }),
+        json!({ "name": "Bad", "price": -1, "total_calls": 10, "validity_days": 30 }),
         json!({ "name": "Bad", "price": 100, "total_calls": 0, "validity_days": 30 }),
         json!({ "name": "Bad", "price": 100, "total_calls": 10, "validity_days": 0 }),
+        json!({ "name": "Bad", "price": 100, "total_calls": 10, "validity_days": 30, "purchase_limit": 0 }),
+        json!({ "name": "Bad", "price": 100, "total_calls": 10, "validity_days": 30, "purchase_limit": -1 }),
         json!({ "name": "  ", "price": 100, "total_calls": 10, "validity_days": 30 }),
     ] {
         let (status, resp) = post(&app, "/api/plans", Some(&admin_token), Some(&body)).await;
@@ -506,6 +575,13 @@ async fn test_available_plans_only_active_own_tenant() {
         .iter()
         .filter_map(|p| p["id"].as_str())
         .collect();
+    let active = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["id"] == active_plan)
+        .expect("active plan response");
+    assert_eq!(active["purchases_used"], 0);
     assert!(ids.contains(&active_plan.as_str()), "active plan visible");
     assert!(
         !ids.contains(&disabled_plan.as_str()),
@@ -596,6 +672,203 @@ async fn test_purchase_flow_with_balance() {
         .filter(|p| p["status"] == "active")
         .count();
     assert_eq!(actives, 2, "purchased instances survive template deletion");
+}
+
+#[tokio::test]
+async fn test_free_plan_purchase_creates_zero_amount_order_without_changing_balance() {
+    let app = axum_helpers::create_app().await;
+    let admin_token =
+        axum_helpers::create_admin_and_login(&app, &common::unique_email("free_buy_adm")).await;
+
+    let user_email = common::unique_email("free_buy_user");
+    create_user(&app, &admin_token, &user_email, None).await;
+    let plan_id = create_plan(&app, &admin_token, None, "Free Buy Plan", 0, 10, 30).await;
+    let user_token = axum_helpers::login(&app, &user_email).await;
+
+    let (status, body) = post(
+        &app,
+        &format!("/api/plans/{plan_id}/purchase"),
+        Some(&user_token),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "purchase free plan: {body}");
+    assert_eq!(body["order"]["amount"], 0);
+    assert_eq!(body["order"]["status"], "paid");
+    assert_eq!(body["user_plan"]["remaining_calls"], 10);
+    assert_eq!(body["balance"], 0);
+
+    let (status, body) = get(&app, "/api/users/me/orders", Some(&user_token)).await;
+    assert_eq!(status, StatusCode::OK, "list free plan order: {body}");
+    assert_eq!(body["total"], 1);
+    assert_eq!(body["items"][0]["amount"], 0);
+}
+
+#[tokio::test]
+async fn test_purchase_limit_excludes_admin_grants_persists_after_refund_and_can_be_cleared() {
+    let app = axum_helpers::create_app().await;
+    let admin_token =
+        axum_helpers::create_admin_and_login(&app, &common::unique_email("purchase_limit_adm"))
+            .await;
+
+    let user_email = common::unique_email("purchase_limit_user");
+    let user_id = create_user(&app, &admin_token, &user_email, None).await;
+    let (status, body) = put(
+        &app,
+        &format!("/api/users/{user_id}/balance"),
+        Some(&admin_token),
+        Some(&json!({ "balance": 10i64 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fund user: {body}");
+
+    let plan_id =
+        create_plan_with_limit(&app, &admin_token, None, "Limited Plan", 1, 10, 30, Some(1)).await;
+
+    // An administrator grant creates an instance but does not consume the
+    // self-service purchase allowance.
+    let (status, body) = post(
+        &app,
+        &format!("/api/users/{user_id}/plans"),
+        Some(&admin_token),
+        Some(&json!({ "plan_id": plan_id })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "admin grant: {body}");
+    assert_eq!(body["source"], "admin_grant");
+
+    let user_token = axum_helpers::login(&app, &user_email).await;
+    let purchase_uri = format!("/api/plans/{plan_id}/purchase");
+    let (status, body) = post(&app, &purchase_uri, Some(&user_token), None).await;
+    assert_eq!(status, StatusCode::OK, "first purchase: {body}");
+    assert_eq!(body["balance"], 9);
+
+    let (status, available) = get(&app, "/api/plans/available", Some(&user_token)).await;
+    assert_eq!(status, StatusCode::OK, "available plans: {available}");
+    let limited = available["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|plan| plan["id"] == plan_id)
+        .expect("limited plan remains visible");
+    assert_eq!(limited["purchases_used"], 1);
+    assert_eq!(limited["purchase_limit"], 1);
+
+    // Changing the audit-order status is record keeping only. The durable
+    // purchase instance remains and therefore still occupies the allowance.
+    let (status, orders) = get(
+        &app,
+        &format!("/api/orders?page=1&per_page=10&user_id={user_id}"),
+        Some(&admin_token),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "list orders: {orders}");
+    let order_id = orders["items"][0]["id"].as_str().unwrap();
+    let (status, body) = put(
+        &app,
+        &format!("/api/orders/{order_id}"),
+        Some(&admin_token),
+        Some(&json!({ "status": "refunded" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "refund order record: {body}");
+
+    let (status, body) = post(&app, &purchase_uri, Some(&user_token), None).await;
+    assert_eq!(status, StatusCode::CONFLICT, "limited purchase: {body}");
+    assert_eq!(body["error"], "purchase_limit_reached");
+
+    // JSON null explicitly removes the limit; an omitted field would leave it
+    // unchanged (covered by the request deserialization unit test).
+    let (status, body) = put(
+        &app,
+        &format!("/api/plans/{plan_id}"),
+        Some(&admin_token),
+        Some(&json!({ "purchase_limit": null })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "clear purchase limit: {body}");
+    assert!(body["purchase_limit"].is_null());
+
+    let (status, body) = post(&app, &purchase_uri, Some(&user_token), None).await;
+    assert_eq!(status, StatusCode::OK, "purchase after clearing: {body}");
+    assert_eq!(body["balance"], 8);
+
+    let (status, body) = get(&app, "/api/users/me/plans", Some(&user_token)).await;
+    assert_eq!(status, StatusCode::OK, "list instances: {body}");
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["source"] == "purchase")
+            .count(),
+        2
+    );
+    assert_eq!(
+        items
+            .iter()
+            .filter(|item| item["source"] == "admin_grant")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn test_purchase_limit_is_atomic_without_redis_purchase_lock() {
+    let app = axum_helpers::create_app().await;
+    let admin_token = axum_helpers::create_admin_and_login(
+        &app,
+        &common::unique_email("purchase_limit_race_adm"),
+    )
+    .await;
+
+    let user_email = common::unique_email("purchase_limit_race_user");
+    let user_id = create_user(&app, &admin_token, &user_email, None).await;
+    let (status, body) = put(
+        &app,
+        &format!("/api/users/{user_id}/balance"),
+        Some(&admin_token),
+        Some(&json!({ "balance": 10i64 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fund user: {body}");
+    let plan_id = create_plan_with_limit(
+        &app,
+        &admin_token,
+        None,
+        "Atomic Limited Plan",
+        1,
+        10,
+        30,
+        Some(1),
+    )
+    .await;
+
+    // Call the service directly so Redis's duplicate-submit lock cannot hide
+    // a race in the database enforcement. The buyer row lock must serialize
+    // count + insert into one atomic decision.
+    let db = common::create_test_db_and_run_migrations().await;
+    let service_a = ains_server::services::plan::PlanService::new(db.clone());
+    let service_b = ains_server::services::plan::PlanService::new(db);
+    let user_id: i64 = user_id.parse().unwrap();
+    let plan_id: i64 = plan_id.parse().unwrap();
+    let (result_a, result_b) = tokio::join!(
+        service_a.purchase(user_id, plan_id),
+        service_b.purchase(user_id, plan_id),
+    );
+    let outcomes = [result_a, result_b];
+    assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(ains_server::services::PlanError::PurchaseLimitReached)
+            ))
+            .count(),
+        1,
+        "one concurrent transaction must observe the committed purchase"
+    );
 }
 
 #[tokio::test]

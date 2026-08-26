@@ -535,6 +535,8 @@ pub struct PlanResponse {
     pub price: i64,
     pub total_calls: i64,
     pub validity_days: i32,
+    #[serde(default)]
+    pub purchase_limit: Option<i32>,
     pub status: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -553,7 +555,16 @@ pub struct PlanListResponse {
 /// Available plans response (user-facing, active plans of own tenant)
 #[derive(Debug, Deserialize)]
 pub struct AvailablePlansResponse {
-    pub items: Vec<PlanResponse>,
+    pub items: Vec<AvailablePlanResponse>,
+}
+
+/// User-facing plan data enriched with this caller's cumulative purchases.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AvailablePlanResponse {
+    #[serde(flatten)]
+    pub plan: PlanResponse,
+    #[serde(default)]
+    pub purchases_used: u64,
 }
 
 /// Create plan request body
@@ -568,6 +579,8 @@ pub struct CreatePlanRequest {
     pub price: i64,
     pub total_calls: i64,
     pub validity_days: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purchase_limit: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }
@@ -585,6 +598,9 @@ pub struct UpdatePlanRequest {
     pub total_calls: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validity_days: Option<i32>,
+    /// Outer `None` omits the field; `Some(None)` serializes JSON `null`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub purchase_limit: Option<Option<i32>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
 }

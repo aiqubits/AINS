@@ -86,6 +86,7 @@ pub fn ConfirmDialog(
                     title,
                     on_close: move |e| on_cancel.call(e),
                     disable_backdrop,
+                    disable_close: loading,
 
                     p { class: "ains-confirm-dialog__msg", "{message}" }
 
@@ -97,7 +98,12 @@ pub fn ConfirmDialog(
                         button {
                             class: "ains-btn ains-btn--secondary",
                             r#type: "button",
-                            onclick: move |e| on_cancel.call(e),
+                            disabled: loading,
+                            onclick: move |e| {
+                                if !loading {
+                                    on_cancel.call(e);
+                                }
+                            },
                             "{cancel_text}"
                         }
                         button {

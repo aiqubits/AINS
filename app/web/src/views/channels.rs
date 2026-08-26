@@ -727,7 +727,12 @@ fn render_delete_confirm(
         .unwrap_or_else(|| t.channels_no_target.to_string());
     let confirm_title = t.channels_confirm_delete_title.to_string();
 
-    let on_cancel = move |_: MouseEvent| close_all(signals);
+    let signals_for_cancel = signals;
+    let on_cancel = move |_: MouseEvent| {
+        if !*signals_for_cancel.submitting.read() {
+            close_all(signals_for_cancel);
+        }
+    };
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
@@ -873,7 +878,12 @@ fn render_form_modal(
         t.channels_form_api_key_hint_edit.to_string()
     };
 
-    let on_close = move |_: MouseEvent| close_all(signals);
+    let signals_for_close = signals;
+    let on_close = move |_: MouseEvent| {
+        if !*signals_for_close.submitting.read() {
+            close_all(signals_for_close);
+        }
+    };
 
     // Protocol toggle
     let mut sig_proto = signals;
@@ -1163,6 +1173,7 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
+            disable_close: submitting,
             div {
                 class: "ains-form-stack",
                 // 点击下拉以外的任意空白/字段区域时关闭租户下拉（不影响模态框）。

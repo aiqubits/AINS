@@ -62,7 +62,21 @@ pub enum ButtonType {
 
 #[cfg(test)]
 mod tests {
+    use dioxus::dioxus_core::{AttributeValue, Mutation, VirtualDom};
+    use dioxus::prelude::*;
+
+    use super::Button;
     use super::{ButtonType, button_class};
+
+    fn submit_button_test_app() -> Element {
+        rsx! {
+            Button {
+                onclick: None,
+                button_type: ButtonType::Submit,
+                "Submit"
+            }
+        }
+    }
 
     #[test]
     fn button_variants_include_the_base_class_and_expected_variant() {
@@ -82,5 +96,20 @@ mod tests {
             button_class(true, ButtonType::Danger),
             "ains-btn ains-btn--danger ains-btn--block"
         );
+    }
+
+    #[test]
+    fn submit_variant_renders_native_submit_semantics() {
+        let mut dom = VirtualDom::new(submit_button_test_app);
+        let mutations = dom.rebuild_to_vec();
+
+        assert!(mutations.edits.iter().any(|mutation| matches!(
+            mutation,
+            Mutation::SetAttribute {
+                name: "type",
+                value: AttributeValue::Text(value),
+                ..
+            } if value == "submit"
+        )));
     }
 }

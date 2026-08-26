@@ -673,9 +673,10 @@ impl Client {
     /// 余额不足时服务端以 `400 insufficient_balance` 拒绝；同一用户的
     /// 并发重复提交会被服务端购买锁以 `409 purchase_in_progress` 拒绝。
     ///
-    /// 注意：购买锁是按用户（而非用户+套餐）粒度的防重复提交保护，
-    /// `409` 表示“稍后重试”而非终态拒绝 —— 集成方应在短暂延迟后重试，
-    /// 而不是将其视为失败。
+    /// 注意：购买锁是按用户（而非用户+套餐）粒度的防重复提交保护。
+    /// 只有 `409 purchase_in_progress` 表示“稍后重试”；
+    /// `409 purchase_limit_reached` 是已达到套餐累计限购次数的终态拒绝，
+    /// 集成方必须按响应体中的 `error` 字段区分两者。
     pub async fn purchase_plan(&self, id: &str) -> Result<PurchasePlanResponse, ClientError> {
         self.post_json(
             &format!("/api/plans/{}/purchase", id),

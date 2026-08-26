@@ -12,7 +12,10 @@
 //! Run: cargo test --test axum_bootstrap_test
 
 use chrono::Utc;
-use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
+use sea_orm::{
+    ConnectOptions, ConnectionTrait, Database, DatabaseBackend, EntityTrait, Statement,
+    TransactionTrait,
+};
 
 mod common;
 
@@ -64,6 +67,9 @@ async fn test_migration_creates_required_tables() {
         "ai_gateway_channels",
         "snowflake_worker",
         "token_usage",
+        "plans",
+        "user_plans",
+        "payment_orders",
     ];
 
     // Use sea_orm query to check each table
@@ -89,6 +95,114 @@ async fn test_migration_creates_required_tables() {
     }
 }
 
+/// Verify the canonical fresh schema contains the nullable positive
+/// per-user purchase limit. This deliberately does not add an ALTER path:
+/// a failure means the integration database must be recreated from 001_init.
+#[tokio::test]
+async fn test_migration_creates_plan_purchase_limit_column() {
+    let db = common::create_test_db_and_run_migrations().await;
+    let row = db
+        .write_conn()
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT is_nullable, data_type FROM information_schema.columns \
+             WHERE table_schema = current_schema() \
+               AND table_name = 'plans' AND column_name = 'purchase_limit'"
+                .to_string(),
+        ))
+        .await
+        .expect("Failed to inspect plans.purchase_limit")
+        .expect(
+            "plans.purchase_limit is missing; recreate the integration database from 001_init.sql",
+        );
+
+    assert_eq!(row.try_get_by::<String, _>("is_nullable").unwrap(), "YES");
+    assert_eq!(row.try_get_by::<String, _>("data_type").unwrap(), "integer");
+}
+
+/// Verify concurrent application instances wait for the canonical schema
+/// transaction instead of racing PostgreSQL's system catalog during startup.
+#[tokio::test]
+async fn test_concurrent_migrations_wait_for_advisory_lock() {
+    let config = common::load_test_config();
+    let mut blocker_options = ConnectOptions::new(config.database_url.clone());
+    blocker_options.max_connections(2);
+    let blocker = Database::connect(blocker_options)
+        .await
+        .expect("Failed to connect migration lock holder");
+
+    let lock_transaction = blocker
+        .begin()
+        .await
+        .expect("Failed to begin migration lock holder");
+    lock_transaction
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            format!(
+                "SELECT pg_advisory_xact_lock({})",
+                ains_server::migrations::MIGRATION_ADVISORY_LOCK_KEY
+            ),
+        ))
+        .await
+        .expect("Failed to hold migration advisory lock");
+
+    // A single-connection pool makes the PID observed here the same backend
+    // that run_migrations uses for its transaction.
+    let mut runner_options = ConnectOptions::new(config.database_url);
+    runner_options.max_connections(1);
+    let runner = Database::connect(runner_options)
+        .await
+        .expect("Failed to connect concurrent migration runner");
+    let runner_pid = runner
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_string(),
+        ))
+        .await
+        .expect("Failed to read migration runner PID")
+        .expect("PostgreSQL must return a backend PID")
+        .try_get_by::<i32, _>("pid")
+        .expect("Migration runner PID must be an integer");
+
+    let migration_task =
+        tokio::spawn(async move { ains_server::migrations::run_migrations(&runner).await });
+
+    let mut observed_wait = false;
+    for _ in 0..100 {
+        observed_wait = blocker
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "SELECT wait_event = 'advisory' AS waiting \
+                     FROM pg_stat_activity WHERE pid = {runner_pid}"
+                ),
+            ))
+            .await
+            .expect("Failed to inspect concurrent migration wait")
+            .and_then(|row| row.try_get_by::<bool, _>("waiting").ok())
+            .unwrap_or(false);
+        if observed_wait {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    assert!(
+        observed_wait,
+        "concurrent migration did not wait on the database advisory lock"
+    );
+
+    lock_transaction
+        .rollback()
+        .await
+        .expect("Failed to release migration advisory lock");
+    tokio::time::timeout(std::time::Duration::from_secs(10), migration_task)
+        .await
+        .expect("Concurrent migration did not resume after lock release")
+        .expect("Concurrent migration task panicked")
+        .expect("Concurrent migration failed after lock release");
+}
+
 /// Verify default tenant has proper GIN index on channels.capabilities.
 #[tokio::test]
 async fn test_migration_creates_channel_indexes() {
@@ -101,6 +215,7 @@ async fn test_migration_creates_channel_indexes() {
         "idx_token_usage_user",
         "idx_token_usage_tenant",
         "idx_token_usage_channel",
+        "idx_user_plans_purchase_count",
     ];
 
     for index in &required_indexes {

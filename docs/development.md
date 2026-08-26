@@ -125,17 +125,25 @@ pub fn health_routes() -> AppRouter {
 
 ---
 
-## 添加新的数据库表
+## 数据库结构变更
+
+当前系统只支持全新部署，尚无需要兼容或迁移的生产旧数据。完整数据库结构以
+`server/migrations/001_init.sql` 为唯一来源：新增或修改表、字段、约束、索引和
+初始化数据时，必须直接修改该文件，不得新建 `002_*.sql` 等增量迁移，也不要为
+当前阶段编写 `ALTER TABLE` 兼容路径。只有在项目明确开始支持保留生产数据的版本
+升级后，才重新评估迁移策略。启动时会重复执行该文件，因此建表和索引必须使用
+`IF NOT EXISTS`，初始化 `INSERT` 必须使用 `ON CONFLICT`，确保所有语句可安全重放。
 
 ### 步骤
 
-1. 在 `server/migrations/` 创建 SQL 迁移文件，命名 `NNN_description.sql`
-2. 运行 `cargo run` 自动执行新迁移
-3. 在 `server/src/repositories/` 中创建 SeaORM Entity
+1. 直接修改 `server/migrations/001_init.sql` 中对应的 `CREATE TABLE`、约束或索引
+2. 同步 `server/src/repositories/` 中的 SeaORM Entity 和相关 API 契约
+3. 同步 `server/src/migrations.rs` 的 schema 断言与数据库集成测试
+4. 使用全新测试数据库运行迁移和相关测试
 
-### 示例：创建 `books` 表
+### 示例：在初始结构中创建 `books` 表
 
-**migrations/002_create_books_table.sql**:
+**server/migrations/001_init.sql**:
 
 ```sql
 CREATE TABLE IF NOT EXISTS books (
@@ -147,7 +155,7 @@ CREATE TABLE IF NOT EXISTS books (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
-CREATE INDEX idx_books_user_id ON books(user_id);
+CREATE INDEX IF NOT EXISTS idx_books_user_id ON books(user_id);
 ```
 
 **repositories/book.rs**:

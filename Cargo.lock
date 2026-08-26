@@ -8613,9 +8613,14 @@ dependencies = [
  "dioxus-icons",
  "gloo-timers",
  "i18n",
+ "js-sys",
  "pulldown-cmark",
  "serde_json",
  "tokio",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "wasm-bindgen-test",
+ "web-sys",
 ]
 
 [[package]]

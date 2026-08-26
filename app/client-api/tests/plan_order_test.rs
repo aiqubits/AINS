@@ -27,6 +27,7 @@ fn plan_json(id: &str, name: &str, status: &str) -> serde_json::Value {
         "price": 40_000_000_000i64,
         "total_calls": 100,
         "validity_days": 30,
+        "purchase_limit": 2,
         "status": status,
         "created_at": BASE_TS,
         "updated_at": BASE_TS,
@@ -79,6 +80,7 @@ async fn test_list_plans_sends_tenant_filter() {
     assert_eq!(resp.items.len(), 1);
     assert_eq!(resp.items[0].name, "Starter");
     assert_eq!(resp.items[0].price, 40_000_000_000i64);
+    assert_eq!(resp.items[0].purchase_limit, Some(2));
 }
 
 #[tokio::test]
@@ -109,11 +111,50 @@ async fn test_create_plan_serializes_optional_fields() {
             price: 40_000_000_000,
             total_calls: 100,
             validity_days: 30,
+            purchase_limit: None,
             status: None,
         })
         .await
         .unwrap();
     assert_eq!(resp.id, PLAN_ID);
+}
+
+#[tokio::test]
+async fn test_update_plan_serializes_limit_value_null_and_omission() {
+    use client_api::UpdatePlanRequest;
+
+    let (client, mock_server) = create_test_client().await;
+    client.set_token(fixtures::TEST_TOKEN);
+
+    for (request, expected) in [
+        (
+            UpdatePlanRequest {
+                purchase_limit: Some(Some(3)),
+                ..Default::default()
+            },
+            serde_json::json!({ "purchase_limit": 3 }),
+        ),
+        (
+            UpdatePlanRequest {
+                purchase_limit: Some(None),
+                ..Default::default()
+            },
+            serde_json::json!({ "purchase_limit": null }),
+        ),
+        (UpdatePlanRequest::default(), serde_json::json!({})),
+    ] {
+        Mock::given(method("PUT"))
+            .and(path(format!("/api/plans/{PLAN_ID}")))
+            .and(body_json(expected))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(plan_json(PLAN_ID, "Starter", "active")),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        client.update_plan(PLAN_ID, request).await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -220,6 +261,29 @@ async fn test_purchase_plan_conflict_preserves_purchase_in_progress_code() {
 }
 
 #[tokio::test]
+async fn test_purchase_plan_conflict_preserves_purchase_limit_code() {
+    let (client, mock_server) = create_test_client().await;
+    client.set_token(fixtures::TEST_TOKEN);
+
+    Mock::given(method("POST"))
+        .and(path(format!("/api/plans/{}/purchase", PLAN_ID)))
+        .respond_with(ResponseTemplate::new(409).set_body_json(serde_json::json!({
+            "error": "purchase_limit_reached",
+            "message": "Purchase limit reached for this plan",
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let err = client.purchase_plan(PLAN_ID).await.unwrap_err();
+    match err {
+        ClientError::Other(409, body) => {
+            assert!(body.contains("purchase_limit_reached"), "body: {body}");
+        }
+        other => panic!("expected Other(409, ..), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn test_purchase_plan_tenant_disabled_maps_to_other_403() {
     let (client, mock_server) = create_test_client().await;
     client.set_token(fixtures::TEST_TOKEN);
@@ -249,11 +313,13 @@ async fn test_purchase_plan_tenant_disabled_maps_to_other_403() {
 async fn test_list_available_and_my_plans() {
     let (client, mock_server) = create_test_client().await;
     client.set_token(fixtures::TEST_TOKEN);
+    let mut available_plan = plan_json(PLAN_ID, "Starter", "active");
+    available_plan["purchases_used"] = serde_json::json!(1);
 
     Mock::given(method("GET"))
         .and(path("/api/plans/available"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "items": [plan_json(PLAN_ID, "Starter", "active")],
+            "items": [available_plan],
         })))
         .mount(&mock_server)
         .await;
@@ -267,6 +333,8 @@ async fn test_list_available_and_my_plans() {
 
     let avail = client.list_available_plans().await.unwrap();
     assert_eq!(avail.items.len(), 1);
+    assert_eq!(avail.items[0].purchases_used, 1);
+    assert_eq!(avail.items[0].plan.id, PLAN_ID);
     let mine = client.list_my_plans().await.unwrap();
     assert!(mine.items.is_empty());
 }

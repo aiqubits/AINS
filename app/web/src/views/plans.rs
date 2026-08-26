@@ -14,8 +14,8 @@ use dioxus::prelude::*;
 use dioxus_icons::lucide::{LoaderCircle, Pencil, Plus, Trash2, TriangleAlert};
 
 use ui::{
-    Align, Badge, BadgeVariant, Button, ButtonType, Column, DataTable, I18nContext, Modal,
-    TextInput, Translations, tf,
+    Align, Badge, BadgeVariant, Button, ButtonType, Column, DataTable, I18nContext, InputType,
+    Modal, TextInput, Translations, tf,
 };
 
 use crate::api::{ErrorContext, humanize_error};
@@ -25,11 +25,19 @@ use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
 
-use super::tenant_select::{TenantSelectView, load_tenant_page, render_tenant_select};
+use super::{
+    format_purchase_limit,
+    tenant_select::{TenantSelectView, load_tenant_page, render_tenant_select},
+};
 
 /// DOM id of the tenant dropdown scroll panel — used by the infinite-scroll
 /// handler to read the panel's scroll position via `element_near_bottom`.
 const TENANT_PANEL_ID: &str = "plan-tenant-dropdown-panel";
+const MAX_PLAN_VALIDITY_DAYS: i32 = 36_500;
+// Free plans are supported. `step="any"` avoids the browser rejecting values
+// that the exact decimal parser and backend contract intentionally support.
+const MIN_PLAN_PRICE: &str = "0";
+const PLAN_PRICE_STEP: &str = "any";
 
 #[derive(Debug, Clone)]
 enum ListState {
@@ -62,6 +70,7 @@ struct PlansSignals {
     form_desc: Signal<String>,
     form_price: Signal<String>,
     form_calls: Signal<String>,
+    form_purchase_limit: Signal<String>,
     form_validity: Signal<String>,
     form_status: Signal<String>,
     submitting: Signal<bool>,
@@ -110,6 +119,7 @@ pub fn Plans() -> Element {
         form_desc: use_signal(String::new),
         form_price: use_signal(String::new),
         form_calls: use_signal(String::new),
+        form_purchase_limit: use_signal(String::new),
         form_validity: use_signal(String::new),
         form_status: use_signal(|| "active".to_string()),
         submitting: use_signal(|| false),
@@ -236,6 +246,7 @@ pub fn Plans() -> Element {
         signals_for_open.form_desc.set(String::new());
         signals_for_open.form_price.set(String::new());
         signals_for_open.form_calls.set(String::new());
+        signals_for_open.form_purchase_limit.set(String::new());
         signals_for_open.form_validity.set(String::new());
         signals_for_open.form_status.set("active".to_string());
         signals_for_open.form_error.set(None);
@@ -445,6 +456,12 @@ fn row_element(
         s_edit.form_desc.set(p_for_edit.description.clone());
         s_edit.form_price.set(format_balance(p_for_edit.price));
         s_edit.form_calls.set(p_for_edit.total_calls.to_string());
+        s_edit.form_purchase_limit.set(
+            p_for_edit
+                .purchase_limit
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
+        );
         s_edit
             .form_validity
             .set(p_for_edit.validity_days.to_string());
@@ -475,6 +492,7 @@ fn row_element(
             td { class: "ains-table__mono ains-table__align--right", "{price_display}" }
             td { class: "ains-table__mono ains-table__align--right", "{plan.total_calls}" }
             td { class: "ains-table__mono ains-table__align--right", "{plan.validity_days}" }
+            td { class: "ains-table__mono ains-table__align--right", "{format_purchase_limit(t, plan.purchase_limit)}" }
             td {
                 if is_active {
                     Badge { variant: BadgeVariant::User, "{t.plans_badge_active}" }
@@ -513,6 +531,7 @@ fn close_all(mut signals: PlansSignals) {
     signals.form_desc.set(String::new());
     signals.form_price.set(String::new());
     signals.form_calls.set(String::new());
+    signals.form_purchase_limit.set(String::new());
     signals.form_validity.set(String::new());
     signals.form_status.set("active".to_string());
     signals.submitting.set(false);
@@ -576,7 +595,12 @@ fn render_delete_confirm(
         .unwrap_or_else(|| t.plans_no_target.to_string());
     let confirm_delete_title = t.plans_confirm_delete_title.to_string();
 
-    let on_cancel = move |_: MouseEvent| close_all(signals);
+    let signals_for_cancel = signals;
+    let on_cancel = move |_: MouseEvent| {
+        if !*signals_for_cancel.submitting.read() {
+            close_all(signals_for_cancel);
+        }
+    };
     let mut s_async = signals;
     let c_async = client;
     let b_async = log_bus;
@@ -674,10 +698,17 @@ fn render_form_modal(
 
     let name_empty = t.plans_name_empty.to_string();
     let invalid_numbers = t.plans_invalid_numbers.to_string();
+    let invalid_validity_range = t.plans_invalid_validity_range.to_string();
+    let invalid_purchase_limit = t.plans_invalid_purchase_limit.to_string();
     let tenant_required = t.plans_tenant_required.to_string();
     let no_target_id = t.plans_modal_no_target_id.to_string();
 
-    let on_close = move |_: MouseEvent| close_all(signals);
+    let signals_for_close = signals;
+    let on_close = move |_: MouseEvent| {
+        if !*signals_for_close.submitting.read() {
+            close_all(signals_for_close);
+        }
+    };
     let mut signals_for_status = signals;
     let pick_active = move |_: MouseEvent| signals_for_status.form_status.set("active".to_string());
     let pick_disabled =
@@ -687,7 +718,8 @@ fn render_form_modal(
     let mut signals_for_submit = signals;
     let auth_for_submit = auth.clone();
     let client_for_submit = client.clone();
-    let on_submit = move |_: MouseEvent| {
+    let on_submit = move |event: FormEvent| {
+        event.prevent_default();
         if *signals_for_submit.submitting.read() {
             return;
         }
@@ -701,7 +733,7 @@ fn render_form_modal(
             signals_for_submit.form_error.set(Some(name_empty.clone()));
             return;
         }
-        // 数值字段统一校验：价格（展示单位）、次数与有效期必须为正。
+        // 数值字段统一校验：价格（展示单位）非负，次数与有效期必须为正。
         let price_text = signals_for_submit.form_price.cloned();
         let price = parse_display_amount(&price_text);
         let calls = signals_for_submit
@@ -716,18 +748,31 @@ fn render_form_modal(
             .trim()
             .parse::<i32>()
             .ok();
+        let purchase_limit = parse_purchase_limit(&signals_for_submit.form_purchase_limit.cloned());
         let (Some(price), Some(calls), Some(validity)) = (price, calls, validity) else {
             signals_for_submit
                 .form_error
                 .set(Some(invalid_numbers.clone()));
             return;
         };
-        if price <= 0 || calls <= 0 || validity <= 0 {
+        if price < 0 || calls <= 0 {
             signals_for_submit
                 .form_error
                 .set(Some(invalid_numbers.clone()));
             return;
         }
+        if !validity_days_in_range(validity) {
+            signals_for_submit
+                .form_error
+                .set(Some(invalid_validity_range.clone()));
+            return;
+        }
+        let Some(purchase_limit) = purchase_limit else {
+            signals_for_submit
+                .form_error
+                .set(Some(invalid_purchase_limit.clone()));
+            return;
+        };
         if kind_now == ModalKind::Create && actor_is_system && tenant_id.is_empty() {
             signals_for_submit
                 .form_error
@@ -761,6 +806,7 @@ fn render_form_modal(
                             price,
                             total_calls: calls,
                             validity_days: validity,
+                            purchase_limit,
                             status: None,
                         })
                         .await;
@@ -784,6 +830,7 @@ fn render_form_modal(
                                 price: price_field,
                                 total_calls: Some(calls),
                                 validity_days: Some(validity),
+                                purchase_limit: Some(purchase_limit),
                                 status: Some(status),
                             },
                         )
@@ -840,8 +887,10 @@ fn render_form_modal(
             on_close,
             open: true,
             disable_backdrop: submitting,
-            div {
+            disable_close: submitting,
+            form {
                 class: "ains-form-stack",
+                onsubmit: on_submit,
                 // 点击下拉以外的任意空白/字段区域时关闭租户下拉（不影响模态框）。
                 // 无需覆盖层，因此不会遮挡模态框右侧滚动条。
                 onclick: move |_: MouseEvent| {
@@ -895,6 +944,9 @@ fn render_form_modal(
                 TextInput {
                     label: t.plans_form_price_label.to_string(),
                     value: signals.form_price,
+                    input_type: InputType::Number,
+                    min: Some(MIN_PLAN_PRICE.to_string()),
+                    step: Some(PLAN_PRICE_STEP.to_string()),
                     required: true,
                     disabled: submitting,
                     name: Some("price".to_string()),
@@ -902,13 +954,29 @@ fn render_form_modal(
                 TextInput {
                     label: t.plans_form_calls_label.to_string(),
                     value: signals.form_calls,
+                    input_type: InputType::Number,
+                    min: Some("1".to_string()),
+                    step: Some("1".to_string()),
                     required: true,
                     disabled: submitting,
                     name: Some("total_calls".to_string()),
                 }
                 TextInput {
+                    label: t.plans_form_purchase_limit_label.to_string(),
+                    value: signals.form_purchase_limit,
+                    input_type: InputType::Number,
+                    min: Some("1".to_string()),
+                    step: Some("1".to_string()),
+                    disabled: submitting,
+                    name: Some("purchase_limit".to_string()),
+                }
+                TextInput {
                     label: t.plans_form_validity_label.to_string(),
                     value: signals.form_validity,
+                    input_type: InputType::Number,
+                    min: Some("1".to_string()),
+                    max: Some("36500".to_string()),
+                    step: Some("1".to_string()),
                     required: true,
                     disabled: submitting,
                     name: Some("validity_days".to_string()),
@@ -916,17 +984,22 @@ fn render_form_modal(
                 // Status toggle only in Edit mode (created plans default to active)
                 if !is_create {
                     div { class: "ains-form-field",
-                        label { class: "ains-form-label", "{t.plans_form_status_label}" }
-                        div { class: "ains-form-pill-group",
+                        span { id: "plan-status-label", class: "ains-form-label", "{t.plans_form_status_label}" }
+                        div {
+                            class: "ains-form-pill-group",
+                            role: "group",
+                            aria_labelledby: "plan-status-label",
                             button {
                                 r#type: "button",
                                 class: if status_now == "active" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
+                                aria_pressed: if status_now == "active" { "true" } else { "false" },
                                 onclick: pick_active,
                                 "{t.plans_form_status_active}"
                             }
                             button {
                                 r#type: "button",
                                 class: if status_now == "disabled" { "ains-form-pill ains-form-pill--active" } else { "ains-form-pill" },
+                                aria_pressed: if status_now == "disabled" { "true" } else { "false" },
                                 onclick: pick_disabled,
                                 "{t.plans_form_status_disabled}"
                             }
@@ -938,7 +1011,7 @@ fn render_form_modal(
                     full_width: true,
                     disabled: submitting,
                     loading: submitting,
-                    onclick: on_submit,
+                    onclick: None,
                     "{submit_label}"
                 }
             }
@@ -961,6 +1034,9 @@ fn build_columns(t: &'static Translations, actor_is_system: bool) -> Vec<Column>
         Column::new(t.plans_column_validity)
             .width("w-20")
             .align(Align::Right),
+        Column::new(t.plans_column_purchase_limit)
+            .width("w-24")
+            .align(Align::Right),
         Column::new(t.plans_column_status)
             .width("w-24")
             .align(Align::Center),
@@ -976,6 +1052,23 @@ fn build_columns(t: &'static Translations, actor_is_system: bool) -> Vec<Column>
 
 fn format_dt(dt: &DateTime<Utc>) -> String {
     dt.format("%Y-%m-%d %H:%M").to_string()
+}
+
+fn validity_days_in_range(validity_days: i32) -> bool {
+    (1..=MAX_PLAN_VALIDITY_DAYS).contains(&validity_days)
+}
+
+/// Blank means unlimited; non-blank values must be positive integers.
+fn parse_purchase_limit(value: &str) -> Option<Option<i32>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Some(None);
+    }
+    value
+        .parse::<i32>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .map(Some)
 }
 
 /// UI 纯函数：仅「创建模式 + system 角色」展示所属租户下拉
@@ -1003,8 +1096,12 @@ fn price_update_field(
 
 #[cfg(test)]
 mod tests {
-    use super::{ModalKind, price_update_field, tenant_select_visible};
+    use super::{
+        MIN_PLAN_PRICE, ModalKind, PLAN_PRICE_STEP, parse_purchase_limit, price_update_field,
+        tenant_select_visible, validity_days_in_range,
+    };
     use crate::balance::{BALANCE_SCALE, format_balance, parse_display_amount};
+    use client_api::UpdatePlanRequest;
 
     #[test]
     fn tenant_select_only_for_system_create() {
@@ -1018,8 +1115,62 @@ mod tests {
     }
 
     #[test]
+    fn purchase_limit_parser_supports_unlimited_and_positive_values() {
+        assert_eq!(parse_purchase_limit(""), Some(None));
+        assert_eq!(parse_purchase_limit("  "), Some(None));
+        assert_eq!(parse_purchase_limit("1"), Some(Some(1)));
+        assert_eq!(parse_purchase_limit("2147483647"), Some(Some(i32::MAX)));
+        assert_eq!(parse_purchase_limit("0"), None);
+        assert_eq!(parse_purchase_limit("-1"), None);
+        assert_eq!(parse_purchase_limit("1.5"), None);
+        assert_eq!(parse_purchase_limit("2147483648"), None);
+    }
+
+    #[test]
+    fn edit_purchase_limit_maps_blank_to_explicit_json_null() {
+        let unlimited = parse_purchase_limit("").expect("blank means unlimited");
+        let request = UpdatePlanRequest {
+            purchase_limit: Some(unlimited),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({ "purchase_limit": null })
+        );
+
+        let limited = parse_purchase_limit("3").expect("positive limit");
+        let request = UpdatePlanRequest {
+            purchase_limit: Some(limited),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({ "purchase_limit": 3 })
+        );
+    }
+
+    #[test]
+    fn validity_days_enforces_the_same_documented_bounds() {
+        assert!(!validity_days_in_range(0));
+        assert!(validity_days_in_range(1));
+        assert!(validity_days_in_range(36_500));
+        assert!(!validity_days_in_range(36_501));
+    }
+
+    #[test]
     fn create_always_sends_price() {
         assert_eq!(price_update_field(None, "10.50", 42), Some(42));
+    }
+
+    #[test]
+    fn price_input_constraints_preserve_the_exact_decimal_contract() {
+        assert_eq!(parse_display_amount(MIN_PLAN_PRICE), Some(0));
+        assert_eq!(PLAN_PRICE_STEP, "any");
+        assert_eq!(
+            parse_display_amount("10.0000000001"),
+            Some(BALANCE_SCALE * 10 + 1)
+        );
     }
 
     #[test]

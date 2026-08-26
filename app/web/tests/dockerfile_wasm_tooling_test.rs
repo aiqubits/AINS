@@ -17,6 +17,22 @@
 const CARGO_LOCK: &str = include_str!("../../../Cargo.lock");
 const DOCKERFILE_WEB: &str = include_str!("../../../Dockerfile.web");
 const CI_WORKFLOW: &str = include_str!("../../../.github/workflows/ains.yml");
+const FAVICON_ICO: &[u8] = include_bytes!("../assets/favicon.ico");
+
+/// 浏览器会在 WASM 注入带指纹的 favicon link 之前请求约定俗成的
+/// `/favicon.ico`；运行镜像必须保留一个不带指纹的根路径副本。
+#[test]
+fn dockerfile_copies_favicon_to_conventional_root_path() {
+    assert!(
+        !FAVICON_ICO.is_empty(),
+        "app/web/assets/favicon.ico 不应为空"
+    );
+    assert!(
+        DOCKERFILE_WEB
+            .contains("COPY app/web/assets/favicon.ico /usr/share/nginx/html/favicon.ico"),
+        "Dockerfile.web 必须把 favicon.ico 复制到 nginx 根目录，避免 /favicon.ico 返回 404"
+    );
+}
 
 // ── esbuild 版本同步契约 ──
 //
