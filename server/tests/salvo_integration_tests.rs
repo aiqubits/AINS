@@ -53,6 +53,148 @@ async fn test_old_ai_chat_route_is_not_registered() {
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
 }
 
+// ── Embedding provider contract ─────────────────────────────────────
+
+async fn create_embedding_test_channel(
+    server: &TestServer,
+    system_token: &str,
+    base_url: &str,
+    label: &str,
+) -> String {
+    let model = format!("embedding-contract{}", common::unique_table_name(label));
+    let (status, body) = salvo::post(
+        server,
+        "/api/channels",
+        Some(system_token),
+        Some(&serde_json::json!({
+            "name": format!("Embedding contract {label}"),
+            "protocol_type": "openai",
+            "models": [model.clone()],
+            "capabilities": ["embedding"],
+            "api_key": "sk-embedding-contract",
+            "base_url": base_url,
+            "tenant_id": "default",
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "channel creation failed: {body}"
+    );
+    model
+}
+
+#[tokio::test]
+async fn test_embedding_response_contract_normalizes_base64_through_salvo_stack() {
+    let server = create_server().await;
+    let system_token = salvo::create_system_and_login(
+        &server,
+        &common::unique_email("salvo_embedding_contract_ok"),
+    )
+    .await;
+    let base_url = common::start_json_upstream(serde_json::json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": "AACAPwAAAMA=", "index": 1},
+            {"object": "embedding", "embedding": "AABAQAAAgEA=", "index": 0}
+        ],
+        "usage": {"prompt_tokens": 2, "total_tokens": 2}
+    }))
+    .await;
+    let model =
+        create_embedding_test_channel(&server, &system_token, &base_url, "salvo_valid").await;
+
+    let (status, body) = salvo::post(
+        &server,
+        "/api/ai/response",
+        Some(&system_token),
+        Some(&serde_json::json!({
+            "capability": "embedding",
+            "model": model,
+            "input": ["first", "second"],
+            "encoding_format": "base64",
+            "dimensions": 2,
+        })),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "embedding request failed: {body}"
+    );
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["index"], 1);
+    assert_eq!(
+        body["output"][0]["embedding"],
+        serde_json::json!([1.0, -2.0])
+    );
+    assert_eq!(body["output"][0]["dimensions"], 2);
+    assert_eq!(body["output"][1]["index"], 0);
+    assert_eq!(
+        body["output"][1]["embedding"],
+        serde_json::json!([3.0, 4.0])
+    );
+    assert_eq!(body["output"][1]["dimensions"], 2);
+}
+
+#[tokio::test]
+async fn test_embedding_response_contract_rejects_provider_mismatches_through_salvo_stack() {
+    let server = create_server().await;
+    let system_token = salvo::create_system_and_login(
+        &server,
+        &common::unique_email("salvo_embedding_contract_bad"),
+    )
+    .await;
+
+    for (label, data) in [
+        (
+            "salvo_truncated",
+            serde_json::json!([
+                {"object": "embedding", "embedding": [0.1, 0.2], "index": 0}
+            ]),
+        ),
+        (
+            "salvo_wrong_dimensions",
+            serde_json::json!([
+                {"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0},
+                {"object": "embedding", "embedding": [0.4, 0.5, 0.6], "index": 1}
+            ]),
+        ),
+    ] {
+        let base_url = common::start_json_upstream(serde_json::json!({
+            "object": "list",
+            "data": data,
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        }))
+        .await;
+        let model = create_embedding_test_channel(&server, &system_token, &base_url, label).await;
+        let (status, body) = salvo::post(
+            &server,
+            "/api/ai/response",
+            Some(&system_token),
+            Some(&serde_json::json!({
+                "capability": "embedding",
+                "model": model,
+                "input": ["first", "second"],
+                "dimensions": 2,
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "{label} response should fail closed: {body}"
+        );
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(body["error"]["message"], "AI provider request failed");
+    }
+}
+
 // ── 用户注册 ──────────────────────────────────────────────────────
 
 #[tokio::test]

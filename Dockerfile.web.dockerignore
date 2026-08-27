@@ -1,0 +1,37 @@
+# Web builds use an allowlist so desktop/mobile/server sources are not sent in
+# the Docker build context. Parent directories must be re-included before their
+# children for Docker's negation rules to take effect.
+**
+!Dockerfile.web
+!Dockerfile.web.dockerignore
+
+!prod-build/
+!prod-build/web/
+!prod-build/web/**
+
+!app/
+!app/web/
+!app/web/Dioxus.toml
+!app/web/src/
+!app/web/src/**
+!app/web/assets/
+!app/web/assets/**
+!app/ui/
+!app/ui/src/
+!app/ui/src/**
+!app/ui/assets/
+!app/ui/assets/**
+!app/client-api/
+!app/client-api/src/
+!app/client-api/src/**
+
+!crates/
+!crates/rust-agent/
+!crates/rust-agent/src/
+!crates/rust-agent/src/**
+!crates/i18n/
+!crates/i18n/src/
+!crates/i18n/src/**
+
+!nginx/
+!nginx/default.conf

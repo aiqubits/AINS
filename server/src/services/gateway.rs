@@ -29,6 +29,7 @@ use crate::{
     services::{
         MeteringService, QuotaService,
         dispatch::{self, DispatchAction},
+        responses::{EmbeddingBatchContract, normalize_embedding_batch},
     },
 };
 use bytes::Bytes;
@@ -424,6 +425,11 @@ impl GatewayService {
         required_capabilities: &[ModelCapability],
         mut body: Value,
     ) -> Result<Value, GatewayError> {
+        let embedding_contract = if capability == ModelCapability::Embedding {
+            Some(embedding_response_contract(&body)?)
+        } else {
+            None
+        };
         let requested_model = dispatch::extract_model(&body);
         let channel = self
             .select_channel(tenant_id, required_capabilities, requested_model.as_deref())
@@ -496,8 +502,9 @@ impl GatewayService {
         {
             object.insert("model".into(), Value::String(model.clone()));
         }
-        if let Ok(response) = &result
-            && let Err(error) = validate_provider_response(&capability, response)
+        if let Ok(response) = &mut result
+            && let Err(error) =
+                validate_provider_response(&capability, response, embedding_contract)
         {
             result = Err(error);
         }
@@ -698,8 +705,8 @@ impl GatewayService {
         {
             object.insert("model".into(), Value::String(model.to_string()));
         }
-        if let Ok(response) = &result
-            && let Err(error) = validate_provider_response(&ModelCapability::Stt, response)
+        if let Ok(response) = &mut result
+            && let Err(error) = validate_provider_response(&ModelCapability::Stt, response, None)
         {
             result = Err(error);
         }
@@ -1067,6 +1074,46 @@ fn ensure_request_model(body: &mut Value, channel: &Model) -> Result<(), Gateway
         .ok_or_else(|| GatewayError::InvalidInput("AI request body must be an object".into()))?
         .insert("model".into(), Value::String(model.to_string()));
     Ok(())
+}
+
+fn embedding_response_contract(body: &Value) -> Result<EmbeddingBatchContract, GatewayError> {
+    let expected_count = match body.get("input") {
+        Some(Value::String(input)) if !input.trim().is_empty() => 1,
+        Some(Value::Array(values))
+            if !values.is_empty()
+                && values
+                    .iter()
+                    .all(|value| value.as_str().is_some_and(|input| !input.trim().is_empty())) =>
+        {
+            values.len()
+        }
+        _ => {
+            return Err(GatewayError::InvalidInput(
+                "Embedding input must be a string or non-empty string array".into(),
+            ));
+        }
+    };
+
+    let expected_dimensions = match body.get("dimensions") {
+        None => None,
+        Some(dimensions) => {
+            let dimensions = dimensions
+                .as_u64()
+                .filter(|dimensions| *dimensions > 0)
+                .and_then(|dimensions| usize::try_from(dimensions).ok())
+                .ok_or_else(|| {
+                    GatewayError::InvalidInput(
+                        "Embedding dimensions must be a positive integer".into(),
+                    )
+                })?;
+            Some(dimensions)
+        }
+    };
+
+    Ok(EmbeddingBatchContract {
+        expected_count,
+        expected_dimensions,
+    })
 }
 
 fn enable_stream_usage(body: &mut Value) -> Result<(), GatewayError> {
@@ -1722,36 +1769,18 @@ fn audio_mime_from_filename(filename: &str) -> &'static str {
 
 fn validate_provider_response(
     capability: &ModelCapability,
-    response: &Value,
+    response: &mut Value,
+    embedding_contract: Option<EmbeddingBatchContract>,
 ) -> Result<(), GatewayError> {
     let valid = match capability {
         ModelCapability::Chat | ModelCapability::Vision | ModelCapability::WebSearch => {
             crate::services::responses::is_valid_chat_completions_response(response)
         }
         ModelCapability::Embedding => response
-            .get("data")
-            .and_then(Value::as_array)
-            .filter(|items| !items.is_empty())
-            .is_some_and(|items| {
-                items.iter().all(|item| {
-                    item.get("embedding").is_some_and(|embedding| {
-                        embedding.as_array().is_some_and(|values| {
-                            !values.is_empty() && values.iter().all(Value::is_number)
-                        }) || embedding.as_str().is_some_and(|encoded| {
-                            STANDARD.decode(encoded).is_ok_and(|bytes| {
-                                !bytes.is_empty()
-                                    && bytes.len() % std::mem::size_of::<f32>() == 0
-                                    && bytes.chunks_exact(4).all(|chunk| {
-                                        f32::from_le_bytes(
-                                            chunk.try_into().expect("four-byte chunk"),
-                                        )
-                                        .is_finite()
-                                    })
-                            })
-                        })
-                    })
-                })
-            }),
+            .get_mut("data")
+            .and_then(Value::as_array_mut)
+            .zip(embedding_contract)
+            .is_some_and(|(items, contract)| normalize_embedding_batch(items, contract)),
         ModelCapability::Stt => response.get("text").and_then(Value::as_str).is_some(),
         ModelCapability::Tts => {
             response
@@ -2225,54 +2254,72 @@ mod tests {
         );
     }
 
+    fn validate_embedding_response(
+        response: &mut Value,
+        expected_count: usize,
+        expected_dimensions: Option<usize>,
+    ) -> Result<(), GatewayError> {
+        validate_provider_response(
+            &ModelCapability::Embedding,
+            response,
+            Some(EmbeddingBatchContract {
+                expected_count,
+                expected_dimensions,
+            }),
+        )
+    }
+
     #[test]
     fn malformed_provider_success_payloads_are_rejected() {
         assert!(
-            validate_provider_response(&ModelCapability::Chat, &serde_json::json!({})).is_err()
+            validate_provider_response(&ModelCapability::Chat, &mut serde_json::json!({}), None)
+                .is_err()
         );
         assert!(
-            validate_provider_response(
-                &ModelCapability::Embedding,
-                &serde_json::json!({"data": []}),
-            )
-            .is_err()
+            validate_embedding_response(&mut serde_json::json!({"data": []}), 1, None).is_err()
         );
-        assert!(validate_provider_response(&ModelCapability::Stt, &serde_json::json!({})).is_err());
+        assert!(
+            validate_provider_response(&ModelCapability::Stt, &mut serde_json::json!({}), None)
+                .is_err()
+        );
         assert!(
             validate_provider_response(
                 &ModelCapability::Tts,
-                &serde_json::json!({"audio": "YWJj"}),
+                &mut serde_json::json!({"audio": "YWJj"}),
+                None,
             )
             .is_err()
         );
 
+        let mut embedding = serde_json::json!({"data": [{"embedding": "AACAPw=="}]});
+        assert!(validate_embedding_response(&mut embedding, 1, Some(1)).is_ok());
+        assert_eq!(embedding["data"][0]["embedding"], serde_json::json!([1.0]));
+        assert_eq!(embedding["data"][0]["dimensions"], 1);
         assert!(
             validate_provider_response(
-                &ModelCapability::Embedding,
-                &serde_json::json!({"data": [{"embedding": "AACAPw=="}]}),
+                &ModelCapability::Stt,
+                &mut serde_json::json!({"text": ""}),
+                None,
             )
             .is_ok()
         );
         assert!(
-            validate_provider_response(&ModelCapability::Stt, &serde_json::json!({"text": ""}),)
-                .is_ok()
-        );
-        assert!(
             validate_provider_response(
                 &ModelCapability::Chat,
-                &serde_json::json!({
+                &mut serde_json::json!({
                     "choices": [{
                         "message": {"role": "assistant", "content": null},
                         "finish_reason": "content_filter"
                     }]
                 }),
+                None,
             )
             .is_ok()
         );
         assert!(
             validate_provider_response(
                 &ModelCapability::Chat,
-                &serde_json::json!({
+                &mut serde_json::json!({
                     "choices": [{
                         "message": {
                             "role": "assistant",
@@ -2282,9 +2329,129 @@ mod tests {
                         "finish_reason": "stop"
                     }]
                 }),
+                None,
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn provider_embedding_validation_rejects_empty_misaligned_and_non_finite_base64() {
+        for encoded in [
+            String::new(),
+            STANDARD.encode([0_u8; 3]),
+            STANDARD.encode(f32::NAN.to_le_bytes()),
+            STANDARD.encode(f32::INFINITY.to_le_bytes()),
+            STANDARD.encode(f32::NEG_INFINITY.to_le_bytes()),
+        ] {
+            let mut response = serde_json::json!({"data": [{"embedding": encoded}]});
+            assert!(
+                validate_embedding_response(&mut response, 1, None).is_err(),
+                "invalid embedding payload should be rejected: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_embedding_validation_rejects_numbers_outside_finite_f32_range() {
+        for embedding in [serde_json::json!([1e100]), serde_json::json!([-1e100])] {
+            let mut response = serde_json::json!({"data": [{"embedding": embedding}]});
+            assert!(
+                validate_embedding_response(&mut response, 1, None).is_err(),
+                "out-of-range numeric embedding should be rejected: {response}"
+            );
+        }
+
+        let mut response = serde_json::json!({"data": [{"embedding": [0.0, 1e38, -1e38]}]});
+        assert!(validate_embedding_response(&mut response, 1, Some(3)).is_ok());
+    }
+
+    #[test]
+    fn provider_embedding_validation_rejects_inconsistent_dimensions_and_invalid_indices() {
+        for mut response in [
+            serde_json::json!({
+                "data": [
+                    {"embedding": [0.1, 0.2], "index": 0},
+                    {"embedding": "AACAPw==", "index": 1}
+                ]
+            }),
+            serde_json::json!({"data": [{"embedding": [0.1], "index": null}]}),
+        ] {
+            let expected_count = response["data"].as_array().unwrap().len();
+            assert!(
+                validate_embedding_response(&mut response, expected_count, None).is_err(),
+                "invalid embedding batch should be rejected: {response}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_response_contract_tracks_input_count_and_requested_dimensions() {
+        assert_eq!(
+            embedding_response_contract(&serde_json::json!({
+                "input": ["first", "second"],
+                "dimensions": 256
+            }))
+            .unwrap(),
+            EmbeddingBatchContract {
+                expected_count: 2,
+                expected_dimensions: Some(256),
+            }
+        );
+        assert_eq!(
+            embedding_response_contract(&serde_json::json!({"input": "single"})).unwrap(),
+            EmbeddingBatchContract {
+                expected_count: 1,
+                expected_dimensions: None,
+            }
+        );
+
+        for invalid in [
+            serde_json::json!({"input": []}),
+            serde_json::json!({"input": ["valid", ""]}),
+            serde_json::json!({"input": "", "dimensions": 2}),
+            serde_json::json!({"input": "valid", "dimensions": 0}),
+        ] {
+            assert!(
+                embedding_response_contract(&invalid).is_err(),
+                "body: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_embedding_validation_rejects_truncated_or_wrong_dimension_batches() {
+        let contract = embedding_response_contract(&serde_json::json!({
+            "input": ["first", "second"],
+            "dimensions": 2
+        }))
+        .unwrap();
+        let mut truncated = serde_json::json!({
+            "data": [{"embedding": [0.1, 0.2], "index": 0}]
+        });
+        assert!(matches!(
+            validate_provider_response(
+                &ModelCapability::Embedding,
+                &mut truncated,
+                Some(contract),
+            ),
+            Err(error) if error.is_channel_health_failure()
+        ));
+
+        let mut wrong_dimensions = serde_json::json!({
+            "data": [
+                {"embedding": [0.1, 0.2, 0.3], "index": 1},
+                {"embedding": [0.4, 0.5, 0.6], "index": 0}
+            ]
+        });
+        assert!(matches!(
+            validate_provider_response(
+                &ModelCapability::Embedding,
+                &mut wrong_dimensions,
+                Some(contract),
+            ),
+            Err(error) if error.is_channel_health_failure()
+        ));
     }
 
     #[test]

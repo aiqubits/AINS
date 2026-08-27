@@ -80,3 +80,43 @@ pub fn unique_table_name(prefix: &str) -> String {
         .as_nanos();
     format!("_{}_{}", prefix, ts)
 }
+
+/// Start a loopback HTTP server that returns the same JSON success payload for
+/// every request. Framework integration tests use this to exercise the real
+/// handler -> gateway -> provider boundary without depending on an external AI
+/// service.
+pub async fn start_json_upstream(body: serde_json::Value) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mock upstream should bind to a loopback port");
+    let base_url = format!(
+        "http://{}",
+        listener
+            .local_addr()
+            .expect("mock upstream should expose its local address")
+    );
+    let body = Arc::new(serde_json::to_string(&body).expect("mock payload should serialize"));
+
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut request = vec![0; 8192];
+                if socket.read(&mut request).await.is_err() {
+                    return;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+
+    base_url
+}

@@ -280,27 +280,79 @@ impl AiResponse {
 
     /// embedding 向量组：按输出项的 `index` 升序返回（缺失 index 时回退到
     /// 出现顺序），使返回顺序与输入文本一一对应，不依赖服务端数组顺序。
-    pub fn embeddings(&self) -> Vec<Vec<f32>> {
-        let mut indexed: Vec<(u64, Vec<f32>)> = self
-            .output
+    ///
+    /// 非法 index、不一致维度或超出有限 `f32` 范围的 JSON 数字会返回
+    /// [`ClientError::Deserialization`]，避免将协议错误静默转换为“无向量”。
+    pub fn embeddings(&self) -> Result<Vec<Vec<f32>>, ClientError> {
+        if self.output.is_empty() {
+            return Err(ClientError::Deserialization(
+                "embedding response contained no output items".into(),
+            ));
+        }
+
+        let mut indexed = Vec::new();
+        let mut expected_dimensions = None;
+        for (pos, item) in self.output.iter().enumerate() {
+            let values = item
+                .get("embedding")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    ClientError::Deserialization(
+                        "embedding output item must contain an embedding array".into(),
+                    )
+                })?;
+            if values.is_empty() {
+                return Err(ClientError::Deserialization(
+                    "embedding output must not be empty".into(),
+                ));
+            }
+
+            let mut vector = Vec::with_capacity(values.len());
+            for value in values {
+                let value = value.as_f64().ok_or_else(|| {
+                    ClientError::Deserialization(
+                        "embedding output contains a non-numeric value".into(),
+                    )
+                })? as f32;
+                if !value.is_finite() {
+                    return Err(ClientError::Deserialization(
+                        "embedding output contains a value outside the finite f32 range".into(),
+                    ));
+                }
+                vector.push(value);
+            }
+
+            match expected_dimensions {
+                Some(expected) if vector.len() != expected => {
+                    return Err(ClientError::Deserialization(
+                        "embedding output vectors must all have the same dimensions".into(),
+                    ));
+                }
+                None => expected_dimensions = Some(vector.len()),
+                Some(_) => {}
+            }
+
+            let index = match item.get("index") {
+                None => pos as u64,
+                Some(index) => index.as_u64().ok_or_else(|| {
+                    ClientError::Deserialization(
+                        "embedding output index must be a non-negative integer".into(),
+                    )
+                })?,
+            };
+            indexed.push((index, vector));
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        if indexed
             .iter()
             .enumerate()
-            .filter_map(|(pos, item)| {
-                item.get("embedding").and_then(Value::as_array).map(|xs| {
-                    let vector = xs
-                        .iter()
-                        .filter_map(|v| v.as_f64().map(|f| f as f32))
-                        .collect();
-                    let index = item
-                        .get("index")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(pos as u64);
-                    (index, vector)
-                })
-            })
-            .collect();
-        indexed.sort_by_key(|(index, _)| *index);
-        indexed.into_iter().map(|(_, vector)| vector).collect()
+            .any(|(expected, (actual, _))| *actual != expected as u64)
+        {
+            return Err(ClientError::Deserialization(
+                "embedding output indices must be unique and contiguous from zero".into(),
+            ));
+        }
+        Ok(indexed.into_iter().map(|(_, vector)| vector).collect())
     }
 }
 
@@ -484,6 +536,7 @@ impl Client {
         texts: Vec<String>,
         model: Option<&str>,
     ) -> Result<Vec<Vec<f32>>, ClientError> {
+        let expected_vectors = texts.len();
         let request = AiRequest {
             capability: Some("embedding".to_string()),
             model: model.map(str::to_string),
@@ -491,7 +544,14 @@ impl Client {
             ..Default::default()
         };
         let response = self.response(&request).await?;
-        Ok(response.embeddings())
+        let vectors = response.embeddings()?;
+        if vectors.len() != expected_vectors {
+            return Err(ClientError::Deserialization(format!(
+                "embedding output count mismatch: expected {expected_vectors}, received {}",
+                vectors.len()
+            )));
+        }
+        Ok(vectors)
     }
 
     /// STT 便捷方法：音频字节（客户端负责 base64 编码）→ 转写文本。
@@ -1220,7 +1280,7 @@ mod tests {
             "usage": null, "error": null
         }))
         .unwrap();
-        let embeddings = response.embeddings();
+        let embeddings = response.embeddings().unwrap();
         assert_eq!(embeddings.len(), 2);
         assert_eq!(embeddings[0].len(), 2);
 
@@ -1261,11 +1321,106 @@ mod tests {
             "usage": null, "error": null
         }))
         .unwrap();
-        let embeddings = response.embeddings();
+        let embeddings = response.embeddings().unwrap();
         assert_eq!(embeddings.len(), 2);
         // index 0 对应 [0,0] 应排在前，index 1 对应 [1,1] 在后
         assert_eq!(embeddings[0], vec![0.0f32, 0.0f32]);
         assert_eq!(embeddings[1], vec![1.0f32, 1.0f32]);
+    }
+
+    #[test]
+    fn embedding_extraction_rejects_malformed_and_non_finite_f32_values() {
+        for item in [
+            json!({}),
+            json!({"embedding": null}),
+            json!({"embedding": "AACAPw=="}),
+            json!({"embedding": []}),
+            json!({"embedding": [null]}),
+            json!({"embedding": ["1.0"]}),
+            json!({"embedding": [1e100]}),
+        ] {
+            let response: AiResponse = serde_json::from_value(json!({
+                "id": "resp_e", "object": "response", "created_at": 1,
+                "model": "m", "capability": "embedding", "status": "completed",
+                "incomplete_details": null,
+                "output": [item],
+                "usage": null, "error": null
+            }))
+            .unwrap();
+
+            assert!(
+                response.embeddings().is_err(),
+                "invalid embedding should fail extraction: {item}"
+            );
+        }
+
+        let empty: AiResponse = serde_json::from_value(json!({
+            "id": "resp_e", "object": "response", "created_at": 1,
+            "model": "m", "capability": "embedding", "status": "completed",
+            "incomplete_details": null, "output": [], "usage": null, "error": null
+        }))
+        .unwrap();
+        assert!(empty.embeddings().is_err());
+
+        let duplicate_indices: AiResponse = serde_json::from_value(json!({
+            "id": "resp_e", "object": "response", "created_at": 1,
+            "model": "m", "capability": "embedding", "status": "completed",
+            "incomplete_details": null,
+            "output": [
+                {"embedding": [0.1], "index": 0},
+                {"embedding": [0.2], "index": 0}
+            ],
+            "usage": null, "error": null
+        }))
+        .unwrap();
+        assert!(duplicate_indices.embeddings().is_err());
+
+        for invalid_index in [json!(null), json!("0"), json!(-1), json!(0.5)] {
+            let response: AiResponse = serde_json::from_value(json!({
+                "id": "resp_e", "object": "response", "created_at": 1,
+                "model": "m", "capability": "embedding", "status": "completed",
+                "incomplete_details": null,
+                "output": [{"embedding": [0.1], "index": invalid_index}],
+                "usage": null, "error": null
+            }))
+            .unwrap();
+            assert!(
+                matches!(
+                    response.embeddings(),
+                    Err(ClientError::Deserialization(message)) if message.contains("index")
+                ),
+                "present but invalid index must not fall back to output order: {invalid_index}"
+            );
+        }
+
+        let inconsistent_dimensions: AiResponse = serde_json::from_value(json!({
+            "id": "resp_e", "object": "response", "created_at": 1,
+            "model": "m", "capability": "embedding", "status": "completed",
+            "incomplete_details": null,
+            "output": [
+                {"embedding": [0.1, 0.2], "index": 0},
+                {"embedding": [0.3], "index": 1}
+            ],
+            "usage": null, "error": null
+        }))
+        .unwrap();
+        assert!(matches!(
+            inconsistent_dimensions.embeddings(),
+            Err(ClientError::Deserialization(message)) if message.contains("dimensions")
+        ));
+
+        let missing_indices: AiResponse = serde_json::from_value(json!({
+            "id": "resp_e", "object": "response", "created_at": 1,
+            "model": "m", "capability": "embedding", "status": "completed",
+            "incomplete_details": null,
+            "output": [
+                {"embedding": [0.1, 0.2]},
+                {"embedding": [0.3, 0.4]}
+            ],
+            "usage": null, "error": null
+        }))
+        .unwrap();
+        assert_eq!(missing_indices.embeddings().unwrap().len(), 2);
     }
 
     #[test]

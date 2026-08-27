@@ -321,7 +321,7 @@ async fn handle_direct_capability(
     // mirroring the main chat path (invalid requests never burn quota).
     let plan_ticket = consume_plan_quota(state, actor).await?;
 
-    let mut result = match service(state)
+    let result = match service(state)
         .proxy(
             &actor.tenant_id,
             &actor.user_id,
@@ -340,7 +340,6 @@ async fn handle_direct_capability(
             return Err(error(e));
         }
     };
-    normalize_and_validate_direct_result(&capability, &mut result)?;
     Response::json(&unified_direct_response(&capability, &result))
 }
 
@@ -608,76 +607,6 @@ fn unified_direct_response(
     })
 }
 
-fn normalize_and_validate_direct_result(
-    capability: &crate::repositories::channel::ModelCapability,
-    result: &mut Value,
-) -> Result<(), HttpError> {
-    use crate::repositories::channel::ModelCapability;
-
-    let invalid = || {
-        tracing::warn!(
-            capability = capability.as_str(),
-            "AI provider returned an invalid response"
-        );
-        HttpError::service_unavailable("AI provider returned an invalid response")
-    };
-
-    match capability {
-        ModelCapability::Embedding => {
-            let items = result
-                .get_mut("data")
-                .and_then(Value::as_array_mut)
-                .filter(|items| !items.is_empty())
-                .ok_or_else(invalid)?;
-            for item in items {
-                let object = item.as_object_mut().ok_or_else(invalid)?;
-                let dimensions = {
-                    let embedding = object.get_mut("embedding").ok_or_else(invalid)?;
-                    if let Some(encoded) = embedding.as_str() {
-                        let bytes = BASE64_STANDARD.decode(encoded).map_err(|_| invalid())?;
-                        if bytes.is_empty() || bytes.len() % std::mem::size_of::<f32>() != 0 {
-                            return Err(invalid());
-                        }
-                        let values = bytes
-                            .chunks_exact(4)
-                            .map(|chunk| {
-                                f32::from_le_bytes(chunk.try_into().expect("four-byte chunk"))
-                            })
-                            .collect::<Vec<_>>();
-                        if values.iter().any(|value| !value.is_finite()) {
-                            return Err(invalid());
-                        }
-                        *embedding = serde_json::json!(values);
-                    }
-                    embedding
-                        .as_array()
-                        .filter(|values| !values.is_empty() && values.iter().all(Value::is_number))
-                        .map(Vec::len)
-                        .ok_or_else(invalid)?
-                };
-                object.insert("dimensions".into(), serde_json::json!(dimensions));
-            }
-        }
-        ModelCapability::Stt if result.get("text").and_then(Value::as_str).is_none() => {
-            return Err(invalid());
-        }
-        ModelCapability::Tts
-            if result
-                .get("audio")
-                .and_then(Value::as_str)
-                .is_none_or(|audio| audio.is_empty())
-                || result
-                    .get("content_type")
-                    .and_then(Value::as_str)
-                    .is_none_or(|content_type| content_type.is_empty()) =>
-        {
-            return Err(invalid());
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 fn unified_usage(result: &Value) -> Value {
     let Some(usage) = result.get("usage").and_then(Value::as_object) else {
         return Value::Null;
@@ -704,30 +633,10 @@ fn unified_usage(result: &Value) -> Value {
 }
 
 fn embedding_output(result: &Value) -> Value {
-    let Some(items) = result.get("data").and_then(Value::as_array) else {
-        return result
-            .get("data")
-            .cloned()
-            .unwrap_or_else(|| result.clone());
-    };
-
-    Value::Array(
-        items
-            .iter()
-            .map(|item| {
-                let mut item = item.clone();
-                if let Some(object) = item.as_object_mut()
-                    && let Some(dimensions) = object
-                        .get("embedding")
-                        .and_then(Value::as_array)
-                        .map(Vec::len)
-                {
-                    object.insert("dimensions".into(), serde_json::json!(dimensions));
-                }
-                item
-            })
-            .collect(),
-    )
+    result
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| result.clone())
 }
 
 fn normalize_tts_body(object: &mut serde_json::Map<String, Value>) -> Result<(), HttpError> {
@@ -2163,22 +2072,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_embedding_is_normalized_to_a_float_vector() {
-        let mut result = json!({
-            "data": [{"embedding": "AACAPwAAAMA=", "index": 0}]
-        });
-        normalize_and_validate_direct_result(&ModelCapability::Embedding, &mut result).unwrap();
-        assert_eq!(result["data"][0]["embedding"], json!([1.0, -2.0]));
-        assert_eq!(result["data"][0]["dimensions"], 2);
-
-        let mut invalid = json!({"data": [{"embedding": "not-base64"}]});
-        assert!(
-            normalize_and_validate_direct_result(&ModelCapability::Embedding, &mut invalid)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn stt_contract_accepts_and_validates_forwarded_options() {
         let valid = json!({
             "model": "whisper-1",
@@ -2229,6 +2122,7 @@ mod tests {
             "data": [{
                 "object": "embedding",
                 "embedding": [0.1, 0.2],
+                "dimensions": 2,
                 "index": 0,
                 "provider_extension": "preserved"
             }],
@@ -2252,7 +2146,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_provider_results_are_rejected() {
+    fn malformed_chat_provider_results_are_rejected() {
         assert!(validate_chat_result(&json!({})).is_err());
         // Representable assistant text is valid regardless of finish_reason —
         // a null/absent finish_reason must NOT be treated as malformed (doing
@@ -2298,14 +2192,6 @@ mod tests {
             }))
             .is_ok()
         );
-
-        for (capability, mut result) in [
-            (ModelCapability::Embedding, json!({"data": []})),
-            (ModelCapability::Stt, json!({"model": "whisper-1"})),
-            (ModelCapability::Tts, json!({"audio": ""})),
-        ] {
-            assert!(normalize_and_validate_direct_result(&capability, &mut result).is_err());
-        }
     }
 
     #[test]

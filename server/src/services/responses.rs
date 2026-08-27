@@ -10,6 +10,7 @@
 //! Responses API format on `/api/ai/response` and translates to/from upstream
 //! Chat Completions / Anthropic Messages protocols.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -463,6 +464,127 @@ fn translate_tool(tool: &ToolConfig) -> Value {
 // ═══════════════════════════════════════════════════════════════════
 //  Response Translation: Chat Completions → Responses
 // ═══════════════════════════════════════════════════════════════════
+
+fn decode_finite_f32_embedding(encoded: &str) -> Option<Vec<f32>> {
+    let bytes = STANDARD.decode(encoded).ok()?;
+    let (chunks, remainder) = bytes.as_chunks::<4>();
+    if chunks.is_empty() || !remainder.is_empty() {
+        return None;
+    }
+
+    let mut output = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let value = f32::from_le_bytes(*chunk);
+        if !value.is_finite() {
+            return None;
+        }
+        output.push(value);
+    }
+    Some(output)
+}
+
+/// Validate the JSON-array embedding representation against the same finite
+/// `f32` contract as the base64 representation. JSON numbers are represented as
+/// `f64`; values outside the `f32` range would otherwise silently cast to an
+/// infinity in the client and corrupt vector persistence/search.
+fn finite_f32_embedding_array_dimension(values: &[Value]) -> Option<usize> {
+    (!values.is_empty()
+        && values.iter().all(|value| {
+            value
+                .as_f64()
+                .is_some_and(|value| (value as f32).is_finite())
+        }))
+    .then_some(values.len())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EmbeddingBatchContract {
+    pub expected_count: usize,
+    pub expected_dimensions: Option<usize>,
+}
+
+/// Validate and normalize a complete embedding batch once at the provider
+/// boundary. The batch must match the originating request's item count and
+/// optional dimensions; every vector must also use the same dimensions, and
+/// present indices must form a unique contiguous range from zero. Missing
+/// indices retain the documented positional fallback.
+///
+/// Base64 vectors are decoded exactly once and applied only after the entire
+/// batch passes validation, so an invalid later item cannot leave a partially
+/// normalized response behind.
+pub(crate) fn normalize_embedding_batch(
+    items: &mut [Value],
+    contract: EmbeddingBatchContract,
+) -> bool {
+    if contract.expected_count == 0 || items.len() != contract.expected_count {
+        return false;
+    }
+
+    let mut expected_dimensions = None;
+    let mut indices = Vec::with_capacity(items.len());
+    let mut decoded_vectors = Vec::with_capacity(items.len());
+    for (pos, item) in items.iter().enumerate() {
+        let Some(object) = item.as_object() else {
+            return false;
+        };
+        let Some(embedding) = object.get("embedding") else {
+            return false;
+        };
+        let (dimensions, decoded) = match embedding {
+            Value::Array(values) => (finite_f32_embedding_array_dimension(values), None),
+            Value::String(encoded) => {
+                let decoded = decode_finite_f32_embedding(encoded);
+                (decoded.as_ref().map(Vec::len), decoded)
+            }
+            _ => (None, None),
+        };
+        let Some(dimensions) = dimensions else {
+            return false;
+        };
+        if contract
+            .expected_dimensions
+            .is_some_and(|expected| dimensions != expected)
+        {
+            return false;
+        }
+        match expected_dimensions {
+            Some(expected) if dimensions != expected => return false,
+            None => expected_dimensions = Some(dimensions),
+            Some(_) => {}
+        }
+
+        let index = match object.get("index") {
+            None => pos as u64,
+            Some(index) => match index.as_u64() {
+                Some(index) => index,
+                None => return false,
+            },
+        };
+        indices.push(index);
+        decoded_vectors.push(decoded);
+    }
+
+    indices.sort_unstable();
+    if !indices
+        .iter()
+        .enumerate()
+        .all(|(expected, actual)| *actual == expected as u64)
+    {
+        return false;
+    }
+
+    let dimensions = expected_dimensions.expect("non-empty validated embedding batch");
+    for (item, decoded) in items.iter_mut().zip(decoded_vectors) {
+        let object = item
+            .as_object_mut()
+            .expect("embedding item was validated as an object");
+        if let Some(decoded) = decoded {
+            object.insert("embedding".into(), serde_json::json!(decoded));
+        }
+        object.insert("dimensions".into(), serde_json::json!(dimensions));
+    }
+    true
+}
 
 /// Validate the text/refusal subset of a non-streaming Chat Completions result
 /// that the unified Responses translator can represent.
@@ -1136,6 +1258,141 @@ pub fn detect_capability(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finite_f32_embedding_decoder_enforces_the_binary_contract() {
+        assert_eq!(
+            decode_finite_f32_embedding("AACAPwAAAMA="),
+            Some(vec![1.0, -2.0])
+        );
+
+        for encoded in [
+            String::new(),
+            STANDARD.encode([0_u8; 3]),
+            STANDARD.encode(f32::NAN.to_le_bytes()),
+            STANDARD.encode(f32::INFINITY.to_le_bytes()),
+            STANDARD.encode(f32::NEG_INFINITY.to_le_bytes()),
+            "not-base64".to_owned(),
+        ] {
+            assert!(
+                decode_finite_f32_embedding(&encoded).is_none(),
+                "decoder should reject invalid embedding payload: {encoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn finite_f32_embedding_array_rejects_values_that_overflow_f32() {
+        let max_f32 = f64::from(f32::MAX);
+        assert_eq!(
+            finite_f32_embedding_array_dimension(
+                serde_json::json!([0.0, max_f32, -max_f32])
+                    .as_array()
+                    .unwrap()
+            ),
+            Some(3)
+        );
+
+        let over_f32 = max_f32 * 2.0;
+        for embedding in [
+            serde_json::json!([]),
+            serde_json::json!([null]),
+            serde_json::json!(["1.0"]),
+            serde_json::json!([over_f32]),
+        ] {
+            assert!(
+                finite_f32_embedding_array_dimension(embedding.as_array().unwrap()).is_none(),
+                "invalid numeric embedding should be rejected: {embedding}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_batch_normalization_requires_the_request_contract_and_valid_indices() {
+        for mut valid in [
+            serde_json::json!([
+                {"embedding": [1.0, 2.0], "index": 1},
+                {"embedding": "AACAPwAAAMA=", "index": 0}
+            ]),
+            serde_json::json!([
+                {"embedding": [1.0]},
+                {"embedding": [2.0]}
+            ]),
+        ] {
+            let expected_count = valid.as_array().unwrap().len();
+            assert!(normalize_embedding_batch(
+                valid.as_array_mut().unwrap(),
+                EmbeddingBatchContract {
+                    expected_count,
+                    expected_dimensions: None,
+                }
+            ));
+            assert!(
+                valid
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["embedding"].is_array() && item["dimensions"].is_number())
+            );
+        }
+
+        for mut invalid in [
+            serde_json::json!([]),
+            serde_json::json!([
+                {"embedding": [1.0, 2.0], "index": 0},
+                {"embedding": [3.0], "index": 1}
+            ]),
+            serde_json::json!([{"embedding": [1.0], "index": "0"}]),
+            serde_json::json!([
+                {"embedding": [1.0], "index": 0},
+                {"embedding": [2.0], "index": 0}
+            ]),
+            serde_json::json!([{"embedding": [1.0], "index": 1}]),
+        ] {
+            let expected_count = invalid.as_array().unwrap().len().max(1);
+            assert!(
+                !normalize_embedding_batch(
+                    invalid.as_array_mut().unwrap(),
+                    EmbeddingBatchContract {
+                        expected_count,
+                        expected_dimensions: None,
+                    }
+                ),
+                "invalid embedding batch should be rejected: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_batch_rejects_count_and_requested_dimension_mismatches_atomically() {
+        let original = serde_json::json!([
+            {"embedding": "AACAPwAAAMA=", "index": 0},
+            {"embedding": [3.0, 4.0], "index": 1}
+        ]);
+
+        let mut truncated = original.clone();
+        truncated.as_array_mut().unwrap().pop();
+        assert!(!normalize_embedding_batch(
+            truncated.as_array_mut().unwrap(),
+            EmbeddingBatchContract {
+                expected_count: 2,
+                expected_dimensions: Some(2),
+            }
+        ));
+
+        let mut wrong_dimensions = original.clone();
+        assert!(!normalize_embedding_batch(
+            wrong_dimensions.as_array_mut().unwrap(),
+            EmbeddingBatchContract {
+                expected_count: 2,
+                expected_dimensions: Some(3),
+            }
+        ));
+        assert_eq!(
+            wrong_dimensions, original,
+            "a rejected batch must not be partially decoded or annotated"
+        );
+    }
 
     // ── Request Translation Tests ─────────────────────────────────
 

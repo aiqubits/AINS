@@ -47,10 +47,13 @@ pub async fn create_test_server() -> TestServer {
     let cache = common::create_cache_service().await;
     let config = Arc::new(common::load_test_config());
 
-    let gateway = Arc::new(ains_server::services::gateway::GatewayService::new(
-        db.clone(),
-        &config.jwt_secret,
-    ));
+    let gateway = Arc::new(
+        ains_server::services::gateway::GatewayService::new_with_proxy_flag(
+            db.clone(),
+            &config.jwt_secret,
+            true, /* no_proxy — loopback provider tests must bypass system proxy */
+        ),
+    );
 
     let state = AppState {
         db,

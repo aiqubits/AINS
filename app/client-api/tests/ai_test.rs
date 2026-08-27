@@ -158,6 +158,96 @@ async fn test_embed_batch_returns_ordered_vectors() {
 }
 
 #[tokio::test]
+async fn test_embed_rejects_numbers_outside_finite_f32_range() {
+    let (client, mock_server) = create_test_client().await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/ai/response"))
+        .and(body_partial_json(json!({
+            "capability": "embedding",
+            "input": ["a"]
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "resp_e", "object": "response", "created_at": 1,
+            "model": "embed-model", "capability": "embedding", "status": "completed",
+            "incomplete_details": null,
+            "output": [{"embedding": [1e100], "index": 0, "dimensions": 1}],
+            "usage": null, "error": null
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let error = client
+        .embed(vec!["a".into()], None)
+        .await
+        .expect_err("out-of-range embedding must fail closed");
+    assert!(
+        matches!(error, ClientError::Deserialization(message) if message.contains("finite f32"))
+    );
+}
+
+#[tokio::test]
+async fn test_embed_rejects_malformed_or_incomplete_batches() {
+    for (output, expected_message) in [
+        (
+            json!([
+                {"embedding": [0.1, 0.2], "index": 0, "dimensions": 2},
+                {"index": 1, "dimensions": 2}
+            ]),
+            "embedding array",
+        ),
+        (
+            json!([{"embedding": [0.1, 0.2], "index": 0, "dimensions": 2}]),
+            "count mismatch",
+        ),
+        (
+            json!([
+                {"embedding": [0.1, 0.2], "index": 0, "dimensions": 2},
+                {"embedding": [0.3, 0.4], "index": 0, "dimensions": 2}
+            ]),
+            "indices",
+        ),
+        (
+            json!([
+                {"embedding": [0.1, 0.2], "index": "1", "dimensions": 2},
+                {"embedding": [0.3, 0.4], "index": "0", "dimensions": 2}
+            ]),
+            "index",
+        ),
+        (
+            json!([
+                {"embedding": [0.1, 0.2], "index": 0, "dimensions": 2},
+                {"embedding": [0.3], "index": 1, "dimensions": 1}
+            ]),
+            "dimensions",
+        ),
+    ] {
+        let (client, mock_server) = create_test_client().await;
+        Mock::given(method("POST"))
+            .and(path("/api/ai/response"))
+            .and(body_partial_json(json!({
+                "capability": "embedding",
+                "input": ["a", "b"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "resp_e", "object": "response", "created_at": 1,
+                "model": "embed-model", "capability": "embedding", "status": "completed",
+                "incomplete_details": null, "output": output, "usage": null, "error": null
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let error = client
+            .embed(vec!["a".into(), "b".into()], None)
+            .await
+            .expect_err("malformed or incomplete embedding batch must fail closed");
+        assert!(
+            matches!(error, ClientError::Deserialization(message) if message.contains(expected_message))
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_stt_encodes_audio_and_extracts_transcription() {
     let (client, mock_server) = create_test_client().await;
 

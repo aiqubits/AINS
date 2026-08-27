@@ -1,0 +1,52 @@
+# Dockerfile.web copies this manifest and its sibling Cargo.lock to /app before
+# Cargo runs; member paths are intentionally relative to that staged root.
+[workspace]
+members = [
+    "app/web",
+    "app/ui",
+    "app/client-api",
+    "crates/rust-agent",
+    "crates/i18n",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+authors = ["aiqubits <aiqubits@hotmail.com>"]
+license = "MIT"
+repository = "https://github.com/aiqubits/ains"
+homepage = "https://www.openpick.org/"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+
+# Keep the framework crates aligned with the pinned dioxus-cli installed by
+# Dockerfile.web. A loose 0.7 range could resolve a newer CLI-incompatible patch.
+dioxus = { version = "=0.7.9" }
+dioxus-icons = "0.1"
+pulldown-cmark = "0.10"
+
+ui = { path = "app/ui" }
+client-api = { path = "app/client-api" }
+rust-agent = { path = "crates/rust-agent" }
+i18n = { path = "crates/i18n" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+panic = "abort"

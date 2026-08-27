@@ -1147,6 +1147,204 @@ async fn start_mock_upstream_error() -> u16 {
     port
 }
 
+async fn create_embedding_test_channel(
+    app: &Router,
+    system_token: &str,
+    base_url: &str,
+    label: &str,
+) -> (String, String) {
+    let model = format!("embedding-contract{}", common::unique_table_name(label));
+    let (status, body) = post(
+        app,
+        "/api/channels",
+        Some(system_token),
+        Some(&json!({
+            "name": format!("Embedding contract {label}"),
+            "protocol_type": "openai",
+            "models": [model.clone()],
+            "capabilities": ["embedding"],
+            "api_key": "sk-embedding-contract",
+            "base_url": base_url,
+            "tenant_id": "default",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "channel creation failed: {body}");
+    let channel_id = body["id"]
+        .as_str()
+        .expect("created channel should include its id")
+        .to_owned();
+    (model, channel_id)
+}
+
+#[tokio::test]
+async fn test_embedding_response_contract_normalizes_base64_through_axum_stack() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let system_token =
+        axum_helpers::create_system_and_login(&app, &common::unique_email("embedding_contract_ok"))
+            .await;
+    let base_url = common::start_json_upstream(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": "AACAPwAAAMA=", "index": 1},
+            {"object": "embedding", "embedding": "AABAQAAAgEA=", "index": 0}
+        ],
+        "usage": {"prompt_tokens": 2, "total_tokens": 2}
+    }))
+    .await;
+    let (model, _) =
+        create_embedding_test_channel(&app, &system_token, &base_url, "axum_valid").await;
+
+    let (status, body) = post(
+        &app,
+        "/api/ai/response",
+        Some(&system_token),
+        Some(&json!({
+            "capability": "embedding",
+            "model": model,
+            "input": ["first", "second"],
+            "encoding_format": "base64",
+            "dimensions": 2,
+        })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "embedding request failed: {body}");
+    assert_eq!(body["status"], "completed");
+    assert_eq!(body["output"][0]["index"], 1);
+    assert_eq!(body["output"][0]["embedding"], json!([1.0, -2.0]));
+    assert_eq!(body["output"][0]["dimensions"], 2);
+    assert_eq!(body["output"][1]["index"], 0);
+    assert_eq!(body["output"][1]["embedding"], json!([3.0, 4.0]));
+    assert_eq!(body["output"][1]["dimensions"], 2);
+}
+
+#[tokio::test]
+async fn test_embedding_response_contract_rejects_provider_mismatches_through_axum_stack() {
+    let (app, _state) = axum_helpers::create_app_and_state().await;
+    let system_token = axum_helpers::create_system_and_login(
+        &app,
+        &common::unique_email("embedding_contract_bad"),
+    )
+    .await;
+
+    for (label, data) in [
+        (
+            "truncated",
+            json!([{"object": "embedding", "embedding": [0.1, 0.2], "index": 0}]),
+        ),
+        (
+            "wrong_dimensions",
+            json!([
+                {"object": "embedding", "embedding": [0.1, 0.2, 0.3], "index": 0},
+                {"object": "embedding", "embedding": [0.4, 0.5, 0.6], "index": 1}
+            ]),
+        ),
+    ] {
+        let base_url = common::start_json_upstream(json!({
+            "object": "list",
+            "data": data,
+            "usage": {"prompt_tokens": 2, "total_tokens": 2}
+        }))
+        .await;
+        let (model, _) = create_embedding_test_channel(&app, &system_token, &base_url, label).await;
+        let (status, body) = post(
+            &app,
+            "/api/ai/response",
+            Some(&system_token),
+            Some(&json!({
+                "capability": "embedding",
+                "model": model,
+                "input": ["first", "second"],
+                "dimensions": 2,
+            })),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{label} response should fail closed: {body}"
+        );
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "failed");
+        assert_eq!(body["error"]["code"], "service_unavailable");
+        assert_eq!(body["error"]["message"], "AI provider request failed");
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_embedding_response_trips_breaker_and_skips_metering() {
+    use ains_server::repositories::token_usage::{Column as UsageColumn, Entity as UsageEntity};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let app = axum_helpers::create_app_with_quota(QuotaConfig {
+        channel_max_rpm: 100,
+        channel_max_tpm: 1_000_000,
+        tenant_max_rpm: 100,
+        cb_failure_threshold: 1,
+        cb_retry_after_secs: 60,
+        ..Default::default()
+    })
+    .await;
+    let system_token = axum_helpers::create_system_and_login(
+        &app,
+        &common::unique_email("embedding_contract_breaker"),
+    )
+    .await;
+    let base_url = common::start_json_upstream(json!({
+        "object": "list",
+        "data": [
+            {"object": "embedding", "embedding": [0.1, 0.2], "index": 0}
+        ],
+        "usage": {"prompt_tokens": 2, "total_tokens": 2}
+    }))
+    .await;
+    let (model, channel_id) =
+        create_embedding_test_channel(&app, &system_token, &base_url, "axum_breaker").await;
+    let request = json!({
+        "capability": "embedding",
+        "model": model,
+        "input": ["first", "second"],
+        "dimensions": 2,
+    });
+
+    let (status, body) = post(
+        &app,
+        "/api/ai/response",
+        Some(&system_token),
+        Some(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["message"], "AI provider request failed");
+
+    let db = common::create_test_db_and_run_migrations().await;
+    let channel_id = uuid::Uuid::parse_str(&channel_id).expect("channel id should be a UUID");
+    let usage = UsageEntity::find()
+        .filter(UsageColumn::ChannelId.eq(channel_id))
+        .all(&*db)
+        .await
+        .expect("token usage query should succeed");
+    assert!(
+        usage.is_empty(),
+        "a rejected embedding batch must not be metered"
+    );
+
+    let (status, body) = post(
+        &app,
+        "/api/ai/response",
+        Some(&system_token),
+        Some(&request),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        body["error"]["message"], "No active AI channel supports this capability",
+        "the invalid provider response should trip the channel circuit"
+    );
+}
+
 #[tokio::test]
 async fn test_responses_e2e_with_mock_upstream() {
     let (app, _state) = axum_helpers::create_app_and_state().await;

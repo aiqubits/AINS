@@ -1,0 +1,15 @@
+# Web/WASM production manifest derived from app/ui/Cargo.toml.
+[package]
+name = "ui"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dioxus = { workspace = true }
+dioxus-icons = { workspace = true }
+i18n = { workspace = true, features = ["dioxus"] }
+pulldown-cmark = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-timers = { version = "0.3", features = ["futures"] }

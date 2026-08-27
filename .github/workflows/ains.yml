@@ -205,8 +205,11 @@ jobs:
   web:
     if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - uses: Swatinem/rust-cache@v2
       with:
         shared-key: "web"
@@ -254,17 +257,71 @@ jobs:
       run: cargo test --package web --verbose
     - name: Run UI Tests
       run: cargo test --package ui --verbose
-    # 生产构建链路：与 Dockerfile.web 的 `dx build` 完全一致（NO_DOWNLOADS=1
-    # + 本地 esbuild/wasm-bindgen-cli/wasm-opt），验证发布产物契约。
-    - name: Build Web (dx, matches Dockerfile.web)
+    # 根 workspace 编译验证真实 Web 源码；dockerfile_wasm_tooling_test 会另行
+    # 复刻 Docker 专用 workspace，并用 cargo tree --locked --offline --depth 0
+    # 验证精简 manifests 与生产锁文件仍可解析。
+    - name: Build Web (dx, locked dependencies)
       run: |
         export NO_DOWNLOADS=1
-        dx build --release --package web --platform web
+        dx build --locked --release --package web --platform web
     - name: Verify dx build artifacts
       # 空目录同样满足 -d，追加 index.html 存在性校验（与 nginx 入口一致）
       run: |
         test -d target/dx/web/release/web/public
         test -f target/dx/web/release/web/public/index.html
+    - name: Detect production Web build changes
+      id: prod_web_changes
+      env:
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      run: |
+        set -euo pipefail
+        if [[ -z "${BASE_SHA}" || "${BASE_SHA}" =~ ^0+$ ]] || \
+           ! git cat-file -e "${BASE_SHA}^{commit}"; then
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+        elif git diff --quiet "${BASE_SHA}" "${GITHUB_SHA}" -- \
+          .github/workflows/ains.yml Dockerfile.web \
+          Dockerfile.web.dockerignore prod-build/web \
+          Cargo.toml Cargo.lock app/web/Cargo.toml app/web/Dioxus.toml \
+          app/ui/Cargo.toml app/client-api/Cargo.toml \
+          crates/rust-agent/Cargo.toml crates/i18n/Cargo.toml \
+          app/web/src app/web/assets app/ui/src app/ui/assets \
+          app/client-api/src crates/rust-agent/src crates/i18n/src \
+          nginx/default.conf; then
+          echo "changed=false" >> "${GITHUB_OUTPUT}"
+        else
+          echo "changed=true" >> "${GITHUB_OUTPUT}"
+        fi
+    - name: Set up Docker Buildx
+      if: steps.prod_web_changes.outputs.changed == 'true'
+      uses: docker/setup-buildx-action@v4
+    - name: Build production Web runtime image
+      if: steps.prod_web_changes.outputs.changed == 'true'
+      uses: docker/build-push-action@v7
+      with:
+        context: .
+        file: Dockerfile.web
+        target: runtime
+        tags: ains-web-ci:${{ github.sha }}
+        load: true
+        cache-from: type=gha,scope=ains-web
+        # Fork/low-trust PRs may be unable to export a shared cache; cache
+        # availability must never decide whether the production build passes.
+        cache-to: type=gha,mode=max,scope=ains-web,ignore-error=true
+    - name: Smoke test production Web runtime image
+      if: steps.prod_web_changes.outputs.changed == 'true'
+      env:
+        WEB_IMAGE: ains-web-ci:${{ github.sha }}
+      run: |
+        docker run --rm --add-host ains-server:127.0.0.1 \
+          --entrypoint sh "${WEB_IMAGE}" -ec '
+            nginx -t
+            test -s /usr/share/nginx/html/index.html
+            test -s /usr/share/nginx/html/favicon.ico
+            set -- /usr/share/nginx/html/assets/*.wasm
+            test -s "$1"
+            set -- /usr/share/nginx/html/assets/*.js
+            test -s "$1"
+          '
 
   # ========================================
   # Client API Library CI
@@ -368,7 +425,9 @@ jobs:
       checks: write
     steps:
     - uses: actions/checkout@v4
-    # 扫描 Cargo.lock 已知 RUSTSEC 漏洞；豁免项及论证见 .cargo/audit.toml
+    # 扫描根 Cargo.lock 已知 RUSTSEC 漏洞；Web 契约测试强制生产锁文件的
+    # package/version/source/checksum 全部是根锁文件的子集，因此同时覆盖
+    # prod-build/web/Cargo.lock。豁免项及论证见 .cargo/audit.toml。
     - name: Cargo audit
       uses: rustsec/audit-check@v2
       with:

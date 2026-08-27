@@ -1,0 +1,37 @@
+# Web/WASM production manifest. Keep normal and wasm32 dependencies aligned
+# with app/web/Cargo.toml; native and test-only dependencies do not belong in
+# the deployment lockfile.
+[package]
+name = "web"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+dioxus = { workspace = true, features = ["router"] }
+ui = { workspace = true }
+dioxus-icons = { workspace = true }
+client-api = { workspace = true }
+rust-agent = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde_yaml = "0.9"
+chrono = { workspace = true }
+base64 = "0.22"
+serde = { workspace = true }
+serde_json = { workspace = true }
+i18n = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Storage", "Document", "HtmlDocument", "Element", "console"] }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+gloo-timers = { version = "0.3", features = ["futures"] }
+
+[features]
+default = ["web"]
+web = ["dioxus/web"]
+# Keep cfg(feature = "desktop") known to rustc without pulling the native rfd
+# dependency into the production lockfile. Docker never enables this feature.
+desktop = []
