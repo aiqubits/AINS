@@ -1667,7 +1667,9 @@ fn parse_storage_key_hex(value: &str) -> Result<[u8; 32], String> {
         ));
     }
     let mut bytes = [0u8; 32];
-    for (index, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    for (index, pair) in pairs.iter().enumerate() {
         let high = hex_nibble(pair[0])
             .ok_or_else(|| format!("{STORAGE_KEY_ENV} must contain only hexadecimal characters"))?;
         let low = hex_nibble(pair[1])
