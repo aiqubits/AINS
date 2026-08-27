@@ -30,7 +30,10 @@ use crate::api::{ErrorContext, humanize_error};
 use crate::auth::AuthState;
 use crate::balance::format_balance;
 use crate::components::{ConfirmDialog, HttpMethod, LogBus, push_log_err, push_log_ok};
-use crate::views::{format_purchase_limit, order_method_label, order_status_label};
+use crate::views::{
+    PaginationEntity, format_pagination_info, format_purchase_limit, order_method_label,
+    order_status_label,
+};
 
 /// 区块加载状态（余额单独用 `Option<i64>` + 错误信号表达）。
 #[derive(Debug, Clone)]
@@ -859,18 +862,8 @@ fn render_orders_section(
                 next_sig.set(next_page(page, total_pages));
             };
             // 账单文案用"记录"计数（metering 键），而非用户/订单管理页的实体计数。
-            let pagination_info = if total_pages == 0 {
-                tf(t.metering_count_simple, &[("total", &total.to_string())])
-            } else {
-                tf(
-                    t.metering_count_info,
-                    &[
-                        ("total", &total.to_string()),
-                        ("page", &page.to_string()),
-                        ("total_pages", &total_pages.to_string()),
-                    ],
-                )
-            };
+            let pagination_info =
+                format_pagination_info(t, PaginationEntity::Records, total, page, total_pages);
 
             rsx! {
                 div { class: "ains-users__table-wrapper",

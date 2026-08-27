@@ -385,6 +385,9 @@ jobs:
     # Modal 的 focus/inert/堆叠行为依赖真实 DOM，NoOpDocument 单测无法覆盖。
     - name: Run UI browser tests (headless Chrome)
       run: wasm-pack test --headless --chrome app/ui
+    # 管理页宽屏、表格列对齐与窄屏横向滚动依赖浏览器布局引擎。
+    - name: Run Web browser tests (headless Chrome)
+      run: wasm-pack test --headless --chrome app/web
 
   # ========================================
   # Desktop App CI (Phase 6.2 native agent embedding)

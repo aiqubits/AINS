@@ -76,6 +76,51 @@ pub(crate) fn short_tenant_id(id: &str) -> String {
     }
 }
 
+/// Entity named by the shared management-table pagination summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaginationEntity {
+    Users,
+    Tenants,
+    Channels,
+    Records,
+    Plans,
+    Orders,
+}
+
+/// Formats a localized pagination summary for all management tables and the
+/// personal-center order history. Keeping the entity-to-translation mapping in
+/// one typed function prevents pages from accidentally reusing another
+/// module's count label.
+pub(crate) fn format_pagination_info(
+    t: &'static Translations,
+    entity: PaginationEntity,
+    total: u64,
+    page: u64,
+    total_pages: u64,
+) -> String {
+    let (info_template, simple_template) = match entity {
+        PaginationEntity::Users => (t.users_count_info, t.users_count_simple),
+        PaginationEntity::Tenants => (t.tenants_count_info, t.tenants_count_simple),
+        PaginationEntity::Channels => (t.channels_count_info, t.channels_count_simple),
+        PaginationEntity::Records => (t.metering_count_info, t.metering_count_simple),
+        PaginationEntity::Plans => (t.plans_count_info, t.plans_count_simple),
+        PaginationEntity::Orders => (t.orders_count_info, t.orders_count_simple),
+    };
+
+    if total_pages == 0 {
+        tf(simple_template, &[("total", &total)])
+    } else {
+        tf(
+            info_template,
+            &[
+                ("total", &total),
+                ("page", &page),
+                ("total_pages", &total_pages),
+            ],
+        )
+    }
+}
+
 /// 订单状态 → 本地化文案（订单管理页与个人中心账单共用）。
 ///
 /// 未知状态原样透出（中性回退）—— 账单/订单数据以诚实展示为先，
@@ -119,7 +164,10 @@ pub(crate) fn format_purchase_limit(
 
 #[cfg(test)]
 mod tests {
-    use super::{format_purchase_limit, order_method_label, order_status_label, short_tenant_id};
+    use super::{
+        PaginationEntity, format_pagination_info, format_purchase_limit, order_method_label,
+        order_status_label, short_tenant_id,
+    };
     use i18n::{EN, ZH};
 
     #[test]
@@ -135,6 +183,61 @@ mod tests {
         // 多字节字符按 chars() 而非字节截断，锁定不会在 UTF-8 边界 panic
         assert_eq!(short_tenant_id("一二三四五六七八九"), "一二三四五六七八...");
         assert_eq!(short_tenant_id("一二三四五六七八"), "一二三四五六七八");
+    }
+
+    #[test]
+    fn pagination_info_uses_the_requested_entity_in_both_languages() {
+        for (entity, expected_en, expected_zh) in [
+            (
+                PaginationEntity::Users,
+                "Users: 25, page 2 / 3",
+                "共 25 个用户，第 2 / 3 页",
+            ),
+            (
+                PaginationEntity::Tenants,
+                "Tenants: 25, page 2 / 3",
+                "共 25 个租户，第 2 / 3 页",
+            ),
+            (
+                PaginationEntity::Channels,
+                "Channels: 25, page 2 / 3",
+                "共 25 个渠道，第 2 / 3 页",
+            ),
+            (
+                PaginationEntity::Records,
+                "Records: 25, page 2 / 3",
+                "共 25 条记录，第 2 / 3 页",
+            ),
+            (
+                PaginationEntity::Plans,
+                "Plans: 25, page 2 / 3",
+                "共 25 个套餐，第 2 / 3 页",
+            ),
+            (
+                PaginationEntity::Orders,
+                "Orders: 25, page 2 / 3",
+                "共 25 个订单，第 2 / 3 页",
+            ),
+        ] {
+            assert_eq!(format_pagination_info(&EN, entity, 25, 2, 3), expected_en);
+            assert_eq!(format_pagination_info(&ZH, entity, 25, 2, 3), expected_zh);
+        }
+    }
+
+    #[test]
+    fn pagination_info_handles_zero_pages_and_singular_english_counts() {
+        assert_eq!(
+            format_pagination_info(&EN, PaginationEntity::Tenants, 0, 1, 0),
+            "Tenants: 0"
+        );
+        assert_eq!(
+            format_pagination_info(&ZH, PaginationEntity::Tenants, 0, 1, 0),
+            "共 0 个租户"
+        );
+        assert_eq!(
+            format_pagination_info(&EN, PaginationEntity::Tenants, 1, 1, 1),
+            "Tenants: 1, page 1 / 1"
+        );
     }
 
     #[test]

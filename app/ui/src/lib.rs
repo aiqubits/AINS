@@ -44,7 +44,7 @@ mod auth_form;
 pub use auth_form::{AuthForm, AuthMode, AuthPayload};
 
 mod data_table;
-pub use data_table::{Align, Column, DataTable};
+pub use data_table::{Align, Column, DATA_TABLE_MAX_COLUMNS, DataTable};
 
 mod stats_card;
 pub use stats_card::{StatsAccent, StatsCard, StatsValueColor};

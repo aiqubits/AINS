@@ -26,7 +26,7 @@ use crate::components::{
 };
 
 use super::{
-    format_purchase_limit,
+    PaginationEntity, format_pagination_info, format_purchase_limit,
     tenant_select::{TenantSelectView, load_tenant_page, render_tenant_select},
 };
 
@@ -367,18 +367,8 @@ fn render_table(
             let on_next = move |_: MouseEvent| {
                 next_sig.set((page + 1).min(total_pages));
             };
-            let pagination_info = if total_pages == 0 {
-                tf(t.users_count_simple, &[("total", &total.to_string())])
-            } else {
-                tf(
-                    t.users_count_info,
-                    &[
-                        ("total", &total.to_string()),
-                        ("page", &page.to_string()),
-                        ("total_pages", &total_pages.to_string()),
-                    ],
-                )
-            };
+            let pagination_info =
+                format_pagination_info(t, PaginationEntity::Plans, total, page, total_pages);
 
             rsx! {
                 div { class: "ains-users__table-wrapper",

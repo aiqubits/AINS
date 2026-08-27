@@ -75,8 +75,69 @@ mod tests {
     fn all_translation_fields_count() {
         let count = ALL_TRANSLATION_FIELDS.len();
         assert_eq!(
-            count, 613,
-            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (613)。如果新增/删除了 translate! 字段，请同步更新此断言。"
+            count, 621,
+            "ALL_TRANSLATION_FIELDS 计数 ({count}) 不符合预期 (621)。如果新增/删除了 translate! 字段，请同步更新此断言。"
         );
+    }
+
+    #[test]
+    fn management_pagination_translations_use_module_specific_entities() {
+        let info_args: &[(&str, &dyn std::fmt::Display)] =
+            &[("total", &1), ("page", &1), ("total_pages", &1)];
+        let simple_args: &[(&str, &dyn std::fmt::Display)] = &[("total", &0)];
+
+        for (info, simple, expected_info, expected_simple) in [
+            (
+                EN.tenants_count_info,
+                EN.tenants_count_simple,
+                "Tenants: 1, page 1 / 1",
+                "Tenants: 0",
+            ),
+            (
+                EN.channels_count_info,
+                EN.channels_count_simple,
+                "Channels: 1, page 1 / 1",
+                "Channels: 0",
+            ),
+            (
+                EN.plans_count_info,
+                EN.plans_count_simple,
+                "Plans: 1, page 1 / 1",
+                "Plans: 0",
+            ),
+            (
+                EN.orders_count_info,
+                EN.orders_count_simple,
+                "Orders: 1, page 1 / 1",
+                "Orders: 0",
+            ),
+            (
+                ZH.tenants_count_info,
+                ZH.tenants_count_simple,
+                "共 1 个租户，第 1 / 1 页",
+                "共 0 个租户",
+            ),
+            (
+                ZH.channels_count_info,
+                ZH.channels_count_simple,
+                "共 1 个渠道，第 1 / 1 页",
+                "共 0 个渠道",
+            ),
+            (
+                ZH.plans_count_info,
+                ZH.plans_count_simple,
+                "共 1 个套餐，第 1 / 1 页",
+                "共 0 个套餐",
+            ),
+            (
+                ZH.orders_count_info,
+                ZH.orders_count_simple,
+                "共 1 个订单，第 1 / 1 页",
+                "共 0 个订单",
+            ),
+        ] {
+            assert_eq!(crate::tf(info, info_args), expected_info);
+            assert_eq!(crate::tf(simple, simple_args), expected_simple);
+        }
     }
 }

@@ -25,6 +25,8 @@ use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
 
+use super::{PaginationEntity, format_pagination_info};
+
 /// DOM id of the tenant dropdown scroll panel — used by the infinite-scroll
 /// handler to read the panel's scroll position via `element_near_bottom`.
 const TENANT_PANEL_ID: &str = "channel-tenant-dropdown-panel";
@@ -407,18 +409,8 @@ fn render_table(
             let on_next = move |_: MouseEvent| {
                 next_sig.set((page + 1).min(total_pages));
             };
-            let pagination_info = if total_pages == 0 {
-                tf(t.users_count_simple, &[("total", &total.to_string())])
-            } else {
-                tf(
-                    t.users_count_info,
-                    &[
-                        ("total", &total.to_string()),
-                        ("page", &page.to_string()),
-                        ("total_pages", &total_pages.to_string()),
-                    ],
-                )
-            };
+            let pagination_info =
+                format_pagination_info(t, PaginationEntity::Channels, total, page, total_pages);
 
             rsx! {
                 div { class: "ains-users__table-wrapper",

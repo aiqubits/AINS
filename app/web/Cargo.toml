@@ -39,8 +39,9 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 # Browser-level regression coverage for APIs unavailable to native unit tests
-# (notably the Web Locks extraction gate).
+# (notably the Web Locks extraction gate and computed layout styles).
 wasm-bindgen-test = "0.3"
+web-sys = { version = "0.3", features = ["CssStyleDeclaration"] }
 
 [features]
 default = ["web"]

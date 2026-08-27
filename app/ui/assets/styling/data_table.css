@@ -48,12 +48,15 @@
 .ains-table__align--right { text-align: right; }
 
 /* Tailwind 风格的固定宽度工具类，供 Column::width 使用 */
+.ains-table__table .w-16 { width: 4rem; }
 .ains-table__table .w-20 { width: 5rem; }
 .ains-table__table .w-24 { width: 6rem; }
 .ains-table__table .w-28 { width: 7rem; }
 .ains-table__table .w-32 { width: 8rem; }
+.ains-table__table .w-36 { width: 9rem; }
 .ains-table__table .w-40 { width: 10rem; }
 .ains-table__table .w-44 { width: 11rem; }
+.ains-table__table .w-48 { width: 12rem; }
 
 .ains-table__body {
   font-size: 12px;
@@ -79,6 +82,25 @@
   padding: 14px 16px;
   vertical-align: middle;
 }
+
+/* Column alignment is declared once by Column::align and exposed as scoped
+   custom properties on the table. Apply the same contract to every body cell
+   so badges, action groups, and plain text line up with their headers. The
+   twelve selectors mirror DATA_TABLE_MAX_COLUMNS; its unit test keeps the Rust
+   contract and this stylesheet synchronized. Empty colspan rows retain their
+   dedicated centered treatment below. */
+.ains-table__body td:not(.ains-table__empty):nth-child(1) { text-align: var(--ains-table-col-1-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(2) { text-align: var(--ains-table-col-2-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(3) { text-align: var(--ains-table-col-3-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(4) { text-align: var(--ains-table-col-4-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(5) { text-align: var(--ains-table-col-5-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(6) { text-align: var(--ains-table-col-6-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(7) { text-align: var(--ains-table-col-7-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(8) { text-align: var(--ains-table-col-8-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(9) { text-align: var(--ains-table-col-9-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(10) { text-align: var(--ains-table-col-10-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(11) { text-align: var(--ains-table-col-11-align, left); }
+.ains-table__body td:not(.ains-table__empty):nth-child(12) { text-align: var(--ains-table-col-12-align, left); }
 
 .ains-table__empty {
   padding: 32px 24px;

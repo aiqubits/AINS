@@ -27,7 +27,10 @@ use crate::balance::{format_balance, parse_display_amount};
 use crate::components::{
     ConfirmDialog, HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok,
 };
-use crate::views::{order_method_label as method_label, order_status_label as status_label};
+use crate::views::{
+    PaginationEntity, format_pagination_info, order_method_label as method_label,
+    order_status_label as status_label,
+};
 
 const ORDER_STATUSES: &[&str] = &["paid", "pending", "refunded", "cancelled"];
 const PAYMENT_METHODS: &[&str] = &["balance", "wechat", "alipay"];
@@ -314,18 +317,8 @@ fn render_table(
             let on_next = move |_: MouseEvent| {
                 next_sig.set((page + 1).min(total_pages));
             };
-            let pagination_info = if total_pages == 0 {
-                tf(t.users_count_simple, &[("total", &total.to_string())])
-            } else {
-                tf(
-                    t.users_count_info,
-                    &[
-                        ("total", &total.to_string()),
-                        ("page", &page.to_string()),
-                        ("total_pages", &total_pages.to_string()),
-                    ],
-                )
-            };
+            let pagination_info =
+                format_pagination_info(t, PaginationEntity::Orders, total, page, total_pages);
 
             rsx! {
                 div { class: "ains-users__table-wrapper",

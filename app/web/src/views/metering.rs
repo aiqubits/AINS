@@ -17,6 +17,8 @@ use crate::auth::AuthState;
 use crate::components::{HttpMethod, LogBus, SearchSignal, push_log_err, push_log_ok};
 use client_api::ListUsageFilter;
 
+use super::{PaginationEntity, format_pagination_info};
+
 #[derive(Debug, Clone)]
 enum UsageListState {
     Loading,
@@ -430,18 +432,8 @@ fn render_table(
                 let max = total_pages.max(1);
                 next_sig.set((page + 1).min(max));
             };
-            let pagination_info = if total_pages == 0 {
-                tf(t.metering_count_simple, &[("total", &total.to_string())])
-            } else {
-                tf(
-                    t.metering_count_info,
-                    &[
-                        ("total", &total.to_string()),
-                        ("page", &page.to_string()),
-                        ("total_pages", &total_pages.to_string()),
-                    ],
-                )
-            };
+            let pagination_info =
+                format_pagination_info(t, PaginationEntity::Records, total, page, total_pages);
 
             rsx! {
                 div { class: "ains-users__table-wrapper",
